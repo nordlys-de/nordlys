@@ -4,6 +4,7 @@
 //! The same state, update and view run as a layer-shell surface on Wayland
 //! and as a plain preview window anywhere else.
 
+use crate::apps;
 use crate::icons::{self, icon};
 use crate::sources::{self, Battery, Compositor, Desk};
 use iced::alignment::Horizontal;
@@ -29,6 +30,14 @@ pub(crate) const MONO: Font = Font::with_name("JetBrains Mono");
 pub const BAR_HEIGHT: u32 = 40;
 pub const BAR_GAP: u32 = 10;
 
+/// This same binary's launcher, so it works without anything on PATH.
+fn launcher_command() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "nordlys-shell".into());
+    format!("{} launcher", apps::shell_quote(&exe))
+}
+
 pub struct Bar {
     palette: Palette,
     layout: Layout,
@@ -45,6 +54,7 @@ pub struct Bar {
 pub enum Message {
     Tick,
     Switch(usize),
+    Launcher,
 }
 
 impl Bar {
@@ -72,6 +82,14 @@ impl Bar {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => self.refresh(),
+            Message::Launcher => {
+                // The preview has no layer shell to open it in.
+                if !self.preview
+                    && let Err(e) = apps::spawn_shell(&launcher_command())
+                {
+                    eprintln!("nordlys-shell: can't open the launcher: {e}");
+                }
+            }
             Message::Switch(i) => {
                 if let Some(ws) = self.desk.workspaces.get(i) {
                     self.compositor.switch_to(ws);
@@ -127,6 +145,30 @@ impl Bar {
                 .into()
         }))
         .spacing(4);
+
+        let apps_button = button(
+            row![
+                icon(icons::GRID, 13),
+                text("Apps").font(INTER_SEMIBOLD).size(12)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .padding([5, 10])
+        .on_press(Message::Launcher)
+        .style(move |_, status| button::Style {
+            background: Some(Background::Color(if status == button::Status::Hovered {
+                glass.chip_hover
+            } else {
+                glass.chip
+            })),
+            text_color: color(p.text),
+            border: Border {
+                radius: 8.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        });
 
         let stage = row![
             icon(icons::WINDOW, 14).color(color(p.dim)),
@@ -184,7 +226,7 @@ impl Bar {
         let bar = container(
             row![
                 container(
-                    row![workspaces, stage]
+                    row![apps_button, workspaces, stage]
                         .spacing(12)
                         .align_y(Alignment::Center)
                 )

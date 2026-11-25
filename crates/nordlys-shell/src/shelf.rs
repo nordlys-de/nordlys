@@ -224,6 +224,7 @@ fn slot(i: usize, w: &ShelfWindow, hovered: bool, r: Rail) -> Element<'static, M
         .on_enter(Message::Hover(i))
         .on_exit(Message::Unhover)
         .on_press(Message::Pick(i))
+        .interaction(iced::mouse::Interaction::Pointer)
         .into()
 }
 

@@ -60,17 +60,19 @@ settings go in `~/.config/nordlys/hypridle.conf`.
 
 ### Keys
 
-Super is the Nordlys key. Hyprland has no Stage layout yet, so the Stage
-keys drive its master layout: the master window is on stage and the stack
-is the shelf. With nordlys-comp running, the same keys go to the real
-Stage model.
+Super is the Nordlys key. Hyprland has no Stage layout yet, so the session
+uses its monocle layout: the focused window fills the stage and the others
+wait, unseen, on the shelf. Click one there to bring it over. Super+T
+switches to a tiled view (Hyprland's master layout) to see windows side by
+side. With nordlys-comp running, the same keys go to the real Stage model.
+The **Apps** button on the bar opens the launcher with the mouse.
 
 | Keys | Does |
 |---|---|
 | Super Space · Super Shift Space | Launcher · commands |
 | Super Enter · E · , | Terminal · editor · `nordlys.toml` |
 | Super K · J | Previous window to stage · cycle the shelf |
-| Super T · Tab · S | Two-up on/off · swap main and side · send to shelf |
+| Super T · Tab · S | Tiled view on/off · swap · send to shelf |
 | Super G | App groups (the launcher's commands) |
 | Super Q · F | Close · float |
 | Super 1–9 · Shift 1–9 | Go to workspace · send the window there |

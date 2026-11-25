@@ -326,7 +326,8 @@ impl Ambient {
                         .width(28)
                         .align_x(Horizontal::Center)
                     )
-                    .on_press(Message::Mute),
+                    .on_press(Message::Mute)
+                    .interaction(iced::mouse::Interaction::Pointer),
                     slider(0.0..=1.0, level, Message::Volume)
                         .step(0.01_f32)
                         .on_release(Message::VolumeDone)
@@ -536,7 +537,10 @@ fn tile(
             .align_y(Vertical::Bottom),
         );
     }
-    mouse_area(layers).on_press(Message::Toggle).into()
+    mouse_area(layers)
+        .on_press(Message::Toggle)
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
 }
 
 /// One line per notification, as on the canvas: dot, summary, then the body.

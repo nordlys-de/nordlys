@@ -4,9 +4,10 @@
 -- left alone. To change something, put Lua in
 -- ~/.config/nordlys/hyprland.lua: it runs last and can override any of this.
 --
--- Hyprland has no Stage layout yet, so the Stage keys are mapped onto its
--- master layout: the master window is on stage, the stack is the shelf.
--- With nordlys-comp, the same keys go to the real Stage model.
+-- Hyprland has no Stage layout, so the session uses its monocle layout:
+-- the focused window fills the stage and the others wait, unseen, on the
+-- shelf. Super+T switches to a tiled view (master layout) to see windows
+-- side by side. With nordlys-comp, the keys go to the real Stage model.
 
 local data = os.getenv("NORDLYS_DATA") or "/usr/share/nordlys"
 local home = os.getenv("HOME") or ""
@@ -76,7 +77,7 @@ hl.config({
             inactive_border = "rgba(ffffff1f)",
         },
         resize_on_border = true,
-        layout = "master",
+        layout = "monocle",
     },
 
     decoration = {
@@ -175,33 +176,36 @@ local function comp_running()
     return sock ~= nil
 end
 
--- With nordlys-comp running, Stage keys go to it; on Hyprland, to master.
-local function stage(ctl, ...)
-    local fallback = { ... }
-    return function()
+-- Stage. Monocle shows only the focused window, so bringing a window to
+-- the stage is just focusing it. Super+T flips to the tiled view and back.
+local tiled = false
+local function when_tiled(a, b)
+    return function() hl.dispatch(tiled and a or b) end
+end
+local last = hl.dsp.focus({ last = true })
+
+local function bind_stage(k, ctl, action, desc)
+    hl.bind(key(k), function()
         if comp_running() then
             hl.exec_cmd("nordlysctl " .. ctl)
-            return
+        else
+            action()
         end
-        for _, d in ipairs(fallback) do hl.dispatch(d) end
-    end
+    end, { desc = desc })
 end
 
--- Stage
-hl.bind(key("K"),   stage("previous",      hl.dsp.focus({ last = true }), hl.dsp.layout("swapwithmaster")),
-        { desc = "Previous window to stage" })
-hl.bind(key("J"),   stage("cycle",         hl.dsp.layout("rollnext")),        { desc = "Cycle through the shelf" })
-local two_up = false
-hl.bind(key("T"), function()
-    if comp_running() then
-        hl.exec_cmd("nordlysctl two-up")
-        return
-    end
-    two_up = not two_up
-    hl.dispatch(hl.dsp.layout(two_up and "addmaster" or "removemaster"))
-end, { desc = "Two-up on or off" })
-hl.bind(key("Tab"), stage("swap",          hl.dsp.layout("swapnext")),        { desc = "Swap main and side" })
-hl.bind(key("S"),   stage("send-to-shelf", hl.dsp.layout("swapwithmaster")),  { desc = "Send to shelf" })
+bind_stage("K", "previous", function() hl.dispatch(last) end, "Previous window to stage")
+bind_stage("J", "cycle",
+    when_tiled(hl.dsp.layout("rollnext"), hl.dsp.layout("cyclenext")), "Cycle through the shelf")
+bind_stage("T", "two-up", function()
+    tiled = not tiled
+    hl.config({ general = { layout = tiled and "master" or "monocle" } })
+end, "Two-up (tiled view) on or off")
+bind_stage("Tab", "swap",
+    when_tiled(hl.dsp.layout("swapwithmaster"), last), "Swap main and side")
+-- On the stage view, shelving the window means bringing the previous one up.
+bind_stage("S", "send-to-shelf",
+    when_tiled(hl.dsp.layout("swapwithmaster"), last), "Send to shelf")
 
 -- Shelves and groups
 hl.bind(key("G"), run("nordlys-shell launcher --query '>'"), { desc = "App groups" })
