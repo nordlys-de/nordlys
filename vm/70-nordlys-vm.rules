@@ -1,0 +1,2 @@
+# Let the logged-in user open the host clipboard port (test VMs only).
+SUBSYSTEM=="virtio-ports", ATTR{name}=="org.nordlys.clipboard", TAG+="uaccess"

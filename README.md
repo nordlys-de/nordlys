@@ -85,6 +85,35 @@ On other distros you need the development files for PAM, xkbcommon and
 Wayland (Debian/Ubuntu: `libpam0g-dev libxkbcommon-dev libwayland-dev`),
 then the same `cargo build` and `scripts/install.sh`.
 
+## Try it in a VM
+
+On the host (needs QEMU with its GTK and virgl modules, OVMF, and `xclip`):
+
+```sh
+vm/nordlys-vm run ~/Downloads/cachyos-desktop-linux-261122.iso
+```
+
+The VM boots with UEFI, 3D acceleration and a screen you can resize freely.
+The first run has an empty disk, so the ISO's installer starts. Install
+CachyOS or Arch to the whole disk; later runs boot it (`vm/nordlys-vm run`).
+Then, inside the VM:
+
+```sh
+sudo pacman -S git github-cli
+gh auth login          # the repository is private
+gh repo clone nordlys-de/nordlys
+nordlys/scripts/setup.sh
+```
+
+Reboot and pick the **Nordlys** session. `setup.sh` installs the
+dependencies, builds and installs Nordlys and, in a VM, adds
+`nordlys-vm-agent`, which shares the text clipboard with the host and
+resizes the screen to the window. Both work inside the Nordlys session.
+After a `git pull`, run `setup.sh` again.
+
+Ctrl+Alt+G grabs the keyboard so Super reaches the VM; Ctrl+Alt+F is
+fullscreen. `vm/nordlys-vm destroy` deletes the VM.
+
 ## Try it
 
 ```sh

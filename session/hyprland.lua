@@ -41,6 +41,10 @@ hl.on("hyprland.start", function()
     hl.exec_cmd("nordlys-shell ambient")
     hl.exec_cmd("hypridle -c " .. (os.getenv("NORDLYS_IDLE") or (data .. "/hypridle.conf")))
 
+    -- In a test VM (scripts/setup.sh installs it): shared clipboard and
+    -- a screen that follows the window size.
+    hl.exec_cmd("sh -c 'command -v nordlys-vm-agent >/dev/null && exec nordlys-vm-agent'")
+
     -- Password prompts for apps that ask for admin rights.
     hl.exec_cmd("sh -c 'systemctl --user start hyprpolkitagent || /usr/lib/hyprpolkitagent/hyprpolkitagent'")
 end)
@@ -243,6 +247,13 @@ hl.bind("XF86AudioNext",  run("playerctl next"),       { locked = true })
 hl.bind("XF86AudioPrev",  run("playerctl previous"),   { locked = true })
 hl.bind("XF86AudioPlay",  run("playerctl play-pause"), { locked = true })
 hl.bind("XF86AudioPause", run("playerctl play-pause"), { locked = true })
+
+-- Test VMs: virtio-gpu draws the cursor wrongly on a hardware plane.
+local vm = io.open(data .. "/vm-guest", "r")
+if vm then
+    vm:close()
+    hl.config({ cursor = { no_hardware_cursors = true } })
+end
 
 -----------------------
 ---- YOUR CHANGES -----

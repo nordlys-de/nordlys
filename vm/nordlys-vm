@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# A QEMU VM for trying Nordlys: UEFI, 3D acceleration (virgl), a display
+# that follows the window size, and a clipboard shared with this desktop.
+#
+#   vm/nordlys-vm run [ISO]   boot the VM. A new VM has an empty disk, so it
+#                             starts the ISO's installer; once installed, it
+#                             boots from disk. Default ISO: the newest
+#                             cachyos-*.iso in ~/Downloads.
+#   vm/nordlys-vm live [ISO]  boot the ISO even though a system is installed
+#   vm/nordlys-vm clip        restart just the clipboard bridge
+#   vm/nordlys-vm destroy     delete the VM (disk and UEFI settings)
+#
+# In the window: Ctrl+Alt+G grabs the keyboard, so Super reaches the VM and
+# not your window manager (press again to release). Ctrl+Alt+F: fullscreen.
+#
+# After installing the OS, set up Nordlys inside the VM:
+#   sudo pacman -S git github-cli && gh auth login
+#   gh repo clone nordlys-de/nordlys && nordlys/scripts/setup.sh
+#
+# Environment: NORDLYS_VM_MEM (6G), NORDLYS_VM_CPUS (4), NORDLYS_VM_DISK (40G),
+# NORDLYS_VM_DISPLAY (gtk,gl=on,zoom-to-fit=on), NORDLYS_VM_SSH_PORT (2222),
+# NORDLYS_VM_AUDIO (pa), NORDLYS_VM_EXTRA (more QEMU options).
+set -euo pipefail
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+state="${NORDLYS_VM_STATE:-${XDG_CACHE_HOME:-$HOME/.cache}/nordlys-vm}"
+disk="$state/disk.qcow2"
+vars="$state/uefi-vars.fd"
+# Unix socket paths are limited to 107 bytes, so not under $state.
+sock="${XDG_RUNTIME_DIR:-/tmp}/nordlys-vm-$(printf %s "$state" | cksum | cut -d" " -f1).sock"
+pidfile="$state/qemu.pid"
+
+die() { echo "nordlys-vm: $*" >&2; exit 1; }
+say() { printf '\033[1;34m::\033[0m %s\n' "$*"; }
+running() { [[ -f $pidfile ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
+
+firmware() { # firmware OVMF_CODE|OVMF_VARS
+    local f
+    for f in /usr/share/edk2/x64/$1.4m.fd /usr/share/edk2-ovmf/x64/$1.4m.fd \
+        /usr/share/OVMF/${1}_4M.fd /usr/share/OVMF/$1.fd; do
+        [[ -f $f ]] && { echo "$f"; return; }
+    done
+    die "UEFI firmware not found; install edk2-ovmf"
+}
+
+find_iso() {
+    local iso=${1:-}
+    [[ -n $iso ]] || iso=$(ls -t "$HOME"/Downloads/cachyos-*.iso 2>/dev/null | head -1 || true)
+    [[ -z $iso || -f $iso ]] || die "$iso: no such file"
+    echo "$iso"
+}
+
+boot() { # boot disk|iso ISO
+    local first=$1 iso=$2
+    command -v qemu-system-x86_64 >/dev/null || die "qemu-system-x86_64 not found"
+    [[ -w /dev/kvm ]] || die "/dev/kvm isn't usable; enable virtualisation / join the kvm group"
+    running && die "the VM is already running"
+    mkdir -p "$state"
+    local fresh=
+    if [[ ! -e $disk ]]; then
+        [[ -n $iso ]] || die "no ISO: pass one, e.g. vm/nordlys-vm run ~/Downloads/some.iso"
+        qemu-img create -q -f qcow2 "$disk" "${NORDLYS_VM_DISK:-40G}"
+        fresh=1
+    fi
+    [[ -e $vars ]] || cp "$(firmware OVMF_VARS)" "$vars"
+    rm -f "$sock"
+
+    # UEFI tries the lower bootindex first and falls through an empty disk.
+    local disk_index=1 iso_index=2
+    [[ $first == iso ]] && disk_index=2 iso_index=1
+    local qemu=(
+        qemu-system-x86_64 -name Nordlys -enable-kvm -machine q35 -cpu host
+        -smp "${NORDLYS_VM_CPUS:-4}" -m "${NORDLYS_VM_MEM:-6G}"
+        -drive "if=pflash,format=raw,readonly=on,file=$(firmware OVMF_CODE)"
+        -drive "if=pflash,format=raw,file=$vars"
+        -drive "if=none,id=hd,format=qcow2,discard=unmap,file=$disk"
+        -device "virtio-blk-pci,drive=hd,bootindex=$disk_index"
+        -device virtio-vga-gl
+        -display "${NORDLYS_VM_DISPLAY:-gtk,gl=on,zoom-to-fit=on}"
+        -device virtio-tablet-pci -device virtio-keyboard-pci
+        -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${NORDLYS_VM_SSH_PORT:-2222}-:22"
+        -audiodev "${NORDLYS_VM_AUDIO:-pa},id=snd" -device intel-hda -device hda-output,audiodev=snd
+        # The clipboard channel: /dev/virtio-ports/org.nordlys.clipboard inside.
+        -device virtio-serial-pci
+        -chardev "socket,id=clip,path=$sock,server=on,wait=off"
+        -device "virtserialport,chardev=clip,name=org.nordlys.clipboard"
+        -pidfile "$pidfile"
+    )
+    if [[ -n $iso ]]; then
+        qemu+=(-drive "if=none,id=cd,format=raw,media=cdrom,readonly=on,file=$iso"
+            -device ide-cd,drive=cd,bootindex=$iso_index)
+    fi
+
+    # Extra QEMU options, split on spaces.
+    local extra=()
+    read -ra extra <<<"${NORDLYS_VM_EXTRA:-}"
+    qemu+=(${extra[@]+"${extra[@]}"})
+
+    [[ -n $fresh ]] && say "New VM: the installer from $(basename "$iso") will start. Pick UEFI defaults and the whole disk."
+    say "Ctrl+Alt+G grabs the keyboard (Super goes to the VM); Ctrl+Alt+F is fullscreen"
+    "${qemu[@]}" &
+    local qpid=$!
+    for _ in $(seq 50); do [[ -S $sock ]] && break; sleep 0.1; done
+    local cpid=
+    if [[ -S $sock ]]; then
+        python3 "$here/clipboard.py" "$sock" &
+        cpid=$!
+        echo "$cpid" >"$state/clip.pid"
+    fi
+    local status=0
+    wait "$qpid" || status=$?
+    [[ -n $cpid ]] && kill "$cpid" 2>/dev/null || true
+    rm -f "$pidfile" "$sock" "$state/clip.pid"
+    ((status == 0)) || die "QEMU exited with status $status"
+}
+
+case ${1:-} in
+    run) iso=$(find_iso "${2:-}"); boot disk "$iso" ;;
+    live) iso=$(find_iso "${2:-}"); [[ -n $iso ]] || die "no ISO found"; boot iso "$iso" ;;
+    clip)
+        running || die "the VM isn't running"
+        [[ -f $state/clip.pid ]] && kill "$(cat "$state/clip.pid")" 2>/dev/null || true
+        echo $$ >"$state/clip.pid"
+        exec python3 "$here/clipboard.py" "$sock" ;;
+    destroy)
+        running && die "shut the VM down first"
+        rm -fv "$disk" "$vars" ;;
+    *) sed -n '2,/^set -euo/{/^set -euo/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

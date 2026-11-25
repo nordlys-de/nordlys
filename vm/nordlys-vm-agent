@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Runs inside the Nordlys test VM, started by the Nordlys session.
+
+- Shares the text clipboard with the host over the virtio-serial port
+  org.nordlys.clipboard (the host end is vm/clipboard.py).
+- Resizes the screen to follow the QEMU window: virtio-gpu reports the
+  window size as the display's first mode, and the agent applies it.
+
+NORDLYS_VM_PORT and NORDLYS_VM_DRM override the paths (for testing).
+"""
+import base64, fcntl, glob, os, select, subprocess, sys, threading, time
+
+PORT = os.environ.get("NORDLYS_VM_PORT", "/dev/virtio-ports/org.nordlys.clipboard")
+DRM = os.environ.get("NORDLYS_VM_DRM", "/sys/class/drm")
+LIMIT = 1 << 20
+
+lock = threading.Lock()
+write_lock = threading.Lock()
+last = None  # the clipboard both sides already have
+
+
+def send(fd, line):
+    with write_lock:
+        data = line + b"\n"
+        try:
+            while data:
+                try:
+                    data = data[os.write(fd, data):]
+                except BlockingIOError:
+                    select.select([], [fd], [], 1)
+        except OSError:
+            pass  # nobody is listening on the host
+
+
+def clip_set(data):
+    # wl-copy forks to keep serving the clipboard: give it no pipes.
+    subprocess.run(["wl-copy"], input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def watch_clipboard(fd):
+    """Guest to host: wl-paste runs the command once per clipboard change."""
+    global last
+    while True:
+        p = subprocess.Popen(
+            ["wl-paste", "-t", "text", "--watch", "sh", "-c", "base64 -w0; echo"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for line in p.stdout:
+            line = line.strip()
+            data = base64.b64decode(line)
+            with lock:
+                fresh = data and len(data) <= LIMIT and data != last
+                if fresh:
+                    last = data
+            if fresh:
+                send(fd, line)
+        p.wait()
+        time.sleep(2)
+
+
+def serve_port(fd):
+    """Host to guest."""
+    global last
+    buf = b""
+    while True:
+        select.select([fd], [], [], 1)
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            continue
+        except OSError:
+            chunk = b""
+        if not chunk:  # the host end is closed
+            buf = b""
+            time.sleep(0.5)
+            continue
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if line == b"!ping":
+                send(fd, b"!hello")
+                continue
+            try:
+                data = base64.b64decode(line, validate=True)
+            except ValueError:
+                continue
+            if not data:
+                continue
+            with lock:
+                last = data
+            clip_set(data)
+        if len(buf) > 2 * LIMIT:
+            buf = b""
+
+
+def preferred_modes():
+    """{output name: "WxH"} for connected virtual outputs."""
+    modes = {}
+    for d in glob.glob(os.path.join(DRM, "card*-Virtual-*")):
+        try:
+            with open(os.path.join(d, "modes")) as f:
+                first = f.readline().strip()
+        except OSError:
+            continue
+        if first:
+            modes[os.path.basename(d).split("-", 1)[1]] = first
+    return modes
+
+
+def follow_window():
+    applied = {}
+    while True:
+        for output, mode in preferred_modes().items():
+            if applied.get(output) == mode:
+                continue
+            lua = (f'hl.monitor({{ output = "{output}", mode = "{mode}@60", '
+                   'position = "auto", scale = 1 })')
+            r = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip() in ("ok", ""):
+                applied[output] = mode
+            else:
+                print(f"nordlys-vm-agent: resize to {mode} failed: {r.stdout}{r.stderr}",
+                      file=sys.stderr)
+                applied[output] = mode  # don't repeat the same failure
+        time.sleep(1)
+
+
+def main():
+    # One agent per session.
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    guard = open(os.path.join(runtime, "nordlys-vm-agent.lock"), "w")
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("nordlys-vm-agent: already running")
+
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        threading.Thread(target=follow_window, daemon=True).start()
+    try:
+        fd = os.open(PORT, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as e:
+        print(f"nordlys-vm-agent: no clipboard port ({e})", file=sys.stderr)
+        while True:
+            time.sleep(3600)
+    send(fd, b"!hello")
+    threading.Thread(target=watch_clipboard, args=(fd,), daemon=True).start()
+    serve_port(fd)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

@@ -5,6 +5,7 @@
 #   sudo scripts/install.sh                 # into /usr/local
 #   scripts/install.sh --prefix /usr --destdir "$pkgdir"   # for packages
 #   sudo scripts/install.sh --uninstall
+#   sudo scripts/install.sh --vm-guest      # also the test VM's guest agent
 #
 # Installs the binaries, the session (Hyprland config, idle config,
 # wallpaper, nordlys-session) and the PAM file, and registers "Nordlys"
@@ -14,12 +15,14 @@ set -eu
 prefix=/usr/local
 destdir=
 uninstall=
+vm_guest=
 while [ $# -gt 0 ]; do
     case $1 in
         --prefix) prefix=$2; shift ;;
         --destdir) destdir=$2; shift ;;
         --uninstall) uninstall=1 ;;
-        -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --vm-guest) vm_guest=1 ;;
+        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "install.sh: unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -35,7 +38,8 @@ pam="$destdir/etc/pam.d"
 bins="nordlys-shell nordlysctl nordlys-theme"
 
 if [ -n "$uninstall" ]; then
-    for b in $bins nordlys-session; do rm -fv "$bin/$b"; done
+    for b in $bins nordlys-session nordlys-vm-agent; do rm -fv "$bin/$b"; done
+    rm -fv "$destdir/etc/udev/rules.d/70-nordlys-vm.rules"
     rm -rfv "$data"
     rm -fv "$sessions/nordlys.desktop"
     # The PAM file only includes `login`; it's left in place on purpose
@@ -65,6 +69,17 @@ if [ "$prefix" != /usr ]; then
         "$sessions/nordlys.desktop"
 fi
 [ -e "$pam/nordlys" ] || install -m644 "$root/config/pam.d/nordlys" "$pam/nordlys"
+
+if [ -n "$vm_guest" ]; then
+    install -m755 "$root/vm/nordlys-vm-agent" "$bin/nordlys-vm-agent"
+    install -d "$destdir/etc/udev/rules.d"
+    install -m644 "$root/vm/70-nordlys-vm.rules" "$destdir/etc/udev/rules.d/"
+    : >"$data/vm-guest"
+    if [ -z "$destdir" ]; then
+        udevadm control --reload
+        udevadm trigger --subsystem-match=virtio-ports
+    fi
+fi
 
 echo "Installed Nordlys into $destdir$prefix."
 [ -z "$destdir" ] && echo "Log out and pick \"Nordlys\" in your display manager, or run nordlys-session from a TTY."
