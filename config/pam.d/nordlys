@@ -1,0 +1,4 @@
+# PAM service for the Nordlys lock screen (nordlys-shell lock).
+# Install: sudo install -m644 config/pam.d/nordlys /etc/pam.d/nordlys
+# Without it the lock screen uses the "login" service, which is the same.
+auth        include     login

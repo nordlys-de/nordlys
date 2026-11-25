@@ -1,0 +1,14 @@
+[package]
+name = "nordlys-ipc"
+description = "Messages spoken over the nordlys-comp control socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

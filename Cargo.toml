@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/nordlys-de/nordlys"
+# License not chosen yet: see README.
+
+[workspace.dependencies]
+nordlys-config = { path = "crates/nordlys-config" }
+nordlys-ipc = { path = "crates/nordlys-ipc" }
+nordlys-stage = { path = "crates/nordlys-stage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

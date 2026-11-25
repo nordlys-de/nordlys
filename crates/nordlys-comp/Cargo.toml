@@ -1,0 +1,15 @@
+[package]
+name = "nordlys-comp"
+description = "The Nordlys Wayland compositor (Smithay). Headless IPC mode for now."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+nordlys-config.workspace = true
+nordlys-ipc.workspace = true
+nordlys-stage.workspace = true
+
+[lints]
+workspace = true

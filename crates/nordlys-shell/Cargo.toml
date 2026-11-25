@@ -1,0 +1,23 @@
+[package]
+name = "nordlys-shell"
+description = "Top bar, launcher, shelves, notifications and lock screen (iced + layer-shell)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+iced = { version = "0.14", features = ["tokio"] }
+futures = "0.3"
+iced_layershell = "0.19.1"
+iced_sessionlock = "0.19.1"
+nordlys-config.workspace = true
+nordlys-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Same major as iced's own zbus; async-io works with and without tokio.
+zbus = "5"
+
+[lints]
+workspace = true

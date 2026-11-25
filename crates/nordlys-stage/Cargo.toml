@@ -1,0 +1,10 @@
+[package]
+name = "nordlys-stage"
+description = "The Stage layout model: newest window in the centre, older ones on the shelf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "nordlysctl"
+description = "Control Nordlys from the command line"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+nordlys-ipc.workspace = true
+
+[lints]
+workspace = true
