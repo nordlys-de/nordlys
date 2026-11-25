@@ -1,0 +1,30 @@
+#!/bin/sh
+# Start a Nordlys session: Hyprland with Nordlys's own config, so
+# ~/.config/hypr stays untouched. The display manager runs this through
+# nordlys.desktop; from a TTY, run it directly.
+
+here=$(dirname "$(readlink -f "$0")")
+for d in "$NORDLYS_DATA" "$here/../share/nordlys" /usr/local/share/nordlys /usr/share/nordlys; do
+    if [ -n "$d" ] && [ -f "$d/hyprland.lua" ]; then
+        NORDLYS_DATA=$(readlink -f "$d")
+        break
+    fi
+done
+if [ ! -f "$NORDLYS_DATA/hyprland.lua" ]; then
+    echo "nordlys-session: can't find hyprland.lua (set NORDLYS_DATA)" >&2
+    exit 1
+fi
+export NORDLYS_DATA
+
+# Your own idle settings win.
+user_idle="${XDG_CONFIG_HOME:-$HOME/.config}/nordlys/hypridle.conf"
+[ -f "$user_idle" ] && export NORDLYS_IDLE="$user_idle"
+
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-Hyprland:Nordlys}"
+export XDG_SESSION_DESKTOP=nordlys
+export XDG_SESSION_TYPE=wayland
+
+if command -v start-hyprland >/dev/null; then
+    exec start-hyprland -- -c "$NORDLYS_DATA/hyprland.lua"
+fi
+exec Hyprland -c "$NORDLYS_DATA/hyprland.lua"

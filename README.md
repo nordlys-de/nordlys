@@ -6,8 +6,9 @@ The newest window always takes the centre of the screen. The window it
 replaces goes to the front of the shelf beside it. Workspaces, app groups
 and the same keys work on every screen size, from ultrawide to laptop.
 
-> Early days. The Stage model, config, theme writer and IPC work and are
-> tested; the compositor's display backend and the shell UI are not written yet.
+> Early days. The shell (bar, launcher, shelves, notifications, lock
+> screen) runs as a session on Hyprland; nordlys-comp, the Stage
+> compositor, is headless only so far.
 
 ## Crates
 
@@ -19,30 +20,70 @@ and the same keys work on every screen size, from ultrawide to laptop.
 | `nordlys-theme` | Writes the palette for GTK 3/4 (libadwaita), qt6ct and foot. | Working |
 | `nordlysctl` | Command-line control: `nordlysctl two-up`, `nordlysctl group d`… | Working |
 | `nordlys-comp` | The compositor, on Smithay. `--headless` runs the Stage model over IPC with no display. | Headless only |
-| `nordlys-shell` | Bar, launcher, shelves, notifications, lock screen, on iced and layer-shell. | Top bar and launcher working |
+| `nordlys-shell` | Bar, launcher, shelves, notifications, lock screen, on iced and layer-shell. | Working on Hyprland |
 
-## Build it
+## Install it
 
-Nordlys runs on Hyprland for now. On Arch or CachyOS:
+Nordlys runs as a session on Hyprland 0.55 or newer for now. On Arch or
+CachyOS:
 
 ```sh
-sudo pacman -S --needed rust hyprland hypridle inter-font ttf-jetbrains-mono \
-    playerctl wireplumber networkmanager bluez-utils
+sudo pacman -S --needed rust git hyprland hypridle swaybg hyprpolkitagent \
+    xdg-desktop-portal-hyprland inter-font ttf-jetbrains-mono \
+    wireplumber playerctl networkmanager bluez-utils brightnessctl \
+    grim slurp wl-clipboard foot
 git clone https://github.com/nordlys-de/nordlys && cd nordlys
 cargo build --release
-sudo install -m755 target/release/nordlys-shell target/release/nordlysctl \
-    target/release/nordlys-theme /usr/local/bin/
-sudo install -m644 config/pam.d/nordlys /etc/pam.d/nordlys
-nordlys-shell lock --check     # make sure the lock screen will take your password
+sudo scripts/install.sh            # into /usr/local; --uninstall removes it
+nordlys-shell lock --check         # make sure the lock screen takes your password
 ```
 
-Then add the `exec-once`, `bind` and `layerrule` lines from the sections
-below to `~/.config/hypr/hyprland.conf` and log into Hyprland. (In a VM,
-give it 3D acceleration, for example virtio-gpu with OpenGL; Hyprland's
-blur needs it.)
+Or build a package: `cd packaging/arch && makepkg -si`.
+
+Log out, pick **Nordlys** in your display manager (SDDM, GDM, greetd…) and
+log in. From a TTY, run `nordlys-session`. In a VM, give it 3D
+acceleration (virtio-gpu with OpenGL, or VMware's 3D); Hyprland needs it.
+
+What you get:
+
+- `nordlys-session` starts Hyprland with Nordlys's own config
+  (`share/nordlys/hyprland.lua`), so your `~/.config/hypr` is left alone.
+- It starts the bar, shelf, ambient rail, notification daemon, hypridle
+  (dim at 4 min, lock at 5, screen off at 6, suspend at 30), the polkit
+  agent and the aurora wallpaper, and blurs every shell surface.
+- On first login it themes GTK and Qt apps with `nordlys-theme`, unless
+  you already have a `gtk.css`.
+
+To change things, put Lua in `~/.config/nordlys/hyprland.lua`; it runs
+after the Nordlys config and can override any of it. Your own idle
+settings go in `~/.config/nordlys/hypridle.conf`.
+
+### Keys
+
+Super is the Nordlys key. Hyprland has no Stage layout yet, so the Stage
+keys drive its master layout: the master window is on stage and the stack
+is the shelf. With nordlys-comp running, the same keys go to the real
+Stage model.
+
+| Keys | Does |
+|---|---|
+| Super Space · Super Shift Space | Launcher · commands |
+| Super Enter · E · , | Terminal · editor · `nordlys.toml` |
+| Super K · J | Previous window to stage · cycle the shelf |
+| Super T · Tab · S | Two-up on/off · swap main and side · send to shelf |
+| Super G | App groups (the launcher's commands) |
+| Super Q · F | Close · float |
+| Super 1–9 · Shift 1–9 | Go to workspace · send the window there |
+| Super [ ] · scroll | Previous · next workspace |
+| Super - · Shift - | Scratchpad · send to scratchpad |
+| Super Shift S | Screenshot a region to the clipboard |
+| Super Esc or L | Lock |
+| Super Shift Esc | Log out |
+| Super drag · right-drag | Move · resize a window |
 
 On other distros you need the development files for PAM, xkbcommon and
-Wayland (Debian/Ubuntu: `libpam0g-dev libxkbcommon-dev libwayland-dev`).
+Wayland (Debian/Ubuntu: `libpam0g-dev libxkbcommon-dev libwayland-dev`),
+then the same `cargo build` and `scripts/install.sh`.
 
 ## Try it
 
@@ -76,15 +117,8 @@ It shows workspaces (click to switch), what's on stage, the clock, the
 layout and the battery. Workspaces come from nordlys-comp when its socket
 is up, from Hyprland's IPC on Hyprland, and from a demo set otherwise.
 
-On Hyprland, start it from `hyprland.conf` and let Hyprland blur it. The
-layer's namespace is `nordlys-bar`; check the layer-rule syntax for your
-Hyprland version:
-
-```ini
-exec-once = nordlys-shell
-layerrule = blur, nordlys-bar
-layerrule = ignorealpha 0.3, nordlys-bar
-```
+The Nordlys session starts it and has Hyprland blur it (layer namespace
+`nordlys-bar`).
 
 The bar asks for the **Inter** and **JetBrains Mono** fonts and falls back
 to the system fonts when they're missing.
@@ -116,13 +150,8 @@ live in `~/.local/state/nordlys/launcher-history`.
 Stage commands need nordlys-comp. Without it, the launcher says so instead
 of closing, and app groups fall back to starting their apps in order.
 
-On Hyprland:
-
-```ini
-bind = SUPER, SPACE, exec, nordlys-shell launcher
-bind = SUPER SHIFT, SPACE, exec, nordlys-shell launcher --query ">"
-layerrule = blur, nordlys-launcher
-```
+In the Nordlys session it opens with Super+Space, or Super+Shift+Space for
+commands.
 
 ## The shelf and the ambient rail
 
@@ -156,16 +185,7 @@ For now it talks to the standard tools: `playerctl`, `wpctl`, `nmcli`,
 Each rail reserves 88 px on its edge, so windows sit between them. The
 surface widens while a hover card or the panel is open.
 
-On Hyprland:
-
-```ini
-exec-once = nordlys-shell shelf
-exec-once = nordlys-shell ambient
-layerrule = blur, nordlys-shelf
-layerrule = blur, nordlys-ambient
-layerrule = ignorealpha 0.3, nordlys-shelf
-layerrule = ignorealpha 0.3, nordlys-ambient
-```
+The Nordlys session starts both.
 
 ## Notifications
 
@@ -193,13 +213,8 @@ you last opened the panel, and the panel lists the three most recent with
 **Show last** and **Clear**. Without the daemon the rail falls back to dunst.
 
 Only one notification daemon can run. If dunst (or mako) is running, stop
-it first; `notify` says so and exits otherwise. On Hyprland:
-
-```ini
-exec-once = nordlys-shell notify
-layerrule = blur, nordlys-notify
-layerrule = ignorealpha 0.3, nordlys-notify
-```
+it first; `notify` says so and exits otherwise. The Nordlys session starts
+it.
 
 To try it without stopping your current daemon, give it a bus of its own:
 
@@ -237,26 +252,12 @@ sudo install -m644 config/pam.d/nordlys /etc/pam.d/nordlys
 Without that file it uses `login`, which is what the file includes anyway.
 Run `lock --check` once before relying on it.
 
-On Hyprland, lock with a key and when idle (with hypridle):
-
-```ini
-# hyprland.conf
-bind = SUPER, L, exec, nordlys-shell lock
-
-# hypridle.conf
-general {
-    lock_cmd = pgrep -f "nordlys-shell lock" || nordlys-shell lock
-    before_sleep_cmd = loginctl lock-session
-}
-listener {
-    timeout = 300
-    on-timeout = loginctl lock-session
-}
-```
+In the Nordlys session, Super+Esc or Super+L locks, and hypridle locks
+after five minutes idle and before sleep.
 
 If the lock screen ever crashes, Hyprland shows a red screen and stays
-locked. From another TTY, run `hyprctl --instance 0 'keyword
-misc:allow_session_lock_restore 1'` and start `nordlys-shell lock` again.
+locked. The session allows a new lock screen to take over: from another
+TTY, run `WAYLAND_DISPLAY=wayland-1 nordlys-shell lock` as yourself.
 
 ## Roadmap
 

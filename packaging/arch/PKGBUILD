@@ -1,0 +1,70 @@
+# Nordlys from git, for Arch and CachyOS.
+#
+#   cd packaging/arch && makepkg -si
+#
+# While the repository is private, makepkg clones it with your git
+# credentials (gh auth setup-git, or an SSH URL below).
+
+pkgname=nordlys-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="A frosted, keyboard-first desktop on Hyprland"
+arch=(x86_64 aarch64)
+url="https://github.com/nordlys-de/nordlys"
+license=(LicenseRef-unknown)   # not chosen yet
+depends=(
+    hyprland hypridle swaybg
+    xdg-desktop-portal-hyprland hyprpolkitagent
+    pam libxkbcommon wayland
+    inter-font ttf-jetbrains-mono
+    wireplumber
+)
+optdepends=(
+    'playerctl: now-playing controls'
+    'networkmanager: Wi-Fi toggle'
+    'bluez-utils: Bluetooth toggle'
+    'brightnessctl: brightness keys and idle dimming'
+    'grim: Super+Shift+S screenshots'
+    'slurp: Super+Shift+S screenshots'
+    'wl-clipboard: Super+Shift+S screenshots'
+    'foot: a terminal for Super+Enter'
+    'qt6ct: Qt apps in the Nordlys palette'
+)
+makedepends=(cargo git)
+provides=(nordlys)
+conflicts=(nordlys)
+backup=(etc/pam.d/nordlys)
+source=("nordlys::git+$url.git")
+sha256sums=(SKIP)
+
+pkgver() {
+    cd nordlys
+    printf '%s.r%s.g%s' \
+        "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" \
+        "$(git rev-list --count HEAD)" \
+        "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    cd nordlys
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd nordlys
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p nordlys-shell -p nordlysctl -p nordlys-theme
+}
+
+check() {
+    cd nordlys
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release -p nordlys-shell -p nordlysctl -p nordlys-theme -p nordlys-config -p nordlys-stage
+}
+
+package() {
+    cd nordlys
+    sh scripts/install.sh --prefix /usr --destdir "$pkgdir"
+}

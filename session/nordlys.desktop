@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Nordlys
+Comment=A frosted, keyboard-first desktop
+Exec=nordlys-session
+TryExec=nordlys-session
+Type=Application
+DesktopNames=Hyprland;Nordlys
+Keywords=wayland;desktop;

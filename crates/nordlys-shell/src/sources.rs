@@ -71,7 +71,11 @@ impl Compositor {
 
     pub fn switch_to(&self, ws: &Workspace) {
         if let Compositor::Hyprland(p) = self {
-            let _ = hypr_request(p, &format!("dispatch workspace {}", ws.id));
+            hypr_dispatch(
+                p,
+                &format!("hl.dsp.focus({{ workspace = {} }})", ws.id),
+                &format!("workspace {}", ws.id),
+            );
         }
         // nordlys-comp has one headless stage for now: no workspaces yet.
     }
@@ -110,7 +114,11 @@ impl Compositor {
                 }
             }
             Compositor::Hyprland(p) => {
-                let _ = hypr_request(p, &format!("dispatch focuswindow address:{}", w.id));
+                hypr_dispatch(
+                    p,
+                    &format!("hl.dsp.focus({{ window = \"address:{}\" }})", w.id),
+                    &format!("focuswindow address:{}", w.id),
+                );
             }
             Compositor::Demo => {}
         }
@@ -235,6 +243,16 @@ fn hypr_request(sock: &Path, cmd: &str) -> Option<String> {
     let mut out = String::new();
     s.read_to_string(&mut out).ok()?;
     Some(out)
+}
+
+/// Run a dispatcher. Hyprland 0.55+ with a Lua config takes Lua
+/// (`hl.dsp.focus({ workspace = 2 })`); older ones take the classic
+/// form (`workspace 2`). Try Lua first and fall back.
+fn hypr_dispatch(sock: &Path, lua: &str, classic: &str) {
+    let ok = |r: Option<String>| r.is_some_and(|r| r.trim() == "ok");
+    if !ok(hypr_request(sock, &format!("dispatch {lua}"))) {
+        let _ = hypr_request(sock, &format!("dispatch {classic}"));
+    }
 }
 
 fn hypr_desk(sock: &Path) -> Option<Desk> {
