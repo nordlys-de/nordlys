@@ -40,6 +40,7 @@ hl.on("hyprland.start", function()
     hl.exec_cmd("nordlys-shell")
     hl.exec_cmd("nordlys-shell shelf")
     hl.exec_cmd("nordlys-shell ambient")
+    hl.exec_cmd("nordlys-shell close-button")
     hl.exec_cmd("hypridle -c " .. (os.getenv("NORDLYS_IDLE") or (data .. "/hypridle.conf")))
 
     -- In a test VM (scripts/setup.sh installs it): shared clipboard and
@@ -117,6 +118,8 @@ hl.config({
 
     misc = {
         force_default_wallpaper = 0,
+        -- XDG_CURRENT_DESKTOP is set by nordlys-session, deliberately.
+        disable_xdg_env_checks = true,
         disable_hyprland_logo   = true,
         disable_splash_rendering = true,
         -- If the lock screen crashes, let a new one take over.
@@ -184,6 +187,19 @@ local function when_tiled(a, b)
 end
 local last = hl.dsp.focus({ last = true })
 
+-- Global on purpose: the launcher runs these with `hyprctl eval`.
+nordlys_stage = {
+    previous = function() hl.dispatch(last) end,
+    cycle = when_tiled(hl.dsp.layout("rollnext"), hl.dsp.layout("cyclenext")),
+    two_up = function()
+        tiled = not tiled
+        hl.config({ general = { layout = tiled and "master" or "monocle" } })
+    end,
+    swap = when_tiled(hl.dsp.layout("swapwithmaster"), last),
+    -- On the stage view, shelving the window means bringing the previous one up.
+    send_to_shelf = when_tiled(hl.dsp.layout("swapwithmaster"), last),
+}
+
 local function bind_stage(k, ctl, action, desc)
     hl.bind(key(k), function()
         if comp_running() then
@@ -194,18 +210,11 @@ local function bind_stage(k, ctl, action, desc)
     end, { desc = desc })
 end
 
-bind_stage("K", "previous", function() hl.dispatch(last) end, "Previous window to stage")
-bind_stage("J", "cycle",
-    when_tiled(hl.dsp.layout("rollnext"), hl.dsp.layout("cyclenext")), "Cycle through the shelf")
-bind_stage("T", "two-up", function()
-    tiled = not tiled
-    hl.config({ general = { layout = tiled and "master" or "monocle" } })
-end, "Two-up (tiled view) on or off")
-bind_stage("Tab", "swap",
-    when_tiled(hl.dsp.layout("swapwithmaster"), last), "Swap main and side")
--- On the stage view, shelving the window means bringing the previous one up.
-bind_stage("S", "send-to-shelf",
-    when_tiled(hl.dsp.layout("swapwithmaster"), last), "Send to shelf")
+bind_stage("K",   "previous",      nordlys_stage.previous,      "Previous window to stage")
+bind_stage("J",   "cycle",         nordlys_stage.cycle,         "Cycle through the shelf")
+bind_stage("T",   "two-up",        nordlys_stage.two_up,        "Two-up (tiled view) on or off")
+bind_stage("Tab", "swap",          nordlys_stage.swap,          "Swap main and side")
+bind_stage("S",   "send-to-shelf", nordlys_stage.send_to_shelf, "Send to shelf")
 
 -- Shelves and groups
 hl.bind(key("G"), run("nordlys-shell launcher --query '>'"), { desc = "App groups" })

@@ -104,6 +104,39 @@ impl Compositor {
         }
     }
 
+    /// The focused window and the pointer, both relative to the window's
+    /// screen. None on a fullscreen or empty screen, or off Hyprland.
+    pub fn active_frame(&self) -> Option<(Frame, (i32, i32))> {
+        let Compositor::Hyprland(p) = self else {
+            return None;
+        };
+        let json =
+            |cmd: &str| -> Option<Value> { serde_json::from_str(&hypr_request(p, cmd)?).ok() };
+        parse_frame(
+            &json("j/activewindow")?,
+            &json("j/monitors")?,
+            &json("j/cursorpos")?,
+        )
+    }
+
+    /// Ask a window to close.
+    pub fn close(&self, id: &str) {
+        match self {
+            Compositor::Nordlys(p) => {
+                let req = nordlys_ipc::Request::Close { id: id.to_owned() };
+                if let Ok(mut s) = UnixStream::connect(p) {
+                    let _ = s.write_all(nordlys_ipc::to_line(&req).as_bytes());
+                }
+            }
+            Compositor::Hyprland(p) => hypr_dispatch(
+                p,
+                &format!("hl.dsp.window.close({{ window = \"address:{id}\" }})"),
+                &format!("closewindow address:{id}"),
+            ),
+            Compositor::Demo => {}
+        }
+    }
+
     /// Put a shelf window on stage.
     pub fn bring(&self, w: &ShelfWindow) {
         match self {
@@ -123,6 +156,40 @@ impl Compositor {
             Compositor::Demo => {}
         }
     }
+}
+
+/// Where a window is on its screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub id: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+fn parse_frame(window: &Value, monitors: &Value, cursor: &Value) -> Option<(Frame, (i32, i32))> {
+    let int = |v: Option<&Value>| v.and_then(Value::as_i64).map(|n| n as i32);
+    // `fullscreen` is a number (0 = no) or, on older Hyprland, a bool.
+    let fullscreen = window.get("fullscreen");
+    if fullscreen.is_some_and(|f| f.as_i64().is_some_and(|n| n != 0) || f.as_bool() == Some(true)) {
+        return None;
+    }
+    let monitor = window.get("monitor")?.as_i64()?;
+    let screen = monitors
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_i64) == Some(monitor))?;
+    let (sx, sy) = (int(screen.get("x"))?, int(screen.get("y"))?);
+    let frame = Frame {
+        id: window.get("address")?.as_str()?.to_owned(),
+        x: int(window.pointer("/at/0"))? - sx,
+        y: int(window.pointer("/at/1"))? - sy,
+        width: int(window.pointer("/size/0"))?,
+        height: int(window.pointer("/size/1"))?,
+    };
+    let pointer = (int(cursor.get("x"))? - sx, int(cursor.get("y"))? - sy);
+    Some((frame, pointer))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +416,22 @@ pub fn clock_text(now: chrono::DateTime<chrono::Local>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_active_window_is_measured_from_its_screen() {
+        let window = json!({"address": "0xab", "monitor": 1, "fullscreen": 0,
+                            "at": [2020, 62], "size": [800, 600]});
+        let monitors = json!([{"id": 0, "x": 0, "y": 0}, {"id": 1, "x": 1920, "y": 0}]);
+        let cursor = json!({"x": 2700, "y": 80});
+        let (f, pointer) = parse_frame(&window, &monitors, &cursor).unwrap();
+        assert_eq!((f.x, f.y, f.width, f.height), (100, 62, 800, 600));
+        assert_eq!(pointer, (780, 80));
+        // Nothing focused, or fullscreen: no button.
+        assert!(parse_frame(&json!({}), &monitors, &cursor).is_none());
+        let full = json!({"address": "0xab", "monitor": 1, "fullscreen": 2,
+                          "at": [1920, 0], "size": [800, 600]});
+        assert!(parse_frame(&full, &monitors, &cursor).is_none());
+    }
 
     #[test]
     fn hyprland_json_becomes_workspaces() {

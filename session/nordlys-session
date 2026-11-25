@@ -20,7 +20,8 @@ export NORDLYS_DATA
 user_idle="${XDG_CONFIG_HOME:-$HOME/.config}/nordlys/hypridle.conf"
 [ -f "$user_idle" ] && export NORDLYS_IDLE="$user_idle"
 
-export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-Hyprland:Nordlys}"
+# Portals and apps know Hyprland; XDG_SESSION_DESKTOP says it's Nordlys.
+export XDG_CURRENT_DESKTOP=Hyprland
 export XDG_SESSION_DESKTOP=nordlys
 export XDG_SESSION_TYPE=wayland
 

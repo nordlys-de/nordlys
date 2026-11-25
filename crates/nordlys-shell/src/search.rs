@@ -219,7 +219,7 @@ impl Catalog {
     pub fn run(&mut self, item: &Item, alt: bool) -> Result<(), String> {
         let result = match &item.action {
             Action::App(i) => self.apps[*i].launch().map_err(|e| e.to_string()),
-            Action::Ipc(req) => ipc(req.clone()),
+            Action::Ipc(req) => stage_request(req.clone()),
             Action::Group(name) => self.launch_group(name),
             Action::Shell(cmd) => apps::spawn_shell(cmd).map_err(|e| e.to_string()),
             Action::Open(p) => {
@@ -407,6 +407,44 @@ pub fn score(q: &str, s: &str) -> Option<i32> {
         pos = found + 1;
     }
     Some(total)
+}
+
+/// A Stage command: for nordlys-comp, or on Hyprland for the session's
+/// own Lua functions (session/hyprland.lua).
+fn stage_request(req: Request) -> Result<(), String> {
+    let lua = hyprland_stage(&req);
+    match (ipc(req), lua) {
+        (Err(_), Some(lua)) if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() => {
+            hyprctl(&lua)
+        }
+        (result, _) => result,
+    }
+}
+
+/// The `hyprctl` arguments that do the same as `req`.
+fn hyprland_stage(req: &Request) -> Option<[&'static str; 2]> {
+    let call = match req {
+        Request::TwoUp => "nordlys_stage.two_up()",
+        Request::SendToShelf => "nordlys_stage.send_to_shelf()",
+        Request::Previous => "nordlys_stage.previous()",
+        Request::Swap => "nordlys_stage.swap()",
+        Request::Reload => return Some(["reload", "config-only"]),
+        _ => return None,
+    };
+    Some(["eval", call])
+}
+
+fn hyprctl(args: &[&str; 2]) -> Result<(), String> {
+    let out = std::process::Command::new("hyprctl")
+        .args(args)
+        .output()
+        .map_err(|e| format!("hyprctl: {e}"))?;
+    let reply = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if out.status.success() && (reply.is_empty() || reply == "ok") {
+        Ok(())
+    } else {
+        Err(format!("Hyprland said: {reply}"))
+    }
 }
 
 /// Send one request to nordlys-comp.

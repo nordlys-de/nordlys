@@ -5,27 +5,60 @@
 //! Shelling out keeps this simple and works on any distro that has the
 //! tools. Talking to D-Bus directly is the later, lighter replacement.
 
-use std::process::{Command, Stdio};
+use std::io::Read;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
+/// How long any tool may take. These run on the UI thread, and some never
+/// return: `bluetoothctl` waits forever when bluetoothd isn't running.
+const PATIENCE: Duration = Duration::from_millis(800);
+
+/// Wait for `child`, killing it once `limit` has passed.
+fn wait_within(mut child: Child, limit: Duration) -> Option<(ExitStatus, Child)> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some((status, child)),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// A tool's output, if it succeeds in time. Outputs here are a few lines,
+/// well within a pipe's buffer, so reading after exit can't deadlock.
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd)
+    let child = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    out.status
+    let (status, mut child) = wait_within(child, PATIENCE)?;
+    let mut out = Vec::new();
+    child.stdout.take()?.read_to_end(&mut out).ok()?;
+    status
         .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .then(|| String::from_utf8_lossy(&out).trim().to_owned())
 }
 
 fn fire(cmd: &str, args: &[&str]) {
-    let _ = Command::new(cmd)
+    let child = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn();
+    if let Ok(child) = child {
+        let _ = wait_within(child, PATIENCE);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -108,6 +141,9 @@ pub fn set_wifi(on: bool) {
 }
 
 pub fn bluetooth() -> Option<bool> {
+    // No adapter (most VMs): don't even ask.
+    let adapters = std::fs::read_dir("/sys/class/bluetooth").ok()?;
+    adapters.flatten().next()?;
     parse_bluetooth(&run("bluetoothctl", &["show"])?)
 }
 
@@ -262,6 +298,15 @@ mod tests {
             parse_now_playing("Playing", "").unwrap().title,
             "Unknown track"
         );
+    }
+
+    #[test]
+    fn a_hung_tool_is_given_up_on() {
+        let start = Instant::now();
+        assert_eq!(run("sleep", &["30"]), None);
+        fire("sleep", &["30"]);
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert_eq!(run("echo", &["hi"]).as_deref(), Some("hi"));
     }
 
     #[test]

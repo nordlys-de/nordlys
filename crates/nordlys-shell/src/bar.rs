@@ -5,12 +5,14 @@
 //! and as a plain preview window anywhere else.
 
 use crate::apps;
+use crate::calendar;
 use crate::icons::{self, icon};
 use crate::sources::{self, Battery, Compositor, Desk};
+use chrono::{Datelike, NaiveDate};
 use iced::alignment::Horizontal;
 use iced::font::Weight;
 use iced::gradient::Linear;
-use iced::widget::{button, container, row, text};
+use iced::widget::{button, column, container, mouse_area, row, text};
 use iced::{
     Alignment, Background, Border, Color, Element, Font, Length, Radians, Shadow, Subscription,
     Task, Vector,
@@ -45,6 +47,8 @@ pub struct Bar {
     desk: Desk,
     battery: Option<Battery>,
     clock: String,
+    /// The month on show while the calendar is open.
+    month: Option<NaiveDate>,
     /// Draw a stand-in wallpaper behind the bar (preview window only).
     preview: bool,
 }
@@ -55,7 +59,20 @@ pub enum Message {
     Tick,
     Switch(usize),
     Launcher,
+    /// Open or close the calendar under the clock.
+    Calendar,
+    /// Move the calendar by this many months.
+    Month(i32),
+    Today,
+    /// A click on the calendar itself, which mustn't close it.
+    Keep,
 }
+
+/// The surface's height with the calendar closed and open.
+pub const SURFACE: u32 = BAR_HEIGHT + BAR_GAP * 2;
+const SURFACE_OPEN: u32 = SURFACE + CALENDAR_HEIGHT;
+const CALENDAR_HEIGHT: u32 = 320;
+const CALENDAR_WIDTH: f32 = 300.0;
 
 impl Bar {
     pub fn new(config: &Config, preview: bool) -> Self {
@@ -66,6 +83,7 @@ impl Bar {
             desk: Desk::default(),
             battery: None,
             clock: String::new(),
+            month: None,
             compositor,
             preview,
         };
@@ -96,10 +114,37 @@ impl Bar {
                 }
                 self.refresh();
             }
+            Message::Calendar => {
+                self.month = match self.month {
+                    Some(_) => None,
+                    None => Some(calendar::first_of(today())),
+                };
+                return self.resize();
+            }
+            Message::Month(by) => {
+                self.month = self.month.map(|m| calendar::shift(m, by));
+            }
+            Message::Today => {
+                self.month = self.month.map(|_| calendar::first_of(today()));
+            }
             // Layer-shell control messages added by `to_layer_message`.
             _ => {}
         }
         Task::none()
+    }
+
+    /// The surface grows to hold the calendar. The space the bar reserves
+    /// stays the same, so windows don't move.
+    fn resize(&self) -> Task<Message> {
+        if self.preview {
+            return Task::none();
+        }
+        let height = if self.month.is_some() {
+            SURFACE_OPEN
+        } else {
+            SURFACE
+        };
+        Task::done(Message::SizeChange((0, height)))
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -185,10 +230,20 @@ impl Bar {
         .spacing(7)
         .align_y(Alignment::Center);
 
-        let clock = text(self.clock.clone())
-            .font(INTER_SEMIBOLD)
-            .size(13)
-            .color(color(p.text));
+        let open = self.month.is_some();
+        let clock = button(text(self.clock.clone()).font(INTER_SEMIBOLD).size(13))
+            .padding([5, 10])
+            .on_press(Message::Calendar)
+            .style(move |_, status| button::Style {
+                background: (open || status == button::Status::Hovered)
+                    .then_some(Background::Color(glass.chip_hover)),
+                text_color: color(p.text),
+                border: Border {
+                    radius: 8.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            });
 
         let layout_label = match (self.layout, &self.compositor) {
             (_, Compositor::Demo) => "preview · no compositor".to_owned(),
@@ -260,8 +315,26 @@ impl Bar {
         let framed = container(bar)
             .padding([BAR_GAP as f32, 12.0])
             .width(Length::Fill);
+        let framed: Element<'_, Message> = match self.month {
+            Some(month) => column![
+                framed,
+                // A click beside the calendar closes it.
+                mouse_area(
+                    container(
+                        mouse_area(calendar_panel(p, glass, month, today()))
+                            .on_press(Message::Keep)
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(Horizontal::Center)
+                )
+                .on_press(Message::Calendar),
+            ]
+            .into(),
+            None => framed.into(),
+        };
         if !self.preview {
-            return framed.into();
+            return framed;
         }
         // A stand-in for the blurred wallpaper so the glass reads in a plain window.
         let (a, b) = if p.dark {
@@ -302,6 +375,110 @@ impl Bar {
             text_color: color(self.palette.text),
         }
     }
+}
+
+fn today() -> NaiveDate {
+    chrono::Local::now().date_naive()
+}
+
+fn calendar_panel<'a>(
+    p: &Palette,
+    glass: Glass,
+    month: NaiveDate,
+    today: NaiveDate,
+) -> Element<'a, Message> {
+    let (accent, on_accent) = (color(p.accent), color(p.on_accent));
+    let (ink, dim) = (color(p.text), color(p.dim));
+    let step = move |label: &'static str, message: Message| {
+        button(text(label).font(INTER_SEMIBOLD).size(14))
+            .padding([2, 10])
+            .on_press(message)
+            .style(move |_, status| button::Style {
+                background: Some(Background::Color(if status == button::Status::Hovered {
+                    glass.chip_hover
+                } else {
+                    glass.chip
+                })),
+                text_color: ink,
+                border: Border {
+                    radius: 7.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            })
+    };
+    let title = button(
+        text(month.format("%B %Y").to_string())
+            .font(INTER_SEMIBOLD)
+            .size(14),
+    )
+    .padding(0)
+    .on_press(Message::Today)
+    .style(move |_, _| button::Style {
+        text_color: ink,
+        ..button::Style::default()
+    });
+    let cell = |content: Element<'a, Message>| {
+        container(content)
+            .width(Length::Fill)
+            .height(30)
+            .align_x(Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+    };
+    let names = row(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+        .map(|d| cell(text(d).font(INTER).size(11).color(dim).into()).into()));
+    let mut grid = column![
+        row![
+            container(title).width(Length::Fill),
+            step("‹", Message::Month(-1)),
+            step("›", Message::Month(1)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        names,
+    ]
+    .spacing(6);
+    for week in calendar::weeks(month) {
+        grid = grid.push(row(week.map(|day| {
+            let is_today = day == today;
+            let ink = if is_today {
+                on_accent
+            } else if day.month() == month.month() {
+                ink
+            } else {
+                dim
+            };
+            let number = container(text(day.day().to_string()).font(INTER).size(12).color(ink))
+                .width(28)
+                .height(28)
+                .align_x(Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center)
+                .style(move |_| container::Style {
+                    background: is_today.then_some(Background::Color(accent)),
+                    border: Border {
+                        radius: 14.0.into(),
+                        ..Border::default()
+                    },
+                    ..container::Style::default()
+                });
+            cell(number.into()).into()
+        })));
+    }
+    let ground = color(p.ground);
+    container(grid)
+        .width(CALENDAR_WIDTH)
+        .padding(14)
+        .style(move |_| container::Style {
+            // Darker than the bar: it sits over windows, not just wallpaper.
+            background: Some(Background::Color(Color { a: 0.94, ..ground })),
+            border: Border {
+                radius: 14.0.into(),
+                width: 1.0,
+                color: glass.bar_border,
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// Translucent fills from the canvas. The compositor supplies the blur.

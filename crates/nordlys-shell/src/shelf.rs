@@ -6,10 +6,11 @@
 //! come with nordlys-comp. Until then the flyout shows name and title.
 
 use crate::bar::{INTER, INTER_SEMIBOLD, color};
+use crate::icons::{self, icon};
 use crate::sources::{Compositor, ShelfWindow};
 use crate::ui::{self, Rail};
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{Space, column, container, mouse_area, row, stack, text};
+use iced::widget::{Space, button, column, container, mouse_area, row, stack, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task};
 use iced_layershell::to_layer_message;
 use nordlys_config::{Config, Palette};
@@ -38,6 +39,7 @@ pub enum Message {
     Hover(usize),
     Unhover,
     Pick(usize),
+    Close(usize),
 }
 
 impl Shelf {
@@ -84,6 +86,17 @@ impl Shelf {
                 }
             }
             Message::Unhover => {
+                self.hover = None;
+                return self.resize();
+            }
+            Message::Close(i) => {
+                if let Some(w) = self.windows.get(i) {
+                    self.compositor.close(&w.id);
+                }
+                // The window takes a moment to go; drop its tile now.
+                if i < self.windows.len() {
+                    self.windows.remove(i);
+                }
                 self.hover = None;
                 return self.resize();
             }
@@ -220,12 +233,51 @@ fn slot(i: usize, w: &ShelfWindow, hovered: bool, r: Rail) -> Element<'static, M
     .height(TILE + 6.0)
     .align_x(Horizontal::Right)
     .align_y(Vertical::Bottom);
-    mouse_area(stack![container(tile).padding(3), badge])
+    // The tile picks; the × on top closes. Hover is tracked around both, so
+    // moving onto the × doesn't count as leaving.
+    let pick = mouse_area(stack![container(tile).padding(3), badge])
+        .on_press(Message::Pick(i))
+        .interaction(iced::mouse::Interaction::Pointer);
+    let mut layers = stack![pick];
+    if hovered {
+        layers = layers.push(
+            container(close_badge(i, r))
+                .width(TILE + 6.0)
+                .align_x(Horizontal::Right),
+        );
+    }
+    mouse_area(layers)
         .on_enter(Message::Hover(i))
         .on_exit(Message::Unhover)
-        .on_press(Message::Pick(i))
-        .interaction(iced::mouse::Interaction::Pointer)
         .into()
+}
+
+fn close_badge(i: usize, r: Rail) -> Element<'static, Message> {
+    button(
+        container(icon(icons::CLOSE, 12))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center),
+    )
+    .width(20)
+    .height(20)
+    .padding(0)
+    .on_press(Message::Close(i))
+    .style(move |_, status| button::Style {
+        background: Some(Background::Color(match status {
+            button::Status::Hovered | button::Status::Pressed => Color::from_rgb8(0xE0, 0x5A, 0x6D),
+            _ => r.badge,
+        })),
+        text_color: r.text,
+        border: Border {
+            radius: 10.0.into(),
+            width: 1.0,
+            color: r.chip_border,
+        },
+        ..button::Style::default()
+    })
+    .into()
 }
 
 fn flyout(i: usize, w: &ShelfWindow, r: Rail) -> Element<'static, Message> {

@@ -65,7 +65,10 @@ uses its monocle layout: the focused window fills the stage and the others
 wait, unseen, on the shelf. Click one there to bring it over. Super+T
 switches to a tiled view (Hyprland's master layout) to see windows side by
 side. With nordlys-comp running, the same keys go to the real Stage model.
-The **Apps** button on the bar opens the launcher with the mouse.
+With the mouse: the **Apps** button on the bar opens the launcher, the
+clock opens a calendar, and the **×** closes a window. It appears when the
+pointer nears the active window's top-right corner, and on a shelf tile
+you hover.
 
 | Keys | Does |
 |---|---|

@@ -4,5 +4,5 @@ Comment=A frosted, keyboard-first desktop
 Exec=nordlys-session
 TryExec=nordlys-session
 Type=Application
-DesktopNames=Hyprland;Nordlys
+DesktopNames=Hyprland
 Keywords=wayland;desktop;

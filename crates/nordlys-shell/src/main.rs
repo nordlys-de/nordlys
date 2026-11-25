@@ -15,6 +15,8 @@
 mod ambient;
 mod apps;
 mod bar;
+mod calendar;
+mod closer;
 mod files;
 mod icons;
 mod launcher;
@@ -40,6 +42,7 @@ usage: nordlys-shell [bar] [--window] [--output NAME]
        nordlys-shell launcher [--window] [--query TEXT]
        nordlys-shell shelf|ambient [--window] [--output NAME]
        nordlys-shell notify [--window]
+       nordlys-shell close-button
        nordlys-shell lock [--window | --check]";
 
 fn main() -> ExitCode {
@@ -91,6 +94,8 @@ fn main() -> ExitCode {
         (Some("shelf"), true) => shelf_window(config),
         (Some("ambient"), false) => ambient_layer(config, output),
         (Some("ambient"), true) => ambient_window(config),
+        (Some("close-button"), false) => close_button_layer(),
+        (Some("close-button"), true) => Err("the close button needs Hyprland".into()),
         (Some("notify"), false) => notify_layer(config),
         (Some("notify"), true) => notify_window(config),
         (Some("lock"), _) if args.iter().any(|a| a == "--check") => lock_check(),
@@ -114,7 +119,7 @@ fn bar_layer(config: Config, output: Option<String>) -> Result<(), String> {
     use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
     use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 
-    let height = BAR_HEIGHT + BAR_GAP * 2;
+    let height = bar::SURFACE;
     iced_layershell::application(
         move || Bar::new(&config, false),
         || "nordlys-bar".to_owned(),
@@ -137,6 +142,42 @@ fn bar_layer(config: Config, output: Option<String>) -> Result<(), String> {
             start_mode: output
                 .map(StartMode::TargetScreen)
                 .unwrap_or(StartMode::Active),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .run()
+    .map_err(|e| e.to_string())
+}
+
+fn close_button_layer() -> Result<(), String> {
+    use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
+    use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
+
+    let compositor = sources::Compositor::detect();
+    if !matches!(compositor, sources::Compositor::Hyprland(_)) {
+        return Err("the close button needs Hyprland".into());
+    }
+    iced_layershell::application(
+        move || closer::Closer::new(compositor.clone()),
+        || "nordlys-close".to_owned(),
+        closer::Closer::update,
+        closer::Closer::view,
+    )
+    .style(closer::Closer::style)
+    .subscription(closer::Closer::subscription)
+    .settings(Settings {
+        default_font: bar::INTER,
+        fonts: vec![icons::FONT_BYTES.into()],
+        layer_settings: LayerShellSettings {
+            // Placed by margins from the screen's top left, ignoring the
+            // bar's and rails' zones, so window coordinates work as is.
+            anchor: Anchor::Top | Anchor::Left,
+            layer: Layer::Top,
+            size: Some((1, 1)),
+            exclusive_zone: -1,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            start_mode: StartMode::Active,
             ..Default::default()
         },
         ..Default::default()
