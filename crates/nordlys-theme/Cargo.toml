@@ -1,6 +1,6 @@
 [package]
 name = "nordlys-theme"
-description = "Writes the Nordlys palette out for GTK, Qt and terminals"
+description = "Writes the Nordlys palette out for GTK, Qt, the terminal and the default apps"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 nordlys-config.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
 
 [lints]
 workspace = true

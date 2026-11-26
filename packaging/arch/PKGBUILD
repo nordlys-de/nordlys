@@ -14,7 +14,7 @@ url="https://github.com/nordlys-de/nordlys"
 license=(LicenseRef-unknown)   # not chosen yet
 depends=(
     hyprland hypridle swaybg
-    xdg-desktop-portal-hyprland hyprpolkitagent
+    xdg-desktop-portal-hyprland xdg-desktop-portal-gtk hyprpolkitagent
     pam libxkbcommon wayland
     inter-font ttf-jetbrains-mono
     wireplumber
@@ -27,8 +27,24 @@ optdepends=(
     'grim: Super+Shift+S screenshots'
     'slurp: Super+Shift+S screenshots'
     'wl-clipboard: Super+Shift+S screenshots'
-    'foot: a terminal for Super+Enter'
+    'foot: the terminal (Super+Enter)'
     'qt6ct: Qt apps in the Nordlys palette'
+    'adw-gtk-theme: GTK 3 apps in the Nordlys palette'
+    'libnotify: a notice when Print saves a screenshot'
+    'xdg-user-dirs: ~/Pictures and friends for the file manager and screenshots'
+    'dconf: Inter and JetBrains Mono as the GTK fonts unless you pick others'
+    'nautilus: the file manager (Super+N)'
+    'gvfs: trash, phones and network places in the file manager'
+    'ffmpegthumbnailer: video thumbnails in the file manager'
+    'imv: the image viewer'
+    'mpv: the video and music player'
+    'mpv-mpris: mpv in the ambient rail (now playing)'
+    'zathura-pdf-mupdf: the PDF and EPUB viewer'
+    'gnome-text-editor: the text editor (Super+E)'
+    'helix: the terminal editor in the "Nordlys dev" group'
+    'btop: the system monitor (Ctrl+Shift+Esc)'
+    'pavucontrol: per-app volume'
+    'file-roller: archives'
 )
 makedepends=(cargo git)
 provides=(nordlys)

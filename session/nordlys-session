@@ -16,6 +16,10 @@ if [ ! -f "$NORDLYS_DATA/hyprland.lua" ]; then
 fi
 export NORDLYS_DATA
 
+# Nordlys's default apps (xdg/mimeapps.list) sit behind your own: anything
+# in ~/.config/mimeapps.list or "Open With" still wins.
+export XDG_CONFIG_DIRS="$NORDLYS_DATA/xdg:${XDG_CONFIG_DIRS:-/etc/xdg}"
+
 # Your own idle settings win.
 user_idle="${XDG_CONFIG_HOME:-$HOME/.config}/nordlys/hypridle.conf"
 [ -f "$user_idle" ] && export NORDLYS_IDLE="$user_idle"

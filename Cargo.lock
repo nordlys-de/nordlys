@@ -1971,6 +1971,7 @@ name = "nordlys-theme"
 version = "0.1.0"
 dependencies = [
  "nordlys-config",
+ "toml",
 ]
 
 [[package]]

@@ -37,7 +37,12 @@ packages="base-devel git pkgconf pam libxkbcommon wayland mesa
     hyprland hypridle swaybg hyprpolkitagent xdg-desktop-portal-hyprland
     inter-font ttf-jetbrains-mono noto-fonts pipewire pipewire-pulse wireplumber
     playerctl networkmanager bluez-utils brightnessctl grim slurp wl-clipboard
-    foot libnotify qt6ct xdg-utils"
+    foot libnotify qt6ct xdg-utils
+    xdg-desktop-portal-gtk xdg-user-dirs gsettings-desktop-schemas dconf
+    adw-gtk-theme adwaita-icon-theme noto-fonts-emoji
+    nautilus gvfs ffmpegthumbnailer imv mpv mpv-mpris
+    zathura zathura-pdf-mupdf gnome-text-editor helix btop
+    pavucontrol file-roller"
 # A rustup or distro toolchain that's already here is fine.
 command -v cargo >/dev/null || packages="$packages rust"
 [ "$vm_guest" = yes ] && packages="$packages python"

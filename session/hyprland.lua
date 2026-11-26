@@ -18,6 +18,18 @@ local function first_of(list)
 end
 local terminal = first_of('"$TERMINAL" foot kitty alacritty ghostty wezterm konsole gnome-terminal')
 local editor   = first_of('"$NORDLYS_EDITOR" gnome-text-editor kate code zeditor codium mousepad')
+local files    = first_of('"$NORDLYS_FILES" nautilus thunar nemo dolphin pcmanfm-qt')
+local browser  = first_of('"$BROWSER" firefox chromium zen-browser librewolf brave google-chrome-stable')
+local monitor  = "sh -c 'command -v btop >/dev/null && exec foot -a btop -T \"System monitor\" btop; exec gnome-system-monitor'"
+
+-- Screenshots: Super+Shift+S copies a region, Print saves the whole screen
+-- to ~/Pictures/Screenshots (and copies it), Shift+Print saves a region.
+local shots = "\"$(xdg-user-dir PICTURES 2>/dev/null || echo \"$HOME/Pictures\")/Screenshots\""
+local function screenshot(region)
+    local grab = region and 'grim -g "$(slurp)"' or "grim"
+    return "sh -c 'd=" .. shots .. "; mkdir -p \"$d\"; f=\"$d/$(date +%Y-%m-%d_%H-%M-%S).png\"; "
+        .. grab .. " \"$f\" && wl-copy <\"$f\" && notify-send -a Screenshot -i \"$f\" \"Screenshot saved\" \"$f\"'"
+end
 
 ------------------
 ---- MONITORS ----
@@ -31,11 +43,15 @@ hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" 
 
 hl.on("hyprland.start", function()
     -- Portals and apps started by D-Bus need the session's environment.
-    hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE")
+    hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE XDG_CONFIG_DIRS QT_QPA_PLATFORMTHEME")
 
     hl.exec_cmd("swaybg -m fill -i " .. data .. "/wallpaper.jpg")
-    -- Theme GTK and Qt apps on first login, unless you have your own gtk.css.
-    hl.exec_cmd("sh -c 'c=${XDG_CONFIG_HOME:-$HOME/.config}; [ -e $c/gtk-4.0/gtk.css ] || [ -e $c/gtk-3.0/gtk.css ] || nordlys-theme'")
+    -- Theme GTK, Qt and the default apps from nordlys.toml, and write the
+    -- starting dotfiles that are missing. Files you've made your own are
+    -- left alone (see nordlys-theme --dry-run).
+    hl.exec_cmd("nordlys-theme --quiet")
+    -- ~/Pictures, ~/Downloads… for the file manager's sidebar and Print.
+    hl.exec_cmd("sh -c 'command -v xdg-user-dirs-update >/dev/null && xdg-user-dirs-update'")
     hl.exec_cmd("nordlys-shell notify")
     hl.exec_cmd("nordlys-shell")
     hl.exec_cmd("nordlys-shell shelf")
@@ -158,6 +174,20 @@ hl.layer_rule({
     ignore_alpha = 0.3,
 })
 
+-- Small utility windows float over the stage instead of taking it.
+for i, class in ipairs({
+    "^(org.pulseaudio.pavucontrol|pavucontrol)$",
+    "^(nm-connection-editor|blueman-manager|.blueman-manager-wrapped)$",
+    "^(xdg-desktop-portal-gtk|org.freedesktop.impl.portal.desktop.kde)$",
+    "^(org.gnome.FileRoller|file-roller)$",
+    "^(org.gnome.Calculator|qalculate-gtk)$",
+    "^(hyprpolkitagent|polkit-gnome-authentication-agent-1)$",
+}) do
+    hl.window_rule({ name = "nordlys-float-" .. i, match = { class = class }, float = true })
+end
+hl.window_rule({ name = "nordlys-float-pip", match = { title = "^(Picture-in-Picture|Picture in picture)$" }, float = true })
+hl.window_rule({ name = "nordlys-float-dialogs", match = { title = "^(Open File|Save File|Open Folder|Save As|File Upload).*" }, float = true })
+
 hl.window_rule({
     name  = "suppress-maximize-events",
     match = { class = ".*" },
@@ -238,8 +268,13 @@ hl.bind(key("SPACE"),         run("nordlys-shell launcher"),               { des
 hl.bind(key("SHIFT + SPACE"), run("nordlys-shell launcher --query '>'"),   { desc = "Commands" })
 hl.bind(key("RETURN"),        run(terminal),                               { desc = "Terminal" })
 hl.bind(key("E"),             run(editor),                                 { desc = "Editor" })
+hl.bind(key("N"),             run(files),                                  { desc = "Files" })
+hl.bind(key("B"),             run(browser),                                { desc = "Browser" })
+hl.bind("CTRL + SHIFT + ESCAPE", run(monitor),                             { desc = "System monitor" })
 hl.bind(key("comma"),         run("xdg-open " .. home .. "/.config/nordlys/nordlys.toml"), { desc = "Settings" })
 hl.bind(key("SHIFT + S"),     run("sh -c 'grim -g \"$(slurp)\" - | wl-copy'"), { desc = "Screenshot to clipboard" })
+hl.bind("Print",              run(screenshot(false)),                      { desc = "Save a screenshot" })
+hl.bind("SHIFT + Print",      run(screenshot(true)),                       { desc = "Save a screenshot of a region" })
 hl.bind(key("ESCAPE"),        run("nordlys-shell lock"),                   { desc = "Lock" })
 hl.bind(key("L"),             run("nordlys-shell lock"),                   { desc = "Lock" })
 hl.bind(key("SHIFT + ESCAPE"), hl.dsp.exit(),                              { desc = "Log out" })

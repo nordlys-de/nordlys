@@ -1,0 +1,21 @@
+# zathura, the Nordlys document viewer (PDF, EPUB with the mupdf plugin).
+# Written once by nordlys-theme and then yours to edit. Colours live in
+# ./nordlys, which nordlys-theme rewrites whenever the palette changes.
+include nordlys
+
+set font                  "Inter 11"
+set guioptions            ""
+set adjust-open           "best-fit"
+set pages-per-row         1
+set scroll-page-aware     true
+set smooth-scroll         true
+set incremental-search    true
+set window-title-basename true
+set statusbar-h-padding   12
+set statusbar-v-padding   6
+set selection-clipboard   clipboard
+set database              sqlite
+
+map r reload
+map R rotate
+map i recolor

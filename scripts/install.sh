@@ -8,7 +8,7 @@
 #   sudo scripts/install.sh --vm-guest      # also the test VM's guest agent
 #
 # Installs the binaries, the session (Hyprland config, idle config,
-# wallpaper, nordlys-session) and the PAM file, and registers "Nordlys"
+# wallpaper, default apps, nordlys-session) and the PAM file, and registers "Nordlys"
 # with the display manager. ~/.config/hypr is never touched.
 set -eu
 
@@ -56,12 +56,14 @@ for b in $bins; do
     fi
 done
 
-install -d "$bin" "$data" "$sessions" "$pam"
+install -d "$bin" "$data" "$data/xdg" "$sessions" "$pam"
 for b in $bins; do install -m755 "$release/$b" "$bin/$b"; done
 install -m755 "$root/session/nordlys-session" "$bin/nordlys-session"
 install -m644 "$root/session/hyprland.lua" "$root/session/hypridle.conf" \
     "$root/session/wallpaper.jpg" "$data/"
 install -m644 "$root/config/nordlys.toml" "$data/nordlys.toml.example"
+# Default apps, behind the user's own (nordlys-session adds this to XDG_CONFIG_DIRS).
+install -m644 "$root/session/xdg/mimeapps.list" "$data/xdg/mimeapps.list"
 install -m644 "$root/session/nordlys.desktop" "$sessions/nordlys.desktop"
 # A prefix other than /usr isn't on every display manager's PATH.
 if [ "$prefix" != /usr ]; then
