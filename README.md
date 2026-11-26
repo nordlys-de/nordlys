@@ -341,9 +341,15 @@ cargo run -p nordlys-shell -- --window  # preview window (automatic on X11)
 ```
 
 It shows workspaces (click to switch), what's on stage, the clock, the
-tray, the layout and the battery, and a red dot with the time while the
+tray, the layout, network, Bluetooth and volume, and the battery, and a red dot with the time while the
 screen is recording (click it to stop). Workspaces come from nordlys-comp when its socket
 is up, from Hyprland's IPC on Hyprland, and from a demo set otherwise.
+Click network, Bluetooth or volume for a panel under the bar:
+Wi-Fi on and off, nearby networks to join (a new secured one asks for
+its password in Settings), wired and VPN connections; Bluetooth on and
+off and paired devices to connect; the output and input devices, their
+levels and mute, and each sound card's profile. Scroll on the volume to
+change it; click the icon again to close its panel.
 It redraws when the compositor reports a change (Hyprland's event socket,
 or nordlys-comp's `subscribe`), not on a timer.
 

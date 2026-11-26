@@ -489,8 +489,21 @@ impl IconCache {
         self.named
             .entry((name.to_owned(), theme_path.to_owned()))
             .or_insert_with(|| {
-                let file = find_icon(name, theme_path)?;
-                let symbolic = name.ends_with("-symbolic");
+                // Status icons (network, battery, volume) often come as a
+                // dark PNG made for light panels, with a symbolic SVG beside
+                // it. The symbolic one, in the bar's text colour, reads on
+                // both light and dark glass. App icons have none and keep
+                // their colours.
+                let symbolic_name = format!("{name}-symbolic");
+                let (file, symbolic) = match name.ends_with("-symbolic") {
+                    true => (find_icon(name, theme_path)?, true),
+                    false => match find_icon(&symbolic_name, theme_path)
+                        .filter(|f| f.extension().is_some_and(|e| e == "svg"))
+                    {
+                        Some(f) => (f, true),
+                        None => (find_icon(name, theme_path)?, false),
+                    },
+                };
                 Some(if file.extension().is_some_and(|e| e == "svg") {
                     Icon::Svg(svg::Handle::from_path(file), symbolic)
                 } else {

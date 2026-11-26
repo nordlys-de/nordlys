@@ -224,6 +224,57 @@ pub fn wifi() -> Option<bool> {
     crate::dbus::wifi().or_else(|| run("nmcli", &["radio", "wifi"]).map(|s| s == "enabled"))
 }
 
+/// How the computer is online, for the bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    Wifi,
+    Wired,
+    /// Connected some other way (VPN only, mobile broadband…).
+    Other,
+    /// Connecting, or only on the local network.
+    Limited,
+    Offline,
+}
+
+/// None when NetworkManager isn't there.
+pub fn link() -> Option<Link> {
+    let (state, kind) = crate::dbus::network()?;
+    Some(match state {
+        70 => match kind.as_str() {
+            "802-11-wireless" => Link::Wifi,
+            "802-3-ethernet" => Link::Wired,
+            _ => Link::Other,
+        },
+        40..=69 => Link::Limited,
+        _ => Link::Offline,
+    })
+}
+
+/// The bar's indicators: network, Bluetooth and volume.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Status {
+    pub link: Option<Link>,
+    /// None without an adapter.
+    pub bluetooth: Option<bool>,
+    pub volume: Option<Volume>,
+}
+
+impl Status {
+    /// All at once. Blocking: call it through [`background`].
+    pub fn read() -> Self {
+        std::thread::scope(|s| {
+            let link = s.spawn(link);
+            let bluetooth = s.spawn(bluetooth);
+            let volume = s.spawn(volume);
+            Status {
+                link: link.join().ok().flatten(),
+                bluetooth: bluetooth.join().ok().flatten(),
+                volume: volume.join().ok().flatten(),
+            }
+        })
+    }
+}
+
 pub fn set_wifi(on: bool) {
     if crate::dbus::set_wifi(on).is_some() {
         return;

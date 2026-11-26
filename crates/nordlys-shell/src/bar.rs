@@ -6,6 +6,7 @@
 
 use crate::apps;
 use crate::calendar;
+use crate::controls;
 use crate::events;
 use crate::icons::{self, icon};
 use crate::sources::{self, Battery, Compositor, Desk};
@@ -63,8 +64,13 @@ pub struct Bar {
     tray: Vec<tray::Item>,
     /// An app's tray menu, open under the bar.
     menu: Option<Menu>,
+    /// The network, Bluetooth or sound panel, open under its icon.
+    panel: Option<controls::Panel>,
     /// How long the screen has been recording, while it is.
     recording: Option<Duration>,
+    /// Network, Bluetooth and volume, read every few seconds.
+    status: system::Status,
+    status_reading: bool,
 }
 
 /// A tray menu on show. Submenus stack on the levels; Back pops one.
@@ -108,6 +114,18 @@ pub enum Message {
     /// A click beside an open menu.
     Dismiss,
     StopRecording,
+    /// Time to read the indicators again.
+    Poll,
+    Status(Option<system::Status>),
+    /// Open a Settings page ("network", "bluetooth", "sound").
+    Settings(&'static str),
+    /// An indicator was clicked: open its panel, or close it.
+    Panel(controls::Kind),
+    Control(controls::Msg),
+    PanelData(controls::Kind, Option<Result<controls::Data, String>>),
+    PanelDone(Option<Result<Option<String>, String>>),
+    /// Scroll on the volume: up (+1) or down (-1).
+    Volume(i32),
 }
 
 /// The surface's height with the calendar closed and open.
@@ -136,9 +154,20 @@ impl Bar {
             tray: vec![],
             menu: None,
             recording: None,
+            panel: None,
+            status: system::Status::default(),
+            status_reading: false,
         };
         bar.tick();
-        let first = bar.read_desk();
+        // The preview can start with a panel open, to look at it:
+        // NORDLYS_PREVIEW_PANEL=network|bluetooth|sound.
+        let panel = match std::env::var("NORDLYS_PREVIEW_PANEL").as_deref() {
+            Ok("network") if preview => Task::done(Message::Panel(controls::Kind::Network)),
+            Ok("bluetooth") if preview => Task::done(Message::Panel(controls::Kind::Bluetooth)),
+            Ok("sound") if preview => Task::done(Message::Panel(controls::Kind::Sound)),
+            _ => Task::none(),
+        };
+        let first = Task::batch([bar.read_desk(), bar.read_status(), panel]);
         (bar, first)
     }
 
@@ -146,6 +175,63 @@ impl Bar {
         self.battery = sources::battery();
         self.clock = sources::clock_text(chrono::Local::now());
         self.recording = recording();
+    }
+
+    /// Read the indicators off the UI thread, one read at a time.
+    fn read_status(&mut self) -> Task<Message> {
+        if self.status_reading {
+            return Task::none();
+        }
+        self.status_reading = true;
+        Task::perform(system::background(system::Status::read), Message::Status)
+    }
+
+    /// Read the open panel again, unless something is changing it.
+    fn read_panel(&self) -> Task<Message> {
+        let Some(panel) = &self.panel else {
+            return Task::none();
+        };
+        if !panel.idle() {
+            return Task::none();
+        }
+        let kind = panel.kind;
+        Task::perform(system::background(move || controls::read(kind)), move |r| {
+            Message::PanelData(kind, r)
+        })
+    }
+
+    fn control(&mut self, msg: controls::Msg) -> Task<Message> {
+        let Some(panel) = &mut self.panel else {
+            return Task::none();
+        };
+        match msg {
+            controls::Msg::Slide(id, v) => panel.sliding = Some((id, v)),
+            controls::Msg::Release => {
+                if let Some((id, v)) = panel.sliding {
+                    return self.control(controls::Msg::Do(controls::Action::Volume(id, v)));
+                }
+            }
+            controls::Msg::Settings(page) => {
+                self.panel = None;
+                return Task::batch([self.update(Message::Settings(page)), self.resize()]);
+            }
+            controls::Msg::Do(action) => {
+                if panel.busy {
+                    return Task::none();
+                }
+                panel.busy = true;
+                panel.status = controls::working(&action);
+                let grow = self.resize();
+                return Task::batch([
+                    grow,
+                    Task::perform(
+                        system::background(move || controls::perform(action)),
+                        Message::PanelDone,
+                    ),
+                ]);
+            }
+        }
+        Task::none()
     }
 
     /// Open `item`'s menu: its dbusmenu when it has one, else the app's own.
@@ -159,6 +245,7 @@ impl Bar {
         };
         let service = item.service.clone();
         self.month = None;
+        self.panel = None;
         self.menu = Some(Menu {
             service: service.clone(),
             path: path.clone(),
@@ -224,6 +311,7 @@ impl Bar {
             }
             Message::Calendar => {
                 self.menu = None;
+                self.panel = None;
                 self.month = match self.month {
                     Some(_) => None,
                     None => Some(calendar::first_of(today())),
@@ -317,7 +405,72 @@ impl Bar {
             Message::Dismiss => {
                 self.menu = None;
                 self.month = None;
+                self.panel = None;
                 return self.resize();
+            }
+            Message::Poll => return Task::batch([self.read_status(), self.read_panel()]),
+            Message::Panel(kind) => {
+                if self.panel.as_ref().is_some_and(|p| p.kind == kind) {
+                    self.panel = None;
+                    return self.resize();
+                }
+                self.menu = None;
+                self.month = None;
+                self.panel = Some(controls::Panel::new(kind));
+                return Task::batch([self.resize(), self.read_panel()]);
+            }
+            Message::Control(msg) => return self.control(msg),
+            Message::PanelData(kind, data) => {
+                if let Some(panel) = &mut self.panel
+                    && panel.kind == kind
+                    && panel.idle()
+                {
+                    let data = data.unwrap_or_else(|| Err("Couldn't read it".into()));
+                    if panel.data.as_ref() != Some(&data) {
+                        panel.data = Some(data);
+                        return self.resize();
+                    }
+                }
+            }
+            Message::PanelDone(result) => {
+                if let Some(panel) = &mut self.panel {
+                    panel.busy = false;
+                    panel.sliding = None;
+                    panel.status = match result {
+                        Some(Ok(said)) => said,
+                        Some(Err(e)) => Some(e),
+                        None => Some("That didn't work".into()),
+                    };
+                }
+                // Show the change, and the icons too.
+                return Task::batch([self.read_panel(), self.read_status(), self.resize()]);
+            }
+            Message::Status(status) => {
+                self.status_reading = false;
+                if let Some(s) = status {
+                    self.status = s;
+                }
+            }
+            Message::Settings(page) => {
+                let cmd = format!(
+                    "command -v nordlys-settings >/dev/null && exec nordlys-settings {page}"
+                );
+                if let Err(e) = apps::spawn_shell(&cmd) {
+                    eprintln!("nordlys-shell: can't open Settings: {e}");
+                }
+            }
+            Message::Volume(dir) => {
+                let way = if dir > 0 { "up" } else { "down" };
+                let exe = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "nordlys-shell".into());
+                let cmd = format!("{} osd volume {way}", apps::shell_quote(&exe));
+                let _ = apps::spawn_shell(&cmd);
+                // Show the new level soon, not at the next poll.
+                return Task::perform(
+                    system::background(|| std::thread::sleep(Duration::from_millis(250))),
+                    |_| Message::Poll,
+                );
             }
             Message::StopRecording => {
                 if let Err(e) = apps::spawn_shell("nordlys-record stop") {
@@ -340,6 +493,8 @@ impl Bar {
             SURFACE_OPEN
         } else if let Some(m) = &self.menu {
             SURFACE + menu_height(m) + BAR_GAP
+        } else if let Some(panel) = &self.panel {
+            SURFACE + panel.height() + BAR_GAP
         } else {
             SURFACE
         };
@@ -352,6 +507,7 @@ impl Bar {
             events::changes(&self.compositor).map(|_| Message::Changed),
             events::config_changes().map(Message::Config),
             tray::items().map(Message::Tray),
+            iced::time::every(Duration::from_secs(3)).map(|_| Message::Poll),
             // In case an event is ever missed.
             iced::time::every(Duration::from_secs(15)).map(|_| Message::Changed),
         ])
@@ -487,6 +643,9 @@ impl Bar {
             right = right.push(tray_icons(p, glass, &self.tray, self.menu.as_ref()));
         }
         right = right.push(chip);
+        if let Some(ind) = indicators(p, glass, self.status) {
+            right = right.push(ind);
+        }
         if let Some(b) = self.battery {
             right = right.push(battery(p, b));
         }
@@ -557,7 +716,23 @@ impl Bar {
                     .on_press(Message::Dismiss),
                 ]
                 .into(),
-                None => framed.into(),
+                None => match &self.panel {
+                    Some(panel) => column![
+                        framed,
+                        mouse_area(
+                            container(
+                                mouse_area(control_panel(p, glass, panel)).on_press(Message::Keep)
+                            )
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .padding([0.0, 12.0])
+                            .align_x(Horizontal::Right)
+                        )
+                        .on_press(Message::Dismiss),
+                    ]
+                    .into(),
+                    None => framed.into(),
+                },
             },
         };
         if !self.preview {
@@ -774,6 +949,76 @@ fn tray_icons<'a>(
     .into()
 }
 
+/// Network, Bluetooth and volume, each a click from its Settings page.
+/// Scrolling on the volume changes it. None when there's nothing to show.
+fn indicators<'a>(p: &Palette, glass: Glass, s: system::Status) -> Option<Element<'a, Message>> {
+    let (ink, dim, alert) = (color(p.text), color(p.dim), color(p.ansi[1]));
+    let mut cells: Vec<Element<'a, Message>> = vec![];
+    let cell = |glyph: char, tone: Color, message: Message| {
+        mouse_area(
+            container(icon(glyph, 15).color(tone))
+                .width(24)
+                .height(26)
+                .align_x(Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center),
+        )
+        .on_press(message)
+        .interaction(iced::mouse::Interaction::Pointer)
+    };
+    if let Some(link) = s.link {
+        let (glyph, tone) = match link {
+            system::Link::Wifi => (icons::WIFI, ink),
+            // Lucide's ethernet icon isn't in the bundled set yet.
+            system::Link::Wired | system::Link::Other => (icons::SWAP, ink),
+            system::Link::Limited => (icons::WIFI, dim),
+            system::Link::Offline => (icons::WIFI_OFF, alert),
+        };
+        cells.push(cell(glyph, tone, Message::Panel(controls::Kind::Network)).into());
+    }
+    if let Some(on) = s.bluetooth {
+        let (glyph, tone) = if on {
+            (icons::BLUETOOTH, ink)
+        } else {
+            (icons::BLUETOOTH_OFF, dim)
+        };
+        cells.push(cell(glyph, tone, Message::Panel(controls::Kind::Bluetooth)).into());
+    }
+    if let Some(v) = s.volume {
+        let tone = if v.muted { dim } else { ink };
+        cells.push(
+            cell(
+                icons::volume(v.level, v.muted),
+                tone,
+                Message::Panel(controls::Kind::Sound),
+            )
+            .on_scroll(|d| {
+                let y = match d {
+                    iced::mouse::ScrollDelta::Lines { y, .. }
+                    | iced::mouse::ScrollDelta::Pixels { y, .. } => y,
+                };
+                Message::Volume(if y > 0.0 { 1 } else { -1 })
+            })
+            .into(),
+        );
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    Some(
+        container(row(cells).spacing(2).align_y(Alignment::Center))
+            .padding([0, 4])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(glass.chip)),
+                border: Border {
+                    radius: 8.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            })
+            .into(),
+    )
+}
+
 /// Height of a menu's panel: a title row, its rows, capped (it scrolls).
 fn menu_height(m: &Menu) -> u32 {
     let rows: u32 = match m.levels.last() {
@@ -787,6 +1032,29 @@ fn menu_height(m: &Menu) -> u32 {
         None => MENU_ROW,
     };
     (rows + MENU_ROW + 20).min(MENU_MAX)
+}
+
+/// The network, Bluetooth or sound panel, on the same glass as menus.
+fn control_panel<'a>(
+    p: &Palette,
+    glass: Glass,
+    panel: &'a controls::Panel,
+) -> Element<'a, Message> {
+    let ground = color(p.ground);
+    container(controls::view(p, panel).map(Message::Control))
+        .width(controls::WIDTH)
+        .height(panel.height() as f32)
+        .padding(8)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(Color { a: 0.94, ..ground })),
+            border: Border {
+                radius: 14.0.into(),
+                width: 1.0,
+                color: glass.bar_border,
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn menu_panel<'a>(p: &Palette, glass: Glass, m: &Menu) -> Element<'a, Message> {

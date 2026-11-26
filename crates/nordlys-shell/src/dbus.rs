@@ -180,6 +180,17 @@ pub fn set_wifi(on: bool) -> Option<()> {
     set(system()?, NM, NM_PATH, NM, "WirelessEnabled", on)
 }
 
+/// NetworkManager's overall state (70 is fully connected) and the kind of
+/// its main connection ("802-11-wireless", "802-3-ethernet"…).
+pub fn network() -> Option<(u32, String)> {
+    let bus = system()?;
+    let state = u32::try_from(get(bus, NM, NM_PATH, NM, "State")?).ok()?;
+    let kind = get(bus, NM, NM_PATH, NM, "PrimaryConnectionType")
+        .and_then(|v| String::try_from(v).ok())
+        .unwrap_or_default();
+    Some((state, kind))
+}
+
 // ---- Bluetooth (BlueZ) ----
 
 type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;

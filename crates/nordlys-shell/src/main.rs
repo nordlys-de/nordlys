@@ -20,6 +20,7 @@ mod apps;
 mod bar;
 mod calendar;
 mod closer;
+mod controls;
 mod dbus;
 mod events;
 mod files;
@@ -297,7 +298,7 @@ fn bar_window(config: Config) -> Result<(), String> {
     .subscription(Bar::subscription)
     .default_font(bar::INTER)
     .font(icons::FONT_BYTES)
-    .window_size((1440.0, 140.0))
+    .window_size((1440.0, 700.0))
     .resizable(false)
     .run()
     .map_err(|e| e.to_string())
