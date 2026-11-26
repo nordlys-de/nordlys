@@ -126,6 +126,15 @@ pub struct Blur {
     radius: u8,
     enabled: bool,
     programs: Option<Result<Programs, ()>>,
+    /// Each screen's backdrop and passes, by output name.
+    screens: HashMap<String, Passes>,
+    /// Per glass surface: its element id and when its blur last changed.
+    surfaces: HashMap<ObjectId, (Id, CommitCounter)>,
+}
+
+/// One screen's worth of blur.
+#[derive(Default)]
+struct Passes {
     /// Everything under the glass, full size, and its damage tracker.
     backdrop: Option<(GlesTexture, OutputDamageTracker)>,
     /// Halved again and again; then grown back into `up`.
@@ -133,8 +142,14 @@ pub struct Blur {
     up: Vec<GlesTexture>,
     /// Where the backdrop changed this frame (physical pixels).
     changed: Vec<Rectangle<i32, Physical>>,
-    /// Per glass surface: its element id and when its blur last changed.
-    surfaces: HashMap<ObjectId, (Id, CommitCounter)>,
+}
+
+impl Passes {
+    /// The blurred backdrop at its smallest useful size: the end of the
+    /// "up" passes, half the output.
+    fn result(&self) -> Option<&GlesTexture> {
+        self.up.last().or(self.down.first())
+    }
 }
 
 impl Blur {
@@ -143,10 +158,7 @@ impl Blur {
             radius: 0,
             enabled: false,
             programs: None,
-            backdrop: None,
-            down: Vec::new(),
-            up: Vec::new(),
-            changed: Vec::new(),
+            screens: HashMap::new(),
             surfaces: HashMap::new(),
         };
         b.configure(theme);
@@ -160,9 +172,7 @@ impl Blur {
             && std::env::var("NORDLYS_BLUR").as_deref() != Ok("0");
         if enabled != self.enabled || theme.blur != self.radius {
             // Start over: new passes, and every glass surface redrawn.
-            self.backdrop = None;
-            self.down.clear();
-            self.up.clear();
+            self.screens.clear();
         }
         self.enabled = enabled;
         self.radius = theme.blur;
@@ -170,6 +180,11 @@ impl Blur {
 
     pub fn forget(&mut self, surface: &WlSurface) {
         self.surfaces.remove(&surface.id());
+    }
+
+    /// A screen went away: free its textures.
+    pub fn forget_screen(&mut self, screen: &str) {
+        self.screens.remove(screen);
     }
 
     /// Does any of these layer surfaces want blur (and can we)?
@@ -219,21 +234,24 @@ impl Blur {
         self.programs.as_ref()?.as_ref().ok()
     }
 
-    /// Draw what's under the glass and blur it, unless nothing under it
-    /// changed since the last frame.
+    /// Draw what's under the glass on `screen` and blur it, unless
+    /// nothing under it changed since that screen's last frame.
     pub fn backdrop(
         &mut self,
         r: &mut GlesRenderer,
+        screen: &str,
         below: &[crate::render::Elem],
         size: Size<i32, Physical>,
         scale: f64,
         ground: [f32; 4],
     ) {
-        self.changed.clear();
+        if let Some(p) = self.screens.get_mut(screen) {
+            p.changed.clear();
+        }
         if self.programs(r).is_none() {
             return;
         }
-        if let Err(e) = self.try_backdrop(r, below, size, scale, ground) {
+        if let Err(e) = self.try_backdrop(r, screen, below, size, scale, ground) {
             eprintln!("nordlys-comp: blur failed, turning it off: {e:?}");
             self.programs = Some(Err(()));
         }
@@ -242,6 +260,7 @@ impl Blur {
     fn try_backdrop(
         &mut self,
         r: &mut GlesRenderer,
+        screen: &str,
         below: &[crate::render::Elem],
         size: Size<i32, Physical>,
         scale: f64,
@@ -249,7 +268,13 @@ impl Blur {
     ) -> Result<(), GlesError> {
         let buffer = |s: Size<i32, Physical>| s.to_logical(1).to_buffer(1, Transform::Normal);
         let (passes, offset) = self.passes();
-        let fresh = self.backdrop.as_ref().is_none_or(|(t, d)| {
+        let Some(Programs { down, up, .. }) = self.programs.as_ref().and_then(|p| p.as_ref().ok())
+        else {
+            return Ok(());
+        };
+        let (down, up) = (down.clone(), up.clone());
+        let p = self.screens.entry(screen.to_owned()).or_default();
+        let fresh = p.backdrop.as_ref().is_none_or(|(t, d)| {
             t.size() != buffer(size)
                 || d.mode()
                     != &OutputModeSource::Static {
@@ -257,29 +282,28 @@ impl Blur {
                         scale: scale.into(),
                         transform: Transform::Normal,
                     }
-        }) || self.down.len() != passes;
+        }) || p.down.len() != passes;
         if fresh {
             let tex = r.create_buffer(Fourcc::Abgr8888, buffer(size))?;
-            self.backdrop = Some((
+            p.backdrop = Some((
                 tex,
                 OutputDamageTracker::new(size, scale, Transform::Normal),
             ));
-            self.down.clear();
-            self.up.clear();
+            p.down.clear();
+            p.up.clear();
             let mut s = size;
             for _ in 0..passes {
                 s = Size::from(((s.w / 2).max(1), (s.h / 2).max(1)));
-                self.down
-                    .push(r.create_buffer(Fourcc::Abgr8888, buffer(s))?);
+                p.down.push(r.create_buffer(Fourcc::Abgr8888, buffer(s))?);
             }
             // Back up to the first halving: down[passes-2] … down[0] sizes.
             for i in (0..passes - 1).rev() {
-                let s = self.down[i].size();
-                self.up.push(r.create_buffer(Fourcc::Abgr8888, s)?);
+                let s = p.down[i].size();
+                p.up.push(r.create_buffer(Fourcc::Abgr8888, s)?);
             }
         }
 
-        let (tex, tracker) = self.backdrop.as_mut().expect("made above");
+        let (tex, tracker) = p.backdrop.as_mut().expect("made above");
         let damage = {
             let mut target = r.bind(tex)?;
             // The backdrop texture is kept, so it's always one frame old.
@@ -295,40 +319,31 @@ impl Blur {
         if damage.is_empty() && !fresh {
             return Ok(());
         }
-        self.changed = if fresh {
+        p.changed = if fresh {
             vec![Rectangle::from_size(size)]
         } else {
             damage
         };
 
-        let programs = self.programs.as_ref().and_then(|p| p.as_ref().ok());
-        let Some(Programs { down, up, .. }) = programs else {
-            return Ok(());
-        };
-        let (down, up) = (down.clone(), up.clone());
-        let mut src = self.backdrop.as_ref().expect("made above").0.clone();
-        for dst in self.down.iter_mut() {
+        let mut src = p.backdrop.as_ref().expect("made above").0.clone();
+        for dst in p.down.iter_mut() {
             pass(r, &src, dst, &down, offset)?;
             src = dst.clone();
         }
-        for dst in self.up.iter_mut() {
+        for dst in p.up.iter_mut() {
             pass(r, &src, dst, &up, offset)?;
             src = dst.clone();
         }
         Ok(())
     }
 
-    /// The blurred backdrop at its smallest useful size: the end of the
-    /// "up" passes, half the output.
-    fn result(&self) -> Option<&GlesTexture> {
-        self.up.last().or(self.down.first())
-    }
-
-    /// The element that frosts `layer`, placed at `geo` (physical), or
-    /// None if it isn't glass or its picture isn't on the GPU yet.
+    /// The element that frosts `layer` on `screen`, placed at `geo`
+    /// (physical, on that screen), or None if it isn't glass or its
+    /// picture isn't on the GPU yet.
     pub fn element(
         &mut self,
         r: &mut GlesRenderer,
+        screen: &str,
         layer: &LayerSurface,
         geo: Rectangle<i32, Physical>,
     ) -> Option<BlurElement> {
@@ -336,13 +351,14 @@ impl Blur {
             return None;
         }
         let program = self.programs.as_ref()?.as_ref().ok()?.masked.clone();
-        let tex = self.result()?.clone();
+        let p = self.screens.get(screen)?;
+        let tex = p.result()?.clone();
         let mask = smithay::backend::renderer::utils::with_renderer_surface_state(
             layer.wl_surface(),
             |s| s.texture::<GlesTexture>(r.context_id()).cloned(),
         )
         .flatten()?;
-        let full = self.backdrop.as_ref()?.0.size();
+        let full = p.backdrop.as_ref()?.0.size();
         let small = tex.size();
         let (sx, sy) = (
             f64::from(small.w) / f64::from(full.w.max(1)),
@@ -360,7 +376,7 @@ impl Blur {
             geo.loc - Point::from((reach, reach)),
             geo.size + Size::from((reach * 2, reach * 2)),
         );
-        let touched = self.changed.iter().any(|d| d.overlaps(near));
+        let touched = p.changed.iter().any(|d| d.overlaps(near));
         let entry = self
             .surfaces
             .entry(layer.wl_surface().id())

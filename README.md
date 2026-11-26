@@ -9,8 +9,8 @@ and the same keys work on every screen size, from ultrawide to laptop.
 > Early days. The shell (bar, launcher, shelves, notifications, lock
 > screen) runs as a session on Hyprland. nordlys-comp, the Stage
 > compositor, runs real apps nested in a window, and as a session of its
-> own on one screen ("Nordlys (own compositor)" at login), which is new
-> and less tried than the Hyprland one.
+> own on every connected screen ("Nordlys (own compositor)" at login),
+> which is new and less tried than the Hyprland one.
 
 ## Crates
 
@@ -21,7 +21,7 @@ and the same keys work on every screen size, from ultrawide to laptop.
 | `nordlys-config` | `nordlys.toml` (theme, stage, app groups) and the shared palette. | Working, tested |
 | `nordlys-theme` | Writes the palette for GTK 3/4 (libadwaita), qt6ct and the default apps, and their starting dotfiles. | Working |
 | `nordlysctl` | Command-line control: `nordlysctl two-up`, `nordlysctl group d`… | Working |
-| `nordlys-comp` | The compositor, on Smithay: real windows laid out by the Stage model, layer-shell for the shell, blur, shelf previews, session lock, X11 apps through xwayland-satellite. `--tty` drives the screen; nested in a window otherwise; `--headless` runs the model over IPC with no display. | Working nested; the TTY session is new, one screen only |
+| `nordlys-comp` | The compositor, on Smithay: real windows laid out by the Stage model, layer-shell for the shell, blur, shelf previews, session lock, X11 apps through xwayland-satellite. `--tty` drives the screen; nested in a window otherwise; `--headless` runs the model over IPC with no display. | Working nested; the TTY session is new |
 | `nordlys-shell` | Bar, launcher, shelves, notifications, lock screen, on iced and layer-shell. | Working on Hyprland |
 | `nordlys-settings` | The Settings app: the desktop's own options and the system's (network, Bluetooth, sound, screens, power, time, apps, services). | Working on Hyprland |
 
@@ -200,6 +200,12 @@ terminal, Alt+Space launcher, Alt+K/J/T/Tab/S, Alt+Q close, Alt+1–9 and
 Alt+Shift+1–9 for workspaces, Alt+← → to move the keyboard between the
 panes, and Alt+Shift+Esc closes the compositor.
 
+To try several screens without the hardware, split the window:
+`NORDLYS_NESTED_SCREENS=2` (up to 4) makes screens `nested-1`, `nested-2`…
+side by side, each with its own workspace and its own bar. The keyboard
+follows the pointer between them, and nested the pointer is the desktop's,
+so Alt+Ctrl+← → moves the keyboard only until the mouse next moves.
+
 It takes an IPC socket of its own, `$XDG_RUNTIME_DIR/nordlys-wayland-N.sock`
 (printed at start), so the shell on the desktop around it isn't confused,
 and apps started inside find it through `NORDLYS_SOCKET`. From outside:
@@ -231,7 +237,7 @@ Pick **Nordlys (own compositor)** in the display manager, or from a TTY:
 nordlys-session --comp
 ```
 
-That runs `nordlys-comp --tty`: DRM/KMS for the screen, libinput for
+That runs `nordlys-comp --tty`: DRM/KMS for the screens, libinput for
 keyboards, mice and touchpads (tap to click), libseat (logind or seatd)
 for the right to use them, so no root. The Nordlys key is **Super**,
 Ctrl+Alt+F1–F12 switch VTs, and the media, brightness and Print keys work
@@ -240,10 +246,26 @@ as on the Hyprland session. It starts the same user services
 `XDG_CURRENT_DESKTOP=Nordlys`, and its portals come from
 `xdg-desktop-portal-gtk` (`nordlys-portals.conf`).
 
-What it doesn't do yet: more than one screen (it takes the laptop panel,
-else the first connected one, in its preferred mode), screen sharing (no
+Every connected screen is used, in its preferred mode, side by side
+left to right: the laptop's own panel first, then the others by connector
+name. Screens plugged in or out are picked up as they come and go. Each
+screen shows a workspace of its own, as on the Hyprland session: the
+screen under the pointer has the keyboard, new windows open there, and
+going to a workspace another screen shows moves the keyboard (and the
+pointer) to that screen. Super+Ctrl+← → moves the keyboard between
+screens, Super+Ctrl+Shift+← → sends the window to the next screen and
+follows it. A screen unplugged leaves its workspace and windows behind, a
+Super+number away. Every screen gets its own bar, rails and close button,
+and the lock screen covers them all. `nordlysctl focus-screen DP-1` does
+the same over IPC, and `nordlysctl screenshot` saves the screen with the
+keyboard.
+
+What it doesn't do yet: arranging screens yourself (Settings' Screens page
+writes Hyprland's config, which nordlys-comp doesn't read), mirroring, a
+mode other than the preferred one, screen sharing (no
 portal knows nordlys-comp), fractional scaling (it picks 1 or 2 from the
-screen's density; `NORDLYS_SCALE` overrides), and hardware cursor planes
+screen's density; `NORDLYS_SCALE` overrides it for all of them), and
+hardware cursor planes
 are left to Smithay to choose.
 
 ## Settings
@@ -353,8 +375,9 @@ change it; click the icon again to close its panel.
 It redraws when the compositor reports a change (Hyprland's event socket,
 or nordlys-comp's `subscribe`), not on a timer.
 
-On Hyprland, `nordlys-shell` without `--output` runs one bar per screen;
-each shows its own screen's workspace. `--output DP-1` runs just one.
+On Hyprland and nordlys-comp, `nordlys-shell` without `--output` runs one
+bar per screen; each shows its own screen's workspace. `--output DP-1`
+runs just one.
 
 The Nordlys session starts it and has Hyprland blur it (layer namespace
 `nordlys-bar`).
@@ -615,8 +638,9 @@ been quiet for a moment, so nothing waits on screen in between. Volume uses
    in the Stage layout from `nordlys-stage`, layer-shell for the shell,
    dmabuf for GPU clients, screenshots over IPC, DRM/KMS and libinput
    through libseat, shelf previews at a low frame rate, dual-kawase blur,
-   session lock and idle notification, xwayland-satellite for X11 apps.
-   Next: more than one screen, and a screencast portal.
+   session lock and idle notification, xwayland-satellite for X11 apps,
+   every connected screen with hotplug. Next: a screencast portal, and
+   screens arranged from Settings.
 3. **Polish.** Adaptive shelves (ultrawide, rails, peek), app groups in
    their own workspaces. Done: the SDDM theme, the Settings app, the tray,
    clipboard history, screen recording and the welcome page.

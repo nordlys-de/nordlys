@@ -60,6 +60,10 @@ pub enum Request {
     },
     /// Re-read nordlys.toml.
     Reload,
+    /// Give the keyboard to screen `name` (its workspace becomes active).
+    FocusScreen {
+        name: String,
+    },
     /// Save the next frame as a PNG at `path` (absolute). Only with a
     /// display; the answer comes before the file is written.
     Screenshot {
@@ -90,6 +94,27 @@ pub struct StageState {
     /// Workspaces with windows, and the active one, in order.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceState>,
+    /// Every screen and what it shows, when the compositor drives more
+    /// than a window (nordlys-comp on a TTY, or nested). Empty headless.
+    /// The top-level main, side and shelf are the focused screen's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screens: Vec<ScreenState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenState {
+    /// The connector name, as in `wl_output.name`: `eDP-1`, `DP-2`…
+    pub name: String,
+    /// The workspace it shows.
+    pub workspace: u32,
+    /// It has the keyboard.
+    #[serde(default)]
+    pub focused: bool,
+    pub main: Option<String>,
+    pub side: Option<String>,
+    /// Most recent first.
+    #[serde(default)]
+    pub shelf: Vec<String>,
 }
 
 fn first() -> u32 {
@@ -230,6 +255,9 @@ mod tests {
             Request::Group {
                 name: "Nordlys dev".into(),
             },
+            Request::FocusScreen {
+                name: "DP-1".into(),
+            },
         ];
         for r in reqs {
             assert_eq!(from_line::<Request>(&to_line(&r)).unwrap(), r);
@@ -241,6 +269,14 @@ mod tests {
                 shelf: vec!["term".into()],
                 workspace: 1,
                 workspaces: vec![WorkspaceState { n: 1, windows: 2 }],
+                screens: vec![ScreenState {
+                    name: "eDP-1".into(),
+                    workspace: 1,
+                    focused: true,
+                    main: Some("helix".into()),
+                    side: None,
+                    shelf: vec!["term".into()],
+                }],
             },
         };
         assert_eq!(from_line::<Response>(&to_line(&resp)).unwrap(), resp);
@@ -256,6 +292,9 @@ mod tests {
             from_line(r#"{"status":"ok","state":{"main":null,"side":null,"shelf":[]}}"#).unwrap();
         let Response::Ok { state } = r else { panic!() };
         assert_eq!((state.workspace, state.workspaces.len()), (1, 0));
+        assert!(state.screens.is_empty());
+        // And with none, none are written (older clients see no change).
+        assert!(!to_line(&state).contains("screens"));
     }
 
     #[test]

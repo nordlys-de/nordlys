@@ -18,6 +18,7 @@ usage: nordlysctl [--json] <command>
   slot <1-4>             Super Alt 1-4
   workspace <n>          Super 1-9
   move-to <n> [id]       Super Shift 1-9 - the main window, or id
+  focus-screen <name>    Super Ctrl Left/Right - eDP-1, DP-2…
   group <name|key>       Super G  - launch an app group
   open <id> [--ambient]  register a window (testing)
   close <id>
@@ -58,6 +59,9 @@ fn parse(args: &[String]) -> Result<Request, String> {
                 .parse()
                 .map_err(|_| "workspace must be a number")?,
             id: args.get(2).cloned(),
+        },
+        "focus-screen" => Request::FocusScreen {
+            name: arg(1, "a screen name")?,
         },
         "group" => {
             let name = args[1..].join(" ");
@@ -251,6 +255,13 @@ mod tests {
             }
         );
         assert_eq!(p("watch").unwrap(), Request::Subscribe);
+        assert_eq!(
+            p("focus-screen DP-1").unwrap(),
+            Request::FocusScreen {
+                name: "DP-1".into()
+            }
+        );
+        assert!(p("focus-screen").is_err());
         let Request::Screenshot { path } = p("screenshot shot.png").unwrap() else {
             panic!("not a screenshot request");
         };

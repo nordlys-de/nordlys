@@ -27,7 +27,7 @@ mod winit;
 mod xwayland;
 
 use nordlys_config::Config;
-use nordlys_ipc::{Request, Response, StageState, WorkspaceState};
+use nordlys_ipc::{Request, Response, ScreenState, StageState, WorkspaceState};
 use nordlys_stage::{Desk, Home};
 use smithay::reexports::calloop::channel::Sender;
 use std::io::{BufRead, BufReader, Write};
@@ -91,6 +91,21 @@ impl State {
                     windows: (st.main().is_some() as u32
                         + st.side().is_some() as u32
                         + st.shelf().count() as u32),
+                })
+                .collect(),
+            screens: self
+                .desk
+                .screens()
+                .map(|(name, n)| {
+                    let st = self.desk.workspace(n);
+                    ScreenState {
+                        name: name.to_owned(),
+                        workspace: n,
+                        focused: self.desk.focused_screen() == Some(name),
+                        main: st.and_then(|s| s.main().cloned()),
+                        side: st.and_then(|s| s.side().cloned()),
+                        shelf: st.map(|s| s.shelf().cloned().collect()).unwrap_or_default(),
+                    }
                 })
                 .collect(),
         }
@@ -170,6 +185,9 @@ impl State {
             Request::SendToShelf => ok(d.stage_mut().send_to_shelf(), "stage is empty"),
             Request::Slot { n } => ok(d.stage_mut().slot(n), &format!("shelf has no slot {n}")),
             Request::Workspace { n } => ok(d.switch(n), "workspaces start at 1"),
+            Request::FocusScreen { name } => {
+                ok(d.focus_screen(&name), &format!("no screen {name:?}"))
+            }
             Request::MoveTo { n, id } => {
                 let id = id
                     .or_else(|| d.stage().main().cloned())
@@ -351,8 +369,14 @@ fn watch_config(shared: Shared, path: PathBuf) {
 }
 
 fn log(st: &StageState) {
+    let on = st
+        .screens
+        .iter()
+        .find(|s| s.focused)
+        .map(|s| format!(" on {}", s.name))
+        .unwrap_or_default();
     eprintln!(
-        "workspace {}: {} {} | shelf: {}",
+        "workspace {}{on}: {} {} | shelf: {}",
         st.workspace,
         st.main.as_deref().unwrap_or("-"),
         st.side
@@ -420,7 +444,7 @@ const USAGE: &str = "\
 usage: nordlys-comp [--tty | --nested] [--run CMD]...
        nordlys-comp --headless
 
-  --tty       the session itself: drive the screen and input devices from
+  --tty       the session itself: drive the screens and input devices from
               a TTY or display manager (the default with no desktop around),
               Super as the Nordlys key
   --nested    a compositor in a window on the current desktop (the default
@@ -576,6 +600,24 @@ mod tests {
         );
         let st = ok(&mut s, r#"{"cmd":"workspace","n":2}"#);
         assert_eq!((st.workspace, st.main.as_deref()), (2, Some("foot")));
+    }
+
+    #[test]
+    fn screens_over_ipc() {
+        let mut s = state();
+        s.desk.set_screens(&["eDP-1".into(), "DP-1".into()]);
+        ok(&mut s, r#"{"cmd":"open","id":"helix"}"#);
+        let st = ok(&mut s, r#"{"cmd":"focus-screen","name":"DP-1"}"#);
+        assert_eq!(st.workspace, 2);
+        assert_eq!(st.screens.len(), 2);
+        assert_eq!(st.screens[0].main.as_deref(), Some("helix"));
+        assert!(st.screens[1].focused && !st.screens[0].focused);
+        assert!(matches!(
+            s.handle(r#"{"cmd":"focus-screen","name":"HDMI-A-9"}"#).0,
+            Response::Error { .. }
+        ));
+        // Headless (no screens named), nothing is listed.
+        assert!(ok(&mut state(), r#"{"cmd":"state"}"#).screens.is_empty());
     }
 
     #[test]

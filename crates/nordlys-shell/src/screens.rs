@@ -1,7 +1,7 @@
 //! One bar, shelf, ambient rail and close button on every screen.
 //!
 //! A layer surface belongs to one output, so `nordlys-shell bar` (without
-//! `--output`) on Hyprland runs as a small supervisor: it starts
+//! `--output`) on Hyprland or nordlys-comp runs as a small supervisor: it starts
 //! `nordlys-shell bar --output NAME` for each screen, starts one for a
 //! screen that's plugged in, stops the one whose screen goes away, and
 //! starts a crashed one again.
@@ -11,6 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// What `supervise` says when there are no screens to watch: the caller
+/// runs a single copy, quietly.
+pub const NO_SCREENS: &str = "no screens to watch";
 
 /// How often the screens and children are looked at.
 const EVERY: Duration = Duration::from_secs(2);
@@ -28,9 +32,9 @@ struct Kid {
 /// Run `piece` once per screen. Returns only if the screens can't be
 /// listed (then the caller runs a single copy instead).
 pub fn supervise(compositor: &Compositor, piece: &str) -> Result<(), String> {
-    let Compositor::Hyprland(_) = compositor else {
-        return Err("only on Hyprland".into());
-    };
+    if let Compositor::Demo = compositor {
+        return Err(NO_SCREENS.into());
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut kids: BTreeMap<String, Kid> = BTreeMap::new();
     let mut gave_up: BTreeSet<String> = BTreeSet::new();
@@ -38,9 +42,10 @@ pub fn supervise(compositor: &Compositor, piece: &str) -> Result<(), String> {
     loop {
         let Some(screens) = compositor.screens() else {
             if first {
-                return Err("can't list Hyprland's screens".into());
+                // An older nordlys-comp, say: one copy on the active screen.
+                return Err(NO_SCREENS.into());
             }
-            // Hyprland is going away; the session will stop us.
+            // The compositor is going away; the session will stop us.
             std::thread::sleep(EVERY);
             continue;
         };

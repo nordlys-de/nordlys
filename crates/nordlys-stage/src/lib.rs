@@ -5,7 +5,9 @@
 //! of the shelf. Ambient windows (chat, music) live on their own rail, so
 //! they leave the stage without joining the shelf.
 //!
-//! A [`Desk`] holds one stage per workspace.
+//! A [`Desk`] holds one stage per workspace. With more than one screen,
+//! each screen shows a workspace of its own and the focused screen's is
+//! the active one, which the stage commands act on.
 //!
 //! This crate is pure logic with no Wayland types, so the compositor, the
 //! headless test server and the unit tests all share exactly one copy of it.
@@ -201,11 +203,20 @@ impl<W: Clone + Eq + Hash> Stage<W> {
 
 /// One stage per workspace, numbered from 1. A window lives on exactly one
 /// workspace; the stage commands act on the active one.
+///
+/// Screens are optional: with none named (headless, or a compositor that
+/// keeps screens to itself) there's one implicit screen showing the active
+/// workspace. Named, each shows one workspace, no two the same, and the
+/// focused one's is the active workspace.
 #[derive(Debug, Clone)]
 pub struct Desk<W> {
     stages: BTreeMap<u32, Stage<W>>,
     active: u32,
     places: HashMap<W, u32>,
+    /// Each screen by name, in order, with the workspace it shows.
+    screens: Vec<(String, u32)>,
+    /// Index into `screens` of the one with the keyboard.
+    focused: usize,
 }
 
 impl<W: Clone + Eq + Hash> Default for Desk<W> {
@@ -214,6 +225,8 @@ impl<W: Clone + Eq + Hash> Default for Desk<W> {
             stages: BTreeMap::from([(1, Stage::default())]),
             active: 1,
             places: HashMap::new(),
+            screens: Vec::new(),
+            focused: 0,
         }
     }
 }
@@ -236,9 +249,89 @@ impl<W: Clone + Eq + Hash> Desk<W> {
         self.stages.entry(self.active).or_default()
     }
 
-    /// Workspaces with windows, plus the active one, in order.
+    /// Workspaces with windows, plus the ones on screen, in order.
     pub fn workspaces(&self) -> impl Iterator<Item = (u32, &Stage<W>)> {
         self.stages.iter().map(|(n, s)| (*n, s))
+    }
+
+    /// Workspace `n`'s stage, if it has one (it's empty otherwise).
+    pub fn workspace(&self, n: u32) -> Option<&Stage<W>> {
+        self.stages.get(&n)
+    }
+
+    /// The screens, in order, each with the workspace it shows.
+    pub fn screens(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.screens.iter().map(|(name, n)| (name.as_str(), *n))
+    }
+
+    /// The screen with the keyboard, when screens are named.
+    pub fn focused_screen(&self) -> Option<&str> {
+        self.screens
+            .get(self.focused)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// The screen showing workspace `n`, if any.
+    pub fn screen_showing(&self, n: u32) -> Option<&str> {
+        self.screens
+            .iter()
+            .find(|(_, w)| *w == n)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// These screens are connected now, in this order. Screens still there
+    /// keep their workspace; a new one shows the active workspace if no
+    /// screen does, else the lowest one not on screen. A screen that went
+    /// away leaves its workspace (and its windows) to be visited again.
+    pub fn set_screens(&mut self, names: &[String]) {
+        let focused = self.focused_screen().map(str::to_owned);
+        let mut next: Vec<(String, u32)> = Vec::new();
+        for name in names {
+            if next.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            if let Some(kept) = self.screens.iter().find(|(n, _)| n == name) {
+                next.push(kept.clone());
+            }
+        }
+        for name in names {
+            if next.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let taken = |w: u32| next.iter().any(|(_, n)| *n == w);
+            let ws = if taken(self.active) {
+                (1..).find(|w| !taken(*w)).expect("a free workspace")
+            } else {
+                self.active
+            };
+            next.push((name.clone(), ws));
+        }
+        // Back in the order given.
+        next.sort_by_key(|(n, _)| names.iter().position(|x| x == n));
+        self.screens = next;
+        self.focused = focused
+            .and_then(|f| self.screens.iter().position(|(n, _)| *n == f))
+            .unwrap_or(0);
+        for (_, n) in &self.screens {
+            self.stages.entry(*n).or_default();
+        }
+        if let Some((_, n)) = self.screens.get(self.focused) {
+            self.active = *n;
+        }
+        self.tidy();
+    }
+
+    /// Give the keyboard to screen `name`: its workspace becomes the
+    /// active one. False if there's no such screen.
+    pub fn focus_screen(&mut self, name: &str) -> bool {
+        let Some(i) = self.screens.iter().position(|(n, _)| n == name) else {
+            return false;
+        };
+        self.focused = i;
+        self.active = self.screens[i].1;
+        self.stages.entry(self.active).or_default();
+        self.tidy();
+        true
     }
 
     pub fn contains(&self, w: &W) -> bool {
@@ -249,10 +342,19 @@ impl<W: Clone + Eq + Hash> Desk<W> {
         self.places.get(w).copied()
     }
 
-    /// Go to workspace `n`. False for 0.
+    /// Go to workspace `n`. If another screen shows it, that screen gets
+    /// the keyboard; otherwise the focused screen shows it. False for 0.
     pub fn switch(&mut self, n: u32) -> bool {
         if n == 0 {
             return false;
+        }
+        match self.screens.iter().position(|(_, w)| *w == n) {
+            Some(i) => self.focused = i,
+            None => {
+                if let Some(s) = self.screens.get_mut(self.focused) {
+                    s.1 = n;
+                }
+            }
         }
         self.active = n;
         self.stages.entry(n).or_default();
@@ -320,13 +422,14 @@ impl<W: Clone + Eq + Hash> Desk<W> {
         true
     }
 
-    /// Forget empty workspaces other than the active one. A workspace
-    /// whose only window is an ambient one off the stage isn't empty: it
-    /// keeps that window, so it can be brought back.
+    /// Forget empty workspaces other than the active one and those on a
+    /// screen. A workspace whose only window is an ambient one off the
+    /// stage isn't empty: it keeps that window, so it can be brought back.
     fn tidy(&mut self) {
         let active = self.active;
+        let shown: Vec<u32> = self.screens.iter().map(|(_, n)| *n).collect();
         self.stages
-            .retain(|n, s| *n == active || !s.homes.is_empty());
+            .retain(|n, s| *n == active || shown.contains(n) || !s.homes.is_empty());
     }
 }
 
@@ -510,5 +613,71 @@ mod tests {
         d.switch(2);
         assert!(d.bring(&"chat"), "chat was lost with its workspace");
         assert_eq!((d.active(), d.stage().main()), (1, Some(&"chat")));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn each_screen_shows_a_workspace_of_its_own() {
+        let mut d: Desk<&str> = Desk::new();
+        d.open("helix", Home::Shelf);
+        d.set_screens(&names(&["eDP-1", "DP-1"]));
+        assert_eq!(d.screens().collect::<Vec<_>>(), [("eDP-1", 1), ("DP-1", 2)]);
+        assert_eq!((d.focused_screen(), d.active()), (Some("eDP-1"), 1));
+
+        // The other screen gets the keyboard, and new windows open there.
+        assert!(d.focus_screen("DP-1"));
+        d.open("firefox", Home::Shelf);
+        assert_eq!(d.workspace_of(&"firefox"), Some(2));
+        assert_eq!(d.workspace(1).and_then(Stage::main), Some(&"helix"));
+        assert!(!d.focus_screen("HDMI-A-1"));
+    }
+
+    #[test]
+    fn switching_to_a_workspace_on_another_screen_focuses_that_screen() {
+        let mut d: Desk<&str> = Desk::new();
+        d.set_screens(&names(&["eDP-1", "DP-1"]));
+        d.switch(2);
+        assert_eq!(d.focused_screen(), Some("DP-1"));
+        assert_eq!(d.screens().collect::<Vec<_>>(), [("eDP-1", 1), ("DP-1", 2)]);
+        // A workspace no screen shows comes to the focused one.
+        d.switch(3);
+        assert_eq!(d.screens().collect::<Vec<_>>(), [("eDP-1", 1), ("DP-1", 3)]);
+        assert_eq!(d.active(), 3);
+    }
+
+    #[test]
+    fn an_empty_workspace_on_screen_is_kept() {
+        let mut d: Desk<&str> = Desk::new();
+        d.set_screens(&names(&["eDP-1", "DP-1"]));
+        d.open("helix", Home::Shelf);
+        d.close(&"helix");
+        assert!(d.workspace(2).is_some(), "DP-1's workspace was dropped");
+    }
+
+    #[test]
+    fn unplugging_a_screen_keeps_its_windows() {
+        let mut d: Desk<&str> = Desk::new();
+        d.set_screens(&names(&["eDP-1", "DP-1"]));
+        d.focus_screen("DP-1");
+        d.open("firefox", Home::Shelf);
+        d.set_screens(&names(&["eDP-1"]));
+        assert_eq!((d.focused_screen(), d.active()), (Some("eDP-1"), 1));
+        assert_eq!(d.workspace_of(&"firefox"), Some(2));
+        // Plugged back in, it shows the lowest workspace not on screen.
+        d.set_screens(&names(&["eDP-1", "DP-1"]));
+        assert_eq!(d.screens().collect::<Vec<_>>(), [("eDP-1", 1), ("DP-1", 2)]);
+        assert!(d.bring(&"firefox"));
+        assert_eq!(d.focused_screen(), Some("DP-1"));
+    }
+
+    #[test]
+    fn the_first_screen_shows_the_active_workspace() {
+        let mut d: Desk<&str> = Desk::new();
+        d.switch(3);
+        d.set_screens(&names(&["DP-1"]));
+        assert_eq!(d.screens().collect::<Vec<_>>(), [("DP-1", 3)]);
     }
 }

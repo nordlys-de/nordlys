@@ -15,6 +15,11 @@
 //! over their parent, and take the keyboard while they're up. The lock
 //! screen uses ext-session-lock-v1: while it's up nothing else is drawn
 //! and nothing else gets input. hypridle and friends get ext-idle-notify.
+//!
+//! With more than one screen, each shows a workspace of its own (the
+//! Stage [`nordlys_stage::Desk`] keeps which), side by side in one
+//! logical space. The screen under the pointer has the keyboard, as on
+//! the Hyprland session; Nordlys+Ctrl+Left/Right moves it by keyboard.
 
 use crate::layout::{self, Rect};
 use crate::render;
@@ -44,7 +49,9 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, Interest, LoopHandle, LoopSignal, PostAction};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::backend::{
+    ClientData, ClientId, DisconnectReason, GlobalId,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
@@ -148,6 +155,10 @@ pub enum Action {
     WorkspaceBy(i32),
     FocusMain,
     FocusSide,
+    /// Give the keyboard to the next screen (or the previous one).
+    ScreenBy(i32),
+    /// Send the focused window to the next screen's workspace, and follow.
+    MoveToScreen(i32),
     Terminal,
     Launcher {
         commands: bool,
@@ -168,10 +179,20 @@ const LOCK: &str = "exec nordlys-shell lock";
 const SCREENSHOT: &str = "d=\"$(xdg-user-dir PICTURES 2>/dev/null || echo \"$HOME/Pictures\")/Screenshots\"; mkdir -p \"$d\"; exec nordlysctl screenshot \"$d/$(date +%Y-%m-%d_%H-%M-%S).png\"";
 
 /// The Nordlys key bindings (the Nordlys key is already held). `sym` is
-/// the key without Shift, so Shift+1 still reads as 1.
-fn binding(shift: bool, sym: u32) -> Option<Action> {
+/// the key without Shift, so Shift+1 still reads as 1. With Ctrl, the
+/// arrows act on screens; nothing else takes Ctrl.
+fn binding(shift: bool, ctrl: bool, sym: u32) -> Option<Action> {
     use Action::*;
     let ipc = |r| Some(Ipc(r));
+    if ctrl {
+        return match (shift, sym) {
+            (false, keysyms::KEY_Left) => Some(ScreenBy(-1)),
+            (false, keysyms::KEY_Right) => Some(ScreenBy(1)),
+            (true, keysyms::KEY_Left) => Some(MoveToScreen(-1)),
+            (true, keysyms::KEY_Right) => Some(MoveToScreen(1)),
+            _ => None,
+        };
+    }
     match (shift, sym) {
         (false, keysyms::KEY_Return) => Some(Terminal),
         (false, keysyms::KEY_space) => Some(Launcher { commands: false }),
@@ -251,9 +272,13 @@ pub enum Backend {
 pub enum Lock {
     Unlocked,
     Locked {
-        /// Answered once a frame without the desktop has been drawn.
+        /// Answered once every screen has drawn a frame without the
+        /// desktop on it.
         pending: Option<SessionLocker>,
-        surface: Option<LockSurface>,
+        /// The lock client's surface for each screen.
+        surfaces: Vec<(Output, LockSurface)>,
+        /// The screens that have drawn since the lock came.
+        drawn: Vec<Output>,
     },
 }
 
@@ -268,7 +293,16 @@ pub struct Comp {
     nordlys_key: NordlysKey,
 
     pub backend: Backend,
-    pub output: Output,
+    /// Every screen, in order, placed side by side in `space`.
+    pub outputs: Vec<Output>,
+    /// Each screen's wl_output global.
+    globals: Vec<(Output, GlobalId)>,
+    /// The screen that had the keyboard at the last layout, to bring the
+    /// pointer along when the keyboard moves to another one.
+    shown_focus: Option<String>,
+    /// Each screen's stage area at the last layout, to notice a bar
+    /// moving it.
+    areas: Vec<(String, Rect)>,
     pub ring: [SolidColorBuffer; 4],
     pub blur: blur::Blur,
     pub cursor: cursor::Cursor,
@@ -321,7 +355,8 @@ pub struct Comp {
 /// What a backend hands over once it can draw.
 pub struct Ready {
     pub backend: Backend,
-    pub output: Output,
+    /// The screens, already sized and placed.
+    pub outputs: Vec<Output>,
     /// For dmabuf: the formats the renderer imports and its device.
     pub formats: Vec<Format>,
     pub device: Option<libc_dev_t>,
@@ -382,10 +417,13 @@ pub fn run(
         (_, Mode::Nested) => NordlysKey::Alt,
     };
 
-    let output = ready.output.clone();
-    let _output_global = output.create_global::<Comp>(&dh);
+    let outputs = ready.outputs.clone();
     let mut space = Space::default();
-    space.map_output(&output, (0, 0));
+    let mut globals = Vec::new();
+    for o in &outputs {
+        globals.push((o.clone(), o.create_global::<Comp>(&dh)));
+        space.map_output(o, o.current_location());
+    }
 
     // dmabuf with feedback, so GPU clients (wgpu, Vulkan, browsers) find
     // the render node; plain v3 when the device can't be told.
@@ -411,7 +449,10 @@ pub fn run(
         ipc_path: ipc_path.clone(),
         nordlys_key,
         backend: ready.backend,
-        output,
+        outputs,
+        globals,
+        shown_focus: None,
+        areas: Vec::new(),
         ring: std::array::from_fn(|_| SolidColorBuffer::new((0, 0), accent)),
         blur: blur::Blur::new(&config.theme),
         cursor: cursor::Cursor::load(),
@@ -484,6 +525,9 @@ pub fn run(
         }
     })?;
 
+    let names: Vec<String> = comp.outputs.iter().map(Output::name).collect();
+    comp.shared.change(|s| s.desk.set_screens(&names));
+    comp.shown_focus = comp.focused_output().map(|o| o.name());
     comp.x_display = xwayland::start(&socket_name);
     let key = nordlys_key.name();
     let place = match mode {
@@ -605,16 +649,114 @@ impl Comp {
         self.backend = backend;
     }
 
-    /// The output changed size or scale: lay everything out again.
-    pub fn output_changed(&mut self) {
-        layer_map_for_output(&self.output).arrange();
-        if let Lock::Locked {
-            surface: Some(s), ..
-        } = &self.lock
-        {
-            configure_lock(s, &self.output);
+    /// A screen changed size or scale: lay everything out again.
+    pub fn outputs_changed(&mut self) {
+        for o in &self.outputs {
+            layer_map_for_output(o).arrange();
+        }
+        if let Lock::Locked { surfaces, .. } = &self.lock {
+            for (o, s) in surfaces {
+                configure_lock(s, o);
+            }
         }
         self.relayout();
+    }
+
+    /// The screens now connected, sized and placed (hotplug). Screens
+    /// that went away take their layer surfaces with them; their
+    /// workspaces stay, to be visited again.
+    pub fn set_outputs(&mut self, outputs: Vec<Output>) {
+        for gone in self.outputs.iter().filter(|o| !outputs.contains(o)) {
+            self.space.unmap_output(gone);
+            let layers: Vec<LayerSurface> = layer_map_for_output(gone).layers().cloned().collect();
+            for l in layers {
+                l.layer_surface().send_close();
+                layer_map_for_output(gone).unmap_layer(&l);
+            }
+            self.blur.forget_screen(&gone.name());
+            if let Some(i) = self.globals.iter().position(|(o, _)| o == gone) {
+                // Clients get a moment to let go of it before it's gone.
+                let (_, id) = self.globals.remove(i);
+                self.dh.disable_global::<Comp>(id.clone());
+                let removed = self.handle.insert_source(
+                    Timer::from_duration(Duration::from_secs(5)),
+                    move |_, _, comp: &mut Comp| {
+                        comp.dh.remove_global::<Comp>(id.clone());
+                        TimeoutAction::Drop
+                    },
+                );
+                if let Err(e) = removed {
+                    eprintln!("nordlys-comp: {e}");
+                }
+            }
+            if let Lock::Locked { surfaces, .. } = &mut self.lock {
+                surfaces.retain(|(o, _)| o != gone);
+            }
+        }
+        for o in &outputs {
+            if !self.globals.iter().any(|(g, _)| g == o) {
+                self.globals
+                    .push((o.clone(), o.create_global::<Comp>(&self.dh)));
+            }
+            self.space.map_output(o, o.current_location());
+        }
+        self.outputs = outputs;
+        let names: Vec<String> = self.outputs.iter().map(Output::name).collect();
+        self.shared.change(|s| s.desk.set_screens(&names));
+        // The pointer may have been on a screen that's gone.
+        let pos = self.pointer_location();
+        if self.output_at(pos).is_none()
+            && let Some(o) = self.focused_output()
+        {
+            let centre = self.output_centre(&o);
+            self.move_pointer(centre);
+        }
+        self.outputs_changed();
+    }
+
+    /// The screen with the keyboard (the first, if the Stage hasn't named
+    /// one yet).
+    pub fn focused_output(&self) -> Option<Output> {
+        let name = lock(&self.shared.state)
+            .desk
+            .focused_screen()
+            .map(str::to_owned);
+        name.and_then(|n| self.output_named(&n).cloned())
+            .or_else(|| self.outputs.first().cloned())
+    }
+
+    fn output_named(&self, name: &str) -> Option<&Output> {
+        self.outputs.iter().find(|o| o.name() == name)
+    }
+
+    /// The screen at `pos`, in the logical space they share.
+    fn output_at(&self, pos: Point<f64, Logical>) -> Option<Output> {
+        self.space.output_under(pos).next().cloned()
+    }
+
+    /// Where `o`'s top-left corner is in the logical space.
+    fn output_origin(&self, o: &Output) -> Point<i32, Logical> {
+        self.space
+            .output_geometry(o)
+            .map(|g| g.loc)
+            .unwrap_or_default()
+    }
+
+    fn output_centre(&self, o: &Output) -> Point<f64, Logical> {
+        let g = self.space.output_geometry(o).unwrap_or_default();
+        Point::from((
+            f64::from(g.loc.x) + f64::from(g.size.w) / 2.0,
+            f64::from(g.loc.y) + f64::from(g.size.h) / 2.0,
+        ))
+    }
+
+    /// The smallest rectangle around every screen.
+    fn bounds(&self) -> Rectangle<i32, Logical> {
+        self.outputs
+            .iter()
+            .filter_map(|o| self.space.output_geometry(o))
+            .reduce(|a, b| a.merge(b))
+            .unwrap_or_default()
     }
 
     // ---- Stage ------------------------------------------------------
@@ -653,45 +795,78 @@ impl Comp {
         self.relayout();
     }
 
-    /// The area windows may use: the output minus what layer surfaces
-    /// (the bar, the rails) reserve.
-    fn stage_area(&self) -> Rect {
-        rect(layer_map_for_output(&self.output).non_exclusive_zone())
+    /// The area windows may use on `o`: the screen minus what its layer
+    /// surfaces (the bar, the rails) reserve, in the shared logical space.
+    fn stage_area(&self, o: &Output) -> Rect {
+        let at = self.output_origin(o);
+        let zone = layer_map_for_output(o).non_exclusive_zone();
+        let r = rect(zone);
+        Rect::new(r.x + at.x, r.y + at.y, r.w, r.h)
     }
 
-    /// Put every window where the Stage model says: main and side mapped
-    /// in their frames, everything else unmapped, dialogs over their
-    /// parent. Then hand the keyboard to whoever should have it.
+    /// Every screen's stage area, by name.
+    fn stage_areas(&self) -> Vec<(String, Rect)> {
+        self.outputs
+            .iter()
+            .map(|o| (o.name(), self.stage_area(o)))
+            .collect()
+    }
+
+    /// Put every window where the Stage model says: on each screen, the
+    /// main and side of the workspace it shows mapped in their frames;
+    /// everything else unmapped; dialogs over their parent. Then hand the
+    /// keyboard to whoever should have it, on the focused screen.
     pub fn relayout(&mut self) {
-        let (main, side, layout, split) = {
+        let (screens, layout, split) = {
             let st = lock(&self.shared.state);
-            let s = st.desk.stage();
-            (
-                s.main().cloned(),
-                s.side().cloned(),
-                st.config.stage.layout,
-                st.config.stage.split,
-            )
+            let screens: Vec<(String, Option<String>, Option<String>)> = st
+                .desk
+                .screens()
+                .map(|(name, n)| {
+                    let stage = st.desk.workspace(n);
+                    (
+                        name.to_owned(),
+                        stage.and_then(|s| s.main().cloned()),
+                        stage.and_then(|s| s.side().cloned()),
+                    )
+                })
+                .collect();
+            (screens, st.config.stage.layout, st.config.stage.split)
         };
-        let area = self.stage_area();
-        let (main_r, side_r) = layout::arrange(area, layout, split, side.is_some());
-        let visible: Vec<(String, Rect)> = main
-            .map(|m| (m, main_r))
-            .into_iter()
-            .chain(side.zip(side_r))
-            .collect();
-        if !self
-            .focus
-            .as_ref()
-            .is_some_and(|f| visible.iter().any(|(id, _)| id == f))
-        {
-            self.focus = visible.first().map(|(id, _)| id.clone());
+        let focused = self.focused_output().map(|o| o.name());
+        self.areas = self.stage_areas();
+        // (window, frame, screen)
+        let mut visible: Vec<(String, Rect, String)> = Vec::new();
+        for (screen, main, side) in screens {
+            let Some(area) = self
+                .areas
+                .iter()
+                .find(|(n, _)| *n == screen)
+                .map(|(_, a)| *a)
+            else {
+                continue;
+            };
+            let (main_r, side_r) = layout::arrange(area, layout, split, side.is_some());
+            visible.extend(main.map(|m| (m, main_r, screen.clone())));
+            visible.extend(side.zip(side_r).map(|(s, r)| (s, r, screen.clone())));
+        }
+        // The keyboard stays on the focused screen.
+        let on_focused = |id: &str| {
+            visible
+                .iter()
+                .any(|(v, _, s)| v == id && Some(s) == focused.as_ref())
+        };
+        if !self.focus.as_deref().is_some_and(on_focused) {
+            self.focus = visible
+                .iter()
+                .find(|(_, _, s)| Some(s) == focused.as_ref())
+                .map(|(id, _, _)| id.clone());
         }
 
         for (id, w) in &self.windows {
             let Some(t) = w.toplevel() else { continue };
-            match visible.iter().find(|(v, _)| v == id) {
-                Some((_, r)) => {
+            match visible.iter().find(|(v, _, _)| v == id) {
+                Some((_, r, _)) => {
                     t.with_pending_state(|s| {
                         s.size = Some((r.w, r.h).into());
                         for tiled in [
@@ -716,19 +891,46 @@ impl Comp {
             }
         }
 
-        // Dialogs show while their parent does.
-        let shown: Vec<WlSurface> = visible
+        // Dialogs show while their parent does, on the parent's screen.
+        let shown: Vec<(WlSurface, String)> = visible
             .iter()
-            .filter_map(|(id, _)| Some(self.window(id)?.toplevel()?.wl_surface().clone()))
+            .filter_map(|(id, _, screen)| {
+                Some((
+                    self.window(id)?.toplevel()?.wl_surface().clone(),
+                    screen.clone(),
+                ))
+            })
             .collect();
         for w in &self.floating {
             let Some(t) = w.toplevel() else { continue };
-            if t.parent().is_some_and(|p| shown.contains(&p)) {
-                let g = w.geometry();
-                let f = layout::float(area, g.size.w, g.size.h);
-                self.space.map_element(w.clone(), (f.x, f.y), true);
-            } else {
-                self.space.unmap_elem(w);
+            let area = t
+                .parent()
+                .and_then(|p| shown.iter().find(|(s, _)| *s == p))
+                .and_then(|(_, screen)| self.areas.iter().find(|(n, _)| n == screen))
+                .map(|(_, a)| *a);
+            match area {
+                Some(area) => {
+                    let g = w.geometry();
+                    let f = layout::float(area, g.size.w, g.size.h);
+                    self.space.map_element(w.clone(), (f.x, f.y), true);
+                }
+                None => self.space.unmap_elem(w),
+            }
+        }
+
+        // The keyboard moved to another screen without the pointer (a key,
+        // a workspace shown there): bring the pointer along.
+        if focused != self.shown_focus {
+            self.shown_focus = focused.clone();
+            let pointer_on = self.output_at(self.pointer_location()).map(|o| o.name());
+            if pointer_on != focused
+                && let Some(o) = focused
+                    .as_deref()
+                    .and_then(|n| self.output_named(n))
+                    .cloned()
+            {
+                let centre = self.output_centre(&o);
+                self.move_pointer(centre);
             }
         }
         self.apply_focus();
@@ -740,7 +942,14 @@ impl Comp {
     /// else the focused stage window.
     fn apply_focus(&mut self) {
         let target = match &self.lock {
-            Lock::Locked { surface, .. } => surface.as_ref().map(|s| s.wl_surface().clone()),
+            Lock::Locked { surfaces, .. } => {
+                let on = self.focused_output();
+                surfaces
+                    .iter()
+                    .find(|(o, _)| Some(o) == on.as_ref())
+                    .or(surfaces.first())
+                    .map(|(_, s)| s.wl_surface().clone())
+            }
             Lock::Unlocked => self
                 .layer_focus
                 .clone()
@@ -861,6 +1070,30 @@ impl Comp {
                     self.relayout();
                 }
             }
+            Action::ScreenBy(d) => {
+                if let Some(o) = self.screen_by(d) {
+                    request(self, Request::FocusScreen { name: o.name() });
+                }
+            }
+            Action::MoveToScreen(d) => {
+                let target = self.screen_by(d).and_then(|o| {
+                    let st = lock(&self.shared.state);
+                    st.desk
+                        .screens()
+                        .find(|(n, _)| *n == o.name())
+                        .map(|(_, w)| w)
+                });
+                if let (Some(n), Some(id)) = (target, self.focus.clone()) {
+                    request(
+                        self,
+                        Request::MoveTo {
+                            n,
+                            id: Some(id.clone()),
+                        },
+                    );
+                    request(self, Request::Bring { id });
+                }
+            }
             Action::Terminal => self.spawn(terminal(), None),
             Action::Launcher { commands } => {
                 let bin = shell_bin();
@@ -877,18 +1110,35 @@ impl Comp {
         }
     }
 
+    /// The screen `d` places from the focused one, wrapping around; None
+    /// with one screen.
+    fn screen_by(&self, d: i32) -> Option<Output> {
+        let n = self.outputs.len() as i32;
+        if n < 2 {
+            return None;
+        }
+        let at = self
+            .focused_output()
+            .and_then(|f| self.outputs.iter().position(|o| *o == f))
+            .unwrap_or(0) as i32;
+        self.outputs.get((at + d).rem_euclid(n) as usize).cloned()
+    }
+
     // ---- Input ------------------------------------------------------
 
     fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-        if let Lock::Locked { surface, .. } = &self.lock {
-            // The lock screen covers the output from its top-left corner.
-            let s = surface.as_ref()?.wl_surface().clone();
-            return Some((s, (0.0, 0.0).into()));
+        let output = self.output_at(pos)?;
+        let origin = self.output_origin(&output);
+        if let Lock::Locked { surfaces, .. } = &self.lock {
+            // Each lock surface covers its screen from the top-left corner.
+            let (_, s) = surfaces.iter().find(|(o, _)| *o == output)?;
+            return Some((s.wl_surface().clone(), origin.to_f64()));
         }
-        let map = layer_map_for_output(&self.output);
+        let map = layer_map_for_output(&output);
+        let local = pos - origin.to_f64();
         let in_layer = |layer: Layer| {
-            let l = map.layer_under(layer, pos)?;
-            let at = map.layer_geometry(l)?.loc;
+            let l = map.layer_under(layer, local)?;
+            let at = map.layer_geometry(l)?.loc + origin;
             l.surface_under(pos - at.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + at).to_f64()))
         };
@@ -904,19 +1154,58 @@ impl Comp {
             .or_else(|| in_layer(Layer::Background))
     }
 
-    fn output_size(&self) -> smithay::utils::Size<i32, Logical> {
-        self.space
-            .output_geometry(&self.output)
-            .map(|g| g.size)
+    fn pointer_location(&self) -> Point<f64, Logical> {
+        self.seat
+            .get_pointer()
+            .map(|p| p.current_location())
             .unwrap_or_default()
     }
 
+    /// The pointer moved to `pos`. It stays on the screens: past an edge
+    /// with no screen beyond, it stops at the edge of the one it was on.
+    /// Onto another screen, that screen gets the keyboard.
     fn pointer_to(&mut self, pos: Point<f64, Logical>, time: u32) {
-        let size = self.output_size();
-        let pos = Point::from((
-            pos.x.clamp(0.0, (size.w - 1).max(0) as f64),
-            pos.y.clamp(0.0, (size.h - 1).max(0) as f64),
-        ));
+        let pos = if self.output_at(pos).is_some() {
+            pos
+        } else {
+            let from = self
+                .output_at(self.pointer_location())
+                .or_else(|| self.outputs.first().cloned());
+            let g = from
+                .and_then(|o| self.space.output_geometry(&o))
+                .unwrap_or_default();
+            Point::from((
+                pos.x.clamp(
+                    f64::from(g.loc.x),
+                    f64::from(g.loc.x + g.size.w - 1).max(f64::from(g.loc.x)),
+                ),
+                pos.y.clamp(
+                    f64::from(g.loc.y),
+                    f64::from(g.loc.y + g.size.h - 1).max(f64::from(g.loc.y)),
+                ),
+            ))
+        };
+        if let Some(o) = self.output_at(pos)
+            && self.focused_output().as_ref() != Some(&o)
+        {
+            let name = o.name();
+            // Already where it's going, so the layout doesn't move it.
+            self.shown_focus = Some(name.clone());
+            self.shared.change(|s| s.desk.focus_screen(&name));
+            self.move_pointer_at(pos, time);
+            self.relayout();
+            return;
+        }
+        self.move_pointer_at(pos, time);
+    }
+
+    /// Put the pointer at `pos` now (no focus follows), as a warp.
+    fn move_pointer(&mut self, pos: Point<f64, Logical>) {
+        let time = self.start.elapsed().as_millis() as u32;
+        self.move_pointer_at(pos, time);
+    }
+
+    fn move_pointer_at(&mut self, pos: Point<f64, Logical>, time: u32) {
         let under = self.surface_under(pos);
         let pointer = self.seat.get_pointer().expect("seat has a pointer");
         pointer.motion(
@@ -969,7 +1258,7 @@ impl Comp {
                             (!locked && key.held(mods))
                                 .then(|| sym.raw_latin_sym_or_raw_current_sym())
                                 .flatten()
-                                .and_then(|s| binding(mods.shift, s.raw()))
+                                .and_then(|s| binding(mods.shift, mods.ctrl, s.raw()))
                         });
                         match found {
                             Some(a) => {
@@ -990,7 +1279,9 @@ impl Comp {
                 self.pointer_to(pos, event.time_msec());
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                let pos = event.position_transformed(self.output_size());
+                // Absolute devices (tablets, a VM's pointer) span every screen.
+                let b = self.bounds();
+                let pos = event.position_transformed(b.size) + b.loc.to_f64();
                 self.pointer_to(pos, event.time_msec());
             }
             InputEvent::PointerButton { event } => {
@@ -1040,12 +1331,13 @@ impl Comp {
     /// A click gives the keyboard to what's under it: a stage window, or a
     /// layer surface that takes the keyboard on demand.
     fn click_focus(&mut self, pos: Point<f64, Logical>) {
-        let layer = {
-            let map = layer_map_for_output(&self.output);
+        let layer = self.output_at(pos).and_then(|o| {
+            let local = pos - self.output_origin(&o).to_f64();
+            let map = layer_map_for_output(&o);
             [Layer::Overlay, Layer::Top]
                 .into_iter()
-                .find_map(|l| map.layer_under(l, pos).cloned())
-        };
+                .find_map(|l| map.layer_under(l, local).cloned())
+        });
         if let Some(l) = layer {
             if l.can_receive_keyboard_focus() {
                 self.layer_focus = Some(l.wl_surface().clone());
@@ -1104,30 +1396,43 @@ impl Comp {
         lock(&self.shared.state).config.palette().accent
     }
 
-    /// A frame was drawn: tell clients they may draw the next, and answer
-    /// a lock request now the desktop is off the screen.
-    pub fn frame_done(&mut self) {
+    /// A frame was drawn on `out`: tell clients there they may draw the
+    /// next, and answer a lock request once every screen has the desktop
+    /// off it.
+    pub fn frame_done(&mut self, out: &Output) {
         self.last_frame = Instant::now();
         let now = self.start.elapsed();
-        let out = self.output.clone();
-        if let Lock::Locked { pending, surface } = &mut self.lock {
-            if let Some(s) = surface {
-                send_frames_surface(s.wl_surface(), &out, now);
+        let screens = self.outputs.clone();
+        if let Lock::Locked {
+            pending,
+            surfaces,
+            drawn,
+        } = &mut self.lock
+        {
+            if let Some((_, s)) = surfaces.iter().find(|(o, _)| o == out) {
+                send_frames_surface(s.wl_surface(), out, now);
             }
-            if let Some(locker) = pending.take() {
+            if !drawn.contains(out) {
+                drawn.push(out.clone());
+            }
+            if screens.iter().all(|o| drawn.contains(o))
+                && let Some(locker) = pending.take()
+            {
                 locker.lock();
             }
             // Clients behind the lock still get frames, slowly, so they
             // don't hang; nothing of theirs is drawn.
         }
-        for w in self.space.elements() {
-            w.send_frame(&out, now, Some(Duration::ZERO), |_, _| Some(out.clone()));
+        for w in self.space.elements_for_output(out) {
+            w.send_frame(out, now, Some(Duration::ZERO), |_, _| Some(out.clone()));
         }
-        for l in layer_map_for_output(&out).layers() {
-            l.send_frame(&out, now, Some(Duration::ZERO), |_, _| Some(out.clone()));
+        for l in layer_map_for_output(out).layers() {
+            l.send_frame(out, now, Some(Duration::ZERO), |_, _| Some(out.clone()));
         }
-        if let CursorImageStatus::Surface(s) = &self.cursor.status {
-            send_frames_surface(s, &out, now);
+        if let CursorImageStatus::Surface(s) = &self.cursor.status
+            && self.output_at(self.pointer_location()).as_ref() == Some(out)
+        {
+            send_frames_surface(s, out, now);
         }
     }
 
@@ -1142,7 +1447,9 @@ impl Comp {
     /// current, and the shelf gets a fresh picture of each.
     fn shelf_tick(&mut self) {
         let now = self.start.elapsed();
-        let out = self.output.clone();
+        let Some(out) = self.focused_output() else {
+            return;
+        };
         let waiting: Vec<(String, Window)> = self
             .windows
             .iter()
@@ -1254,8 +1561,16 @@ impl CompositorHandler for Comp {
 
 impl Comp {
     fn commit_layer(&mut self, surface: &WlSurface) {
+        let Some(output) = self.outputs.iter().find(|o| {
+            layer_map_for_output(o)
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .is_some()
+        }) else {
+            return;
+        };
+        let output = output.clone();
         let (first, wants_keys) = {
-            let mut map = layer_map_for_output(&self.output);
+            let mut map = layer_map_for_output(&output);
             let Some(layer) = map
                 .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
                 .cloned()
@@ -1282,31 +1597,9 @@ impl Comp {
             self.layer_focus = None;
         }
         // What the layer reserves may have changed; so may the keyboard.
-        if first || wants_keys != has {
+        if first || wants_keys != has || self.stage_areas() != self.areas {
             self.relayout();
-        } else {
-            let area = self.stage_area();
-            if self.last_area() != Some(area) {
-                self.relayout();
-            }
         }
-    }
-
-    /// Where the main window currently sits, to notice when a bar's
-    /// reservation moved the stage.
-    fn last_area(&self) -> Option<Rect> {
-        let st = lock(&self.shared.state);
-        let main = st.desk.stage().main()?.clone();
-        let split = st.config.stage.split;
-        let layout = st.config.stage.layout;
-        let two_up = st.desk.stage().side().is_some();
-        drop(st);
-        let g = self.space.element_geometry(self.window(&main)?)?;
-        // Recompute what arrange() would give for the current area and
-        // compare it with where the window is; equal means unchanged.
-        let area = self.stage_area();
-        let (want, _) = layout::arrange(area, layout, split, two_up);
-        (rect(g).x == want.x && rect(g).y == want.y).then_some(area)
     }
 }
 
@@ -1399,12 +1692,22 @@ impl WlrLayerShellHandler for Comp {
     fn new_layer_surface(
         &mut self,
         surface: WlrLayerSurface,
-        _output: Option<WlOutput>,
+        output: Option<WlOutput>,
         _layer: Layer,
         namespace: String,
     ) {
-        // One output, so every layer surface goes on it.
-        let mut map = layer_map_for_output(&self.output);
+        // On the screen it asked for, else the one with the keyboard (where
+        // the launcher should open).
+        let Some(output) = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .filter(|o| self.outputs.contains(o))
+            .or_else(|| self.focused_output())
+        else {
+            surface.send_close();
+            return;
+        };
+        let mut map = layer_map_for_output(&output);
         if let Err(e) = map.map_layer(&LayerSurface::new(surface, namespace)) {
             eprintln!("nordlys-comp: layer surface: {e}");
         }
@@ -1417,8 +1720,8 @@ impl WlrLayerShellHandler for Comp {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        {
-            let mut map = layer_map_for_output(&self.output);
+        for o in &self.outputs {
+            let mut map = layer_map_for_output(o);
             let layer = map
                 .layers()
                 .find(|l| l.layer_surface() == &surface)
@@ -1445,7 +1748,8 @@ impl SessionLockHandler for Comp {
         self.layer_focus = None;
         self.lock = Lock::Locked {
             pending: Some(confirmation),
-            surface: None,
+            surfaces: Vec::new(),
+            drawn: Vec::new(),
         };
         self.apply_focus();
         self.request_redraw();
@@ -1456,10 +1760,15 @@ impl SessionLockHandler for Comp {
         self.relayout();
     }
 
-    fn new_surface(&mut self, surface: LockSurface, _output: WlOutput) {
-        configure_lock(&surface, &self.output);
-        if let Lock::Locked { surface: slot, .. } = &mut self.lock {
-            *slot = Some(surface);
+    fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
+        let Some(output) = Output::from_resource(&output).filter(|o| self.outputs.contains(o))
+        else {
+            return;
+        };
+        configure_lock(&surface, &output);
+        if let Lock::Locked { surfaces, .. } = &mut self.lock {
+            surfaces.retain(|(o, _)| *o != output);
+            surfaces.push((output, surface));
         }
         self.apply_focus();
         self.request_redraw();
@@ -1572,20 +1881,47 @@ mod tests {
     #[test]
     fn bindings_read_shift_from_the_modifier_not_the_symbol() {
         assert_eq!(
-            binding(false, keysyms::KEY_3),
+            binding(false, false, keysyms::KEY_3),
             Some(Action::Ipc(Request::Workspace { n: 3 }))
         );
-        assert_eq!(binding(true, keysyms::KEY_3), Some(Action::MoveFocused(3)));
         assert_eq!(
-            binding(false, keysyms::KEY_k),
+            binding(true, false, keysyms::KEY_3),
+            Some(Action::MoveFocused(3))
+        );
+        assert_eq!(
+            binding(false, false, keysyms::KEY_k),
             Some(Action::Ipc(Request::Previous))
         );
-        assert_eq!(binding(true, keysyms::KEY_Escape), Some(Action::Quit));
         assert_eq!(
-            binding(false, keysyms::KEY_Escape),
+            binding(true, false, keysyms::KEY_Escape),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            binding(false, false, keysyms::KEY_Escape),
             Some(Action::Spawn(LOCK))
         );
-        assert_eq!(binding(false, keysyms::KEY_z), None);
+        assert_eq!(binding(false, false, keysyms::KEY_z), None);
+    }
+
+    #[test]
+    fn ctrl_arrows_act_on_screens_and_ctrl_takes_nothing_else() {
+        assert_eq!(
+            binding(false, true, keysyms::KEY_Right),
+            Some(Action::ScreenBy(1))
+        );
+        assert_eq!(
+            binding(false, true, keysyms::KEY_Left),
+            Some(Action::ScreenBy(-1))
+        );
+        assert_eq!(
+            binding(true, true, keysyms::KEY_Right),
+            Some(Action::MoveToScreen(1))
+        );
+        assert_eq!(
+            binding(false, false, keysyms::KEY_Left),
+            Some(Action::FocusMain)
+        );
+        assert_eq!(binding(false, true, keysyms::KEY_3), None);
     }
 
     #[test]

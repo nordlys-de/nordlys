@@ -1,7 +1,8 @@
-//! What a frame is made of, for either backend: the lock screen alone
-//! while it's up; otherwise the cursor, overlay and top layers (with
+//! What a screen's frame is made of, for either backend: the lock screen
+//! alone while it's up; otherwise the cursor, overlay and top layers (with
 //! their blur behind them), the accent ring, the windows, then the bottom
-//! and background layers. Front to back, as Smithay wants them.
+//! and background layers. Front to back, as Smithay wants them. Each
+//! screen is drawn on its own, from the part of the desktop it shows.
 
 use crate::comp::{Comp, Lock};
 use nordlys_config::Rgb;
@@ -16,7 +17,8 @@ use smithay::backend::renderer::element::{AsRenderElements, Kind, render_element
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
 use smithay::desktop::layer_map_for_output;
-use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
+use smithay::output::Output;
+use smithay::utils::{Logical, Physical, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shell::wlr_layer::Layer;
 use std::path::Path;
 
@@ -34,23 +36,31 @@ pub fn color(c: Rgb, alpha: f32) -> [f32; 4] {
     [f(c.0), f(c.1), f(c.2), alpha]
 }
 
-pub fn scale(comp: &Comp) -> Scale<f64> {
-    Scale::from(comp.output.current_scale().fractional_scale())
+pub fn scale(output: &Output) -> Scale<f64> {
+    Scale::from(output.current_scale().fractional_scale())
 }
 
 /// The output's size in physical pixels.
-pub fn output_size(comp: &Comp) -> Size<i32, Physical> {
-    comp.output
+pub fn output_size(output: &Output) -> Size<i32, Physical> {
+    output
         .current_mode()
         .map(|m| m.size)
         .unwrap_or_else(|| (1, 1).into())
 }
 
-/// Every element of the next frame, front to back. `with_cursor` when the
-/// backend has to draw the pointer itself (on the screen; nested, the
-/// desktop around draws it).
-pub fn elements(comp: &mut Comp, r: &mut GlesRenderer, with_cursor: bool) -> Vec<Elem> {
-    let scale = scale(comp);
+/// Every element of `output`'s next frame, front to back, placed on that
+/// output (its top-left corner is 0, 0). `with_cursor` when the backend
+/// has to draw the pointer itself (on the screen; nested, the desktop
+/// around draws it).
+pub fn elements(
+    comp: &mut Comp,
+    r: &mut GlesRenderer,
+    output: &Output,
+    with_cursor: bool,
+) -> Vec<Elem> {
+    let scale = scale(output);
+    let region = comp.space.output_geometry(output).unwrap_or_default();
+    let origin = region.loc;
     let mut out: Vec<Elem> = Vec::new();
     if with_cursor {
         let pos = comp
@@ -58,12 +68,14 @@ pub fn elements(comp: &mut Comp, r: &mut GlesRenderer, with_cursor: bool) -> Vec
             .get_pointer()
             .map(|p| p.current_location())
             .unwrap_or_default();
-        out.extend(comp.cursor.elements(r, pos, scale));
+        if region.to_f64().contains(pos) {
+            out.extend(comp.cursor.elements(r, pos - origin.to_f64(), scale));
+        }
     }
 
-    if let Lock::Locked { surface, .. } = &comp.lock {
+    if let Lock::Locked { surfaces, .. } = &comp.lock {
         // Only the lock screen; until it has drawn, nothing but the ground.
-        if let Some(s) = surface {
+        if let Some((_, s)) = surfaces.iter().find(|(o, _)| o == output) {
             out.extend(
                 render_elements_from_surface_tree::<_, WaylandSurfaceRenderElement<_>>(
                     r,
@@ -83,20 +95,21 @@ pub fn elements(comp: &mut Comp, r: &mut GlesRenderer, with_cursor: bool) -> Vec
     // Everything under the top layer: what glass surfaces blur.
     let mut below: Vec<Elem> = Vec::new();
     for (i, (x, y, w, h)) in comp.ring_rects().into_iter().enumerate().take(4) {
+        let rect = Rectangle::<i32, Logical>::new((x, y).into(), (w, h).into());
+        if !rect.overlaps(region) {
+            continue;
+        }
         let accent = color(comp.accent(), 0.9);
         let buf: &mut SolidColorBuffer = &mut comp.ring[i];
         buf.update((w, h), accent);
         below.push(Elem::from(SolidColorRenderElement::from_buffer(
             buf,
-            Rectangle::<i32, smithay::utils::Logical>::new((x, y).into(), (w, h).into())
-                .loc
-                .to_physical_precise_round(scale),
+            (rect.loc - origin).to_physical_precise_round(scale),
             scale,
             1.0,
             Kind::Unspecified,
         )));
     }
-    let region = comp.space.output_geometry(&comp.output).unwrap_or_default();
     below.extend(
         comp.space
             .render_elements_for_region(r, &region, scale, 1.0)
@@ -104,25 +117,27 @@ pub fn elements(comp: &mut Comp, r: &mut GlesRenderer, with_cursor: bool) -> Vec
             .map(Elem::from),
     );
     below.extend(layer_elements(
-        comp,
+        output,
         r,
         &[Layer::Bottom, Layer::Background],
         scale,
     ));
 
     // The glass on top, each with its blur behind it.
-    let map = layer_map_for_output(&comp.output);
+    let map = layer_map_for_output(output);
     let glass: Vec<_> = [Layer::Overlay, Layer::Top]
         .into_iter()
         .flat_map(|l| map.layers_on(l).rev().cloned().collect::<Vec<_>>())
         .filter_map(|l| Some((map.layer_geometry(&l)?, l)))
         .collect();
     drop(map);
+    let screen = output.name();
     let blurs = comp.blur.wants(glass.iter().map(|(_, l)| l));
     if blurs {
-        let size = output_size(comp);
+        let size = output_size(output);
         let ground = comp.ground();
-        comp.blur.backdrop(r, &below, size, scale.x, ground);
+        comp.blur
+            .backdrop(r, &screen, &below, size, scale.x, ground);
     }
     for (geo, layer) in &glass {
         let loc = geo.loc.to_physical_precise_round(scale);
@@ -133,9 +148,9 @@ pub fn elements(comp: &mut Comp, r: &mut GlesRenderer, with_cursor: bool) -> Vec
                 .map(Elem::from),
         );
         if blurs
-            && let Some(b) = comp
-                .blur
-                .element(r, layer, geo.to_physical_precise_round(scale))
+            && let Some(b) =
+                comp.blur
+                    .element(r, &screen, layer, geo.to_physical_precise_round(scale))
         {
             out.push(Elem::from(b));
         }
@@ -145,12 +160,12 @@ pub fn elements(comp: &mut Comp, r: &mut GlesRenderer, with_cursor: bool) -> Vec
 }
 
 fn layer_elements(
-    comp: &Comp,
+    output: &Output,
     r: &mut GlesRenderer,
     layers: &[Layer],
     scale: Scale<f64>,
 ) -> Vec<Elem> {
-    let map = layer_map_for_output(&comp.output);
+    let map = layer_map_for_output(output);
     let mut out = Vec::new();
     for &layer in layers {
         for l in map.layers_on(layer).rev() {
@@ -195,13 +210,14 @@ pub fn read_back(
         .map_err(|e| format!("{e:?}"))
 }
 
-/// Save the frame for every screenshot asked for since the last one.
-pub fn shots(comp: &mut Comp, r: &mut GlesRenderer, elements: &[Elem]) {
-    if comp.shots.is_empty() {
+/// Save the frame for every screenshot asked for since the last one:
+/// what the focused screen shows, once `output` (the one just drawn) is it.
+pub fn shots(comp: &mut Comp, r: &mut GlesRenderer, output: &Output, elements: &[Elem]) {
+    if comp.shots.is_empty() || comp.focused_output().as_ref() != Some(output) {
         return;
     }
-    let size = output_size(comp);
-    let pixels = read_back(r, elements, size, scale(comp).x, comp.ground());
+    let size = output_size(output);
+    let pixels = read_back(r, elements, size, scale(output).x, comp.ground());
     for path in std::mem::take(&mut comp.shots) {
         let saved = pixels
             .as_ref()

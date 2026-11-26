@@ -65,19 +65,30 @@ impl Compositor {
     /// workspace), or as the focused screen does.
     pub fn desk(&self, screen: Option<&str>) -> Desk {
         match self {
-            Compositor::Nordlys(p) => nordlys_desk(p).unwrap_or_else(demo_desk),
+            Compositor::Nordlys(p) => nordlys_desk(p, screen).unwrap_or_else(demo_desk),
             Compositor::Hyprland(p) => hypr_desk(p, screen).unwrap_or_default(),
             Compositor::Demo => demo_desk(),
         }
     }
 
-    /// The screens' names, e.g. ["DP-1", "eDP-1"]. Hyprland only.
+    /// The screens' names, e.g. ["DP-1", "eDP-1"]. None in the demo, or
+    /// from a nordlys-comp too old to list them.
     pub fn screens(&self) -> Option<Vec<String>> {
-        let Compositor::Hyprland(p) = self else {
-            return None;
-        };
-        let monitors: Value = serde_json::from_str(&hypr_request(p, "j/monitors")?).ok()?;
-        Some(screen_names(&monitors))
+        match self {
+            Compositor::Hyprland(p) => {
+                let monitors: Value = serde_json::from_str(&hypr_request(p, "j/monitors")?).ok()?;
+                Some(screen_names(&monitors))
+            }
+            Compositor::Nordlys(p) => {
+                let names: Vec<String> = nordlys_state(p)?
+                    .screens
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+                (!names.is_empty()).then_some(names)
+            }
+            Compositor::Demo => None,
+        }
     }
 
     pub fn switch_to(&self, ws: &Workspace) {
@@ -117,7 +128,8 @@ impl Compositor {
         match self {
             Compositor::Nordlys(p) => nordlys_state(p)
                 .map(|s| {
-                    s.shelf
+                    on_screen(s, screen)
+                        .shelf
                         .into_iter()
                         .map(|id| ShelfWindow {
                             app: pretty_app(&id),
@@ -386,8 +398,33 @@ fn demo_desk() -> Desk {
     }
 }
 
-fn nordlys_desk(sock: &Path) -> Option<Desk> {
-    Some(desk_from_stage(nordlys_state(sock)?))
+fn nordlys_desk(sock: &Path, screen: Option<&str>) -> Option<Desk> {
+    Some(desk_from_stage(on_screen(nordlys_state(sock)?, screen)))
+}
+
+/// The state as `screen` sees it: its workspace taken as the active one,
+/// and its own stage and shelf. Unchanged for no screen, or one the
+/// compositor doesn't list.
+fn on_screen(mut state: nordlys_ipc::StageState, screen: Option<&str>) -> nordlys_ipc::StageState {
+    let Some(s) = screen.and_then(|name| state.screens.iter().find(|s| s.name == name)) else {
+        return state;
+    };
+    state.workspace = s.workspace;
+    state.main = s.main.clone();
+    state.side = s.side.clone();
+    state.shelf = s.shelf.clone();
+    // An empty workspace on screen isn't listed with the busy ones.
+    if !state.workspaces.iter().any(|w| w.n == s.workspace) {
+        let at = state.workspaces.partition_point(|w| w.n < s.workspace);
+        state.workspaces.insert(
+            at,
+            nordlys_ipc::WorkspaceState {
+                n: s.workspace,
+                windows: 0,
+            },
+        );
+    }
+    state
 }
 
 fn desk_from_stage(state: nordlys_ipc::StageState) -> Desk {
@@ -587,10 +624,51 @@ mod tests {
                 WorkspaceState { n: 1, windows: 3 },
                 WorkspaceState { n: 2, windows: 2 },
             ],
+            screens: vec![],
         });
         assert_eq!(d.workspaces.len(), 2);
         assert!(d.workspaces[1].active && !d.workspaces[0].active);
         assert_eq!(d.stage.as_deref(), Some("Helix + Foot"));
+    }
+
+    #[test]
+    fn each_nordlys_screen_sees_its_own_workspace() {
+        use nordlys_ipc::{ScreenState, StageState, WorkspaceState};
+        let state = StageState {
+            main: Some("helix".into()),
+            side: None,
+            shelf: vec!["foot".into()],
+            workspace: 1,
+            workspaces: vec![WorkspaceState { n: 1, windows: 2 }],
+            screens: vec![
+                ScreenState {
+                    name: "eDP-1".into(),
+                    workspace: 1,
+                    focused: true,
+                    main: Some("helix".into()),
+                    side: None,
+                    shelf: vec!["foot".into()],
+                },
+                ScreenState {
+                    name: "DP-1".into(),
+                    workspace: 2,
+                    focused: false,
+                    main: None,
+                    side: None,
+                    shelf: vec![],
+                },
+            ],
+        };
+        let d = desk_from_stage(on_screen(state.clone(), Some("DP-1")));
+        assert_eq!(
+            d.workspaces.iter().map(|w| w.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(d.workspaces[1].active && !d.workspaces[0].active);
+        assert_eq!(d.stage, None);
+        assert!(on_screen(state.clone(), Some("DP-1")).shelf.is_empty());
+        assert_eq!(on_screen(state.clone(), None), state);
+        assert_eq!(on_screen(state.clone(), Some("HDMI-A-9")), state);
     }
 
     #[test]

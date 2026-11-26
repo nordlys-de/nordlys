@@ -110,7 +110,7 @@ fn main() -> ExitCode {
         let name = piece.unwrap_or("bar");
         match screens::supervise(&sources::Compositor::detect(), name) {
             Ok(()) => return ExitCode::SUCCESS,
-            Err(e) if e == "only on Hyprland" => {}
+            Err(e) if e == screens::NO_SCREENS => {}
             Err(e) => eprintln!("nordlys-shell {name}: {e}; running on the active screen only"),
         }
     }
