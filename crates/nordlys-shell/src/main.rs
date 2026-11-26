@@ -7,6 +7,9 @@
 //!   nordlys-shell shelf|ambient [--window] [--output NAME]
 //!   nordlys-shell notify [--window]
 //!   nordlys-shell lock [--window | --check]
+//!   nordlys-shell osd volume|brightness up|down|show
+//!   nordlys-shell tray
+//!   nordlys-shell welcome [--first-run] [--window]
 //!
 //! On Wayland each piece is a layer-shell surface, so it runs on Hyprland
 //! today and on nordlys-comp later. Elsewhere, or with `--window`, it opens
@@ -17,16 +20,22 @@ mod apps;
 mod bar;
 mod calendar;
 mod closer;
+mod dbus;
+mod events;
 mod files;
 mod icons;
 mod launcher;
 mod lock;
 mod notify;
+mod osd;
+mod screens;
 mod search;
 mod shelf;
 mod sources;
 mod system;
+mod tray;
 mod ui;
+mod welcome;
 
 use ambient::Ambient;
 use bar::{BAR_GAP, BAR_HEIGHT, Bar};
@@ -42,8 +51,14 @@ usage: nordlys-shell [bar] [--window] [--output NAME]
        nordlys-shell launcher [--window] [--query TEXT]
        nordlys-shell shelf|ambient [--window] [--output NAME]
        nordlys-shell notify [--window]
-       nordlys-shell close-button
-       nordlys-shell lock [--window | --check]";
+       nordlys-shell close-button [--output NAME]
+       nordlys-shell lock [--window | --check]
+       nordlys-shell osd volume|brightness up|down|show · osd volume|mic mute
+       nordlys-shell tray                 (print the tray's icons and menus)
+       nordlys-shell welcome [--first-run] [--window]
+
+On Hyprland, bar, shelf, ambient and close-button without --output run
+one copy per screen, following screens as they come and go.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -85,6 +100,20 @@ fn main() -> ExitCode {
         eprintln!("nordlys-shell: not on Wayland, opening a preview window");
     }
 
+    // One per screen: this process only watches the screens.
+    let per_screen = matches!(
+        piece,
+        None | Some("bar" | "shelf" | "ambient" | "close-button")
+    );
+    if per_screen && !window && output.is_none() {
+        let name = piece.unwrap_or("bar");
+        match screens::supervise(&sources::Compositor::detect(), name) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(e) if e == "only on Hyprland" => {}
+            Err(e) => eprintln!("nordlys-shell {name}: {e}; running on the active screen only"),
+        }
+    }
+
     let result = match (piece, window) {
         (None | Some("bar"), false) => bar_layer(config, output),
         (None | Some("bar"), true) => bar_window(config),
@@ -94,10 +123,18 @@ fn main() -> ExitCode {
         (Some("shelf"), true) => shelf_window(config),
         (Some("ambient"), false) => ambient_layer(config, output),
         (Some("ambient"), true) => ambient_window(config),
-        (Some("close-button"), false) => close_button_layer(),
+        (Some("close-button"), false) => close_button_layer(output),
         (Some("close-button"), true) => Err("the close button needs Hyprland".into()),
         (Some("notify"), false) => notify_layer(config),
         (Some("notify"), true) => notify_window(config),
+        (Some("osd"), _) => osd_show(config, &args, window),
+        (Some("tray"), _) => tray::print(),
+        // Only once, at the first login.
+        (Some("welcome"), _) if args.iter().any(|a| a == "--first-run") && welcome::seen() => {
+            Ok(())
+        }
+        (Some("welcome"), false) => welcome_layer(config),
+        (Some("welcome"), true) => welcome_window(config),
         (Some("lock"), _) if args.iter().any(|a| a == "--check") => lock_check(),
         (Some("lock"), false) => lock_session(config),
         (Some("lock"), true) => lock_window(config),
@@ -120,8 +157,9 @@ fn bar_layer(config: Config, output: Option<String>) -> Result<(), String> {
     use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 
     let height = bar::SURFACE;
+    let screen = output.clone();
     iced_layershell::application(
-        move || Bar::new(&config, false),
+        move || Bar::new(&config, false, screen.clone()),
         || "nordlys-bar".to_owned(),
         Bar::update,
         Bar::view,
@@ -150,16 +188,71 @@ fn bar_layer(config: Config, output: Option<String>) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn close_button_layer() -> Result<(), String> {
+/// Change a level, then show it: in the pill that's already up, else in
+/// a new one (or, without Wayland, on stdout).
+fn osd_show(config: Config, args: &[String], window: bool) -> Result<(), String> {
     use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
     use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
+
+    let rest: Vec<String> = args
+        .iter()
+        .skip_while(|a| *a != "osd")
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
+    let (kind, change) = osd::parse(&rest)?;
+    let level = osd::apply(kind, change).ok_or("couldn't read the level back")?;
+    if window {
+        println!(
+            "{kind:?} {}%{}",
+            level.percent,
+            if level.muted { " (muted)" } else { "" }
+        );
+        return Ok(());
+    }
+    if osd::tell_running(level) {
+        return Ok(());
+    }
+    osd::claim()?;
+    iced_layershell::application(
+        move || osd::Osd::new(&config, level),
+        || "nordlys-osd".to_owned(),
+        osd::Osd::update,
+        osd::Osd::view,
+    )
+    .style(osd::Osd::style)
+    .subscription(osd::Osd::subscription)
+    .settings(Settings {
+        default_font: bar::INTER,
+        fonts: vec![icons::FONT_BYTES.into()],
+        layer_settings: LayerShellSettings {
+            anchor: Anchor::Bottom,
+            layer: Layer::Overlay,
+            size: Some((osd::WIDTH, osd::HEIGHT)),
+            margin: (0, 0, osd::LIFT, 0),
+            exclusive_zone: -1,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            start_mode: StartMode::Active,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .run()
+    .map_err(|e| e.to_string())
+}
+
+fn close_button_layer(output: Option<String>) -> Result<(), String> {
+    use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
+    use iced_layershell::settings::{LayerShellSettings, Settings};
 
     let compositor = sources::Compositor::detect();
     if !matches!(compositor, sources::Compositor::Hyprland(_)) {
         return Err("the close button needs Hyprland".into());
     }
+    let screen = output.clone();
     iced_layershell::application(
-        move || closer::Closer::new(compositor.clone()),
+        move || closer::Closer::new(compositor.clone(), screen.clone()),
         || "nordlys-close".to_owned(),
         closer::Closer::update,
         closer::Closer::view,
@@ -177,7 +270,7 @@ fn close_button_layer() -> Result<(), String> {
             size: Some((1, 1)),
             exclusive_zone: -1,
             keyboard_interactivity: KeyboardInteractivity::None,
-            start_mode: StartMode::Active,
+            start_mode: screen_mode(output.clone()),
             ..Default::default()
         },
         ..Default::default()
@@ -186,17 +279,28 @@ fn close_button_layer() -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+fn screen_mode(output: Option<String>) -> iced_layershell::settings::StartMode {
+    use iced_layershell::settings::StartMode;
+    output
+        .map(StartMode::TargetScreen)
+        .unwrap_or(StartMode::Active)
+}
+
 fn bar_window(config: Config) -> Result<(), String> {
-    iced::application(move || Bar::new(&config, true), Bar::update, Bar::view)
-        .title("Nordlys bar · preview")
-        .style(Bar::style)
-        .subscription(Bar::subscription)
-        .default_font(bar::INTER)
-        .font(icons::FONT_BYTES)
-        .window_size((1440.0, 140.0))
-        .resizable(false)
-        .run()
-        .map_err(|e| e.to_string())
+    iced::application(
+        move || Bar::new(&config, true, None),
+        Bar::update,
+        Bar::view,
+    )
+    .title("Nordlys bar · preview")
+    .style(Bar::style)
+    .subscription(Bar::subscription)
+    .default_font(bar::INTER)
+    .font(icons::FONT_BYTES)
+    .window_size((1440.0, 140.0))
+    .resizable(false)
+    .run()
+    .map_err(|e| e.to_string())
 }
 
 fn launcher_layer(config: Config, query: String) -> Result<(), String> {
@@ -227,6 +331,52 @@ fn launcher_layer(config: Config, query: String) -> Result<(), String> {
         },
         ..Default::default()
     })
+    .run()
+    .map_err(|e| e.to_string())
+}
+
+fn welcome_layer(config: Config) -> Result<(), String> {
+    use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
+    use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
+
+    iced_layershell::application(
+        move || welcome::Welcome::new(&config, false),
+        || "nordlys-welcome".to_owned(),
+        welcome::Welcome::update,
+        welcome::Welcome::view,
+    )
+    .style(welcome::Welcome::style)
+    .subscription(welcome::Welcome::subscription)
+    .settings(Settings {
+        default_font: bar::INTER,
+        fonts: vec![icons::FONT_BYTES.into()],
+        layer_settings: LayerShellSettings {
+            anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+            layer: Layer::Overlay,
+            size: Some((0, 0)),
+            exclusive_zone: -1,
+            keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            start_mode: StartMode::Active,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .run()
+    .map_err(|e| e.to_string())
+}
+
+fn welcome_window(config: Config) -> Result<(), String> {
+    iced::application(
+        move || welcome::Welcome::new(&config, true),
+        welcome::Welcome::update,
+        welcome::Welcome::view,
+    )
+    .title("Welcome to Nordlys · preview")
+    .style(welcome::Welcome::style)
+    .subscription(welcome::Welcome::subscription)
+    .default_font(bar::INTER)
+    .font(icons::FONT_BYTES)
+    .window_size((1000.0, 760.0))
     .run()
     .map_err(|e| e.to_string())
 }
@@ -277,8 +427,9 @@ fn rail_settings(
 
 fn shelf_layer(config: Config, output: Option<String>) -> Result<(), String> {
     use iced_layershell::reexport::Anchor;
+    let screen = output.clone();
     iced_layershell::application(
-        move || Shelf::new(&config, false),
+        move || Shelf::new(&config, false, screen.clone()),
         || "nordlys-shelf".to_owned(),
         Shelf::update,
         Shelf::view,
@@ -292,7 +443,7 @@ fn shelf_layer(config: Config, output: Option<String>) -> Result<(), String> {
 
 fn shelf_window(config: Config) -> Result<(), String> {
     iced::application(
-        move || Shelf::new(&config, true),
+        move || Shelf::new(&config, true, None),
         Shelf::update,
         Shelf::view,
     )

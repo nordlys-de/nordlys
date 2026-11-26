@@ -16,14 +16,18 @@ depends=(
     hyprland hypridle swaybg
     xdg-desktop-portal-hyprland xdg-desktop-portal-gtk hyprpolkitagent
     pam libxkbcommon wayland
+    libinput seatd mesa libdrm systemd-libs
     inter-font ttf-jetbrains-mono
     wireplumber
 )
 optdepends=(
     'playerctl: now-playing controls'
-    'networkmanager: Wi-Fi toggle'
-    'bluez-utils: Bluetooth toggle'
-    'brightnessctl: brightness keys and idle dimming'
+    'networkmanager: Wi-Fi toggle and the Network page in Settings'
+    'bluez-utils: Bluetooth toggle and the Bluetooth page in Settings'
+    'brightnessctl: brightness keys, idle dimming and the brightness slider'
+    'power-profiles-daemon: power modes in Settings'
+    'hyprsunset: night light in Settings'
+    'zenity: picking a wallpaper file in Settings'
     'grim: Super+Shift+S screenshots'
     'slurp: Super+Shift+S screenshots'
     'wl-clipboard: Super+Shift+S screenshots'
@@ -45,6 +49,14 @@ optdepends=(
     'btop: the system monitor (Ctrl+Shift+Esc)'
     'pavucontrol: per-app volume'
     'file-roller: archives'
+    'gnome-keyring: saved passwords for browsers, VS Code and git (the Secret Service)'
+    'libsecret: git credential helper and apps that store passwords'
+    'seahorse: see and manage saved passwords'
+    'wf-recorder: screen recording (Super+R)'
+    'gpu-screen-recorder: screen recording, when wf-recorder is missing'
+    'cliphist: clipboard history (Super+V)'
+    'sddm: the Nordlys login screen'
+    'xwayland-satellite: X11 apps on the nordlys-comp session'
 )
 makedepends=(cargo git)
 provides=(nordlys)
@@ -71,13 +83,13 @@ build() {
     cd nordlys
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
-    cargo build --frozen --release -p nordlys-shell -p nordlysctl -p nordlys-theme
+    cargo build --frozen --release -p nordlys-comp -p nordlys-shell -p nordlysctl -p nordlys-theme -p nordlys-settings
 }
 
 check() {
     cd nordlys
     export RUSTUP_TOOLCHAIN=stable
-    cargo test --frozen --release -p nordlys-shell -p nordlysctl -p nordlys-theme -p nordlys-config -p nordlys-stage
+    cargo test --frozen --release -p nordlys-comp -p nordlys-shell -p nordlysctl -p nordlys-theme -p nordlys-settings -p nordlys-config -p nordlys-stage
 }
 
 package() {

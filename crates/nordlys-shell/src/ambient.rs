@@ -4,7 +4,7 @@
 
 use crate::bar::{INTER, INTER_SEMIBOLD, color};
 use crate::icons::{self, icon};
-use crate::system::{self, Notices, NowPlaying, Volume};
+use crate::system::{self, Notices, NowPlaying, Snapshot, Volume};
 use crate::ui::{self, Rail};
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{Space, button, column, container, mouse_area, row, slider, stack, text};
@@ -30,12 +30,18 @@ pub struct Ambient {
     dragging: Option<f32>,
     open: bool,
     preview: bool,
+    reads: system::Reads,
 }
 
 #[to_layer_message]
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    Read(Option<Snapshot>),
+    /// A control finished; read the new state.
+    Done,
+    /// nordlys.toml was saved.
+    Config(Config),
     Toggle,
     PlayPause,
     Next,
@@ -50,7 +56,7 @@ pub enum Message {
 }
 
 impl Ambient {
-    pub fn new(config: &Config, preview: bool, open: bool) -> Self {
+    pub fn new(config: &Config, preview: bool, open: bool) -> (Self, Task<Message>) {
         let mut me = Self {
             palette: config.palette(),
             playing: None,
@@ -62,23 +68,43 @@ impl Ambient {
             dragging: None,
             open,
             preview,
+            reads: system::Reads::default(),
         };
-        me.refresh();
-        me
+        let first = me.refresh();
+        (me, first)
     }
 
-    /// The rail only needs media and notices; the rest is read while the panel is open.
-    fn refresh(&mut self) {
-        self.playing = system::now_playing();
-        self.notices = system::notices();
-        if self.open {
-            if let Some(newest) = self.notices.as_ref().and_then(|n| n.recent.first()) {
-                self.seen = self.seen.max(newest.id);
-            }
-            self.volume = system::volume();
-            self.wifi = system::wifi();
-            self.bluetooth = system::bluetooth();
+    /// Read the tools in the background. The rail only needs media and
+    /// notices; the quick settings are read while the panel is open.
+    fn refresh(&mut self) -> Task<Message> {
+        if !self.reads.start() {
+            return Task::none();
         }
+        let controls = self.open;
+        Task::perform(
+            system::background(move || Snapshot::read(controls)),
+            Message::Read,
+        )
+    }
+
+    fn apply(&mut self, snap: Snapshot) {
+        self.playing = snap.playing;
+        self.notices = snap.notices;
+        if self.open
+            && let Some(newest) = self.notices.as_ref().and_then(|n| n.recent.first())
+        {
+            self.seen = self.seen.max(newest.id);
+        }
+        if let Some(c) = snap.controls {
+            self.volume = c.volume;
+            self.wifi = c.wifi;
+            self.bluetooth = c.bluetooth;
+        }
+    }
+
+    /// Run a control in the background, then read the result.
+    fn act(&mut self, work: impl FnOnce() + Send + 'static) -> Task<Message> {
+        Task::perform(system::background(work), |_| Message::Done)
     }
 
     fn resize(&self) -> Task<Message> {
@@ -95,65 +121,90 @@ impl Ambient {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => self.refresh(),
+            Message::Tick | Message::Done => self.refresh(),
+            Message::Config(c) => {
+                self.palette = c.palette();
+                Task::none()
+            }
+            Message::Read(snap) => {
+                let again = self.reads.done();
+                if let Some(snap) = snap {
+                    self.apply(snap);
+                }
+                if again {
+                    return self.refresh();
+                }
+                Task::none()
+            }
             Message::Toggle => {
                 self.open = !self.open;
-                self.refresh();
-                return self.resize();
+                // Opening wants the quick settings now, not after a read
+                // that started while the panel was shut.
+                if self.open {
+                    self.reads.invalidate();
+                }
+                Task::batch([self.refresh(), self.resize()])
             }
             Message::PlayPause => {
-                system::play_pause();
-                self.refresh();
-            }
-            Message::Next => {
-                system::next_track();
-                self.refresh();
-            }
-            Message::Volume(v) => self.dragging = Some(v),
-            Message::VolumeDone => {
-                if let Some(v) = self.dragging.take() {
-                    system::set_volume(v);
+                if let Some(p) = &mut self.playing {
+                    p.playing = !p.playing;
                 }
-                self.refresh();
+                self.act(system::play_pause)
             }
+            Message::Next => self.act(system::next_track),
+            Message::Volume(v) => {
+                self.dragging = Some(v);
+                Task::none()
+            }
+            Message::VolumeDone => match self.dragging.take() {
+                Some(v) => {
+                    if let Some(vol) = &mut self.volume {
+                        vol.level = v;
+                    }
+                    self.act(move || system::set_volume(v))
+                }
+                None => Task::none(),
+            },
             Message::Mute => {
-                system::toggle_mute();
-                self.refresh();
-            }
-            Message::Wifi => {
-                if let Some(on) = self.wifi {
-                    system::set_wifi(!on);
+                if let Some(vol) = &mut self.volume {
+                    vol.muted = !vol.muted;
                 }
-                self.refresh();
+                self.act(system::toggle_mute)
             }
-            Message::Bluetooth => {
-                if let Some(on) = self.bluetooth {
-                    system::set_bluetooth(!on);
+            Message::Wifi => match self.wifi {
+                Some(on) => {
+                    self.wifi = Some(!on);
+                    self.act(move || system::set_wifi(!on))
                 }
-                self.refresh();
-            }
-            Message::Dnd => {
-                if let Some(n) = &self.notices {
-                    system::set_dnd(!n.dnd);
+                None => Task::none(),
+            },
+            Message::Bluetooth => match self.bluetooth {
+                Some(on) => {
+                    self.bluetooth = Some(!on);
+                    self.act(move || system::set_bluetooth(!on))
                 }
-                self.refresh();
-            }
-            Message::ShowLast => {
-                system::pop_notification();
-                self.refresh();
-            }
-            Message::Clear => {
-                system::clear_notifications();
-                self.refresh();
-            }
-            _ => {}
+                None => Task::none(),
+            },
+            Message::Dnd => match &mut self.notices {
+                Some(n) => {
+                    n.dnd = !n.dnd;
+                    let on = n.dnd;
+                    self.act(move || system::set_dnd(on))
+                }
+                None => Task::none(),
+            },
+            Message::ShowLast => self.act(system::pop_notification),
+            Message::Clear => self.act(system::clear_notifications),
+            _ => Task::none(),
         }
-        Task::none()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let every = if self.open { 1000 } else { 2500 };
-        iced::time::every(Duration::from_millis(every)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(every)).map(|_| Message::Tick),
+            crate::events::config_changes().map(Message::Config),
+        ])
     }
 
     pub fn view(&self) -> Element<'_, Message> {

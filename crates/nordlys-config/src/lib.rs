@@ -180,6 +180,19 @@ impl Config {
 }
 
 /// `$XDG_CONFIG_HOME/nordlys`, else `~/.config/nordlys`.
+impl Group {
+    /// `dir` with a leading `~` swapped for the home folder.
+    pub fn dir_path(&self) -> Option<PathBuf> {
+        let dir = self.dir.as_deref()?;
+        let home = || std::env::var_os("HOME").map(PathBuf::from);
+        Some(match dir.strip_prefix('~') {
+            Some("") => home()?,
+            Some(rest) if rest.starts_with('/') => home()?.join(&rest[1..]),
+            _ => PathBuf::from(dir),
+        })
+    }
+}
+
 pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -249,5 +262,22 @@ mod tests {
     fn accent_override_applies() {
         let c = Config::from_toml("[theme]\naccent = \"#F4B183\"").unwrap();
         assert_eq!(c.palette().accent.hex(), "#F4B183");
+    }
+
+    #[test]
+    fn group_dir_expands_home() {
+        let g = |dir: &str| Group {
+            name: "x".into(),
+            key: None,
+            apps: vec![],
+            open_in: OpenIn::Current,
+            dir: Some(dir.into()),
+            reuse_running: true,
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(g("~/code").dir_path(), Some(home.join("code")));
+        assert_eq!(g("~").dir_path(), Some(home));
+        assert_eq!(g("/srv").dir_path(), Some(PathBuf::from("/srv")));
+        assert_eq!(g("~bob/x").dir_path(), Some(PathBuf::from("~bob/x")));
     }
 }

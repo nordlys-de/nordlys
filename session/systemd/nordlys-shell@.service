@@ -1,0 +1,14 @@
+# One piece of the shell: bar, shelf, ambient or close-button.
+[Unit]
+Description=Nordlys %i
+Documentation=https://github.com/nordlys-de/nordlys
+PartOf=nordlys-session.target
+After=graphical-session.target nordlys-notify.service
+# A piece that keeps crashing stops after five starts in half a minute.
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+ExecStart=@BINDIR@/nordlys-shell %i
+Restart=on-failure
+RestartSec=1

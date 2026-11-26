@@ -32,6 +32,9 @@ pub struct Launcher {
     selected: usize,
     ctrl: bool,
     status: Option<String>,
+    /// A command that asks before it runs (restart, shut down…), armed by
+    /// the first Enter; the second runs it.
+    armed: Option<String>,
     preview: bool,
 }
 
@@ -46,6 +49,7 @@ pub enum Message {
     Ctrl(bool),
     Prefix(&'static str),
     FilesIndexed(Vec<std::path::PathBuf>),
+    ClipsLoaded(Vec<(u64, String)>),
     Close,
 }
 
@@ -61,10 +65,15 @@ impl Launcher {
             selected: 0,
             ctrl: false,
             status: None,
+            armed: None,
             preview,
         };
         let index = Task::perform(async { crate::files::index_home() }, Message::FilesIndexed);
-        (me, Task::batch([operation::focus(QUERY), index]))
+        let clips = Task::perform(
+            async { crate::search::clip_history() },
+            Message::ClipsLoaded,
+        );
+        (me, Task::batch([operation::focus(QUERY), index, clips]))
     }
 
     fn refresh(&mut self) {
@@ -78,6 +87,7 @@ impl Launcher {
                 self.query = q;
                 self.selected = 0;
                 self.status = None;
+                self.armed = None;
                 self.refresh();
             }
             Message::Prefix(p) => {
@@ -93,6 +103,7 @@ impl Launcher {
             Message::Move(d) if !self.results.is_empty() => {
                 let n = self.results.len() as i32;
                 self.selected = (self.selected as i32 + d).rem_euclid(n) as usize;
+                self.disarm();
             }
             Message::Hover(i) => self.selected = i,
             Message::Ctrl(down) => self.ctrl = down,
@@ -105,16 +116,34 @@ impl Launcher {
                 self.catalog.set_files(files);
                 self.refresh();
             }
+            Message::ClipsLoaded(clips) => {
+                self.catalog.set_clips(clips);
+                self.refresh();
+            }
             Message::Close => return iced::exit(),
             _ => {}
         }
         Task::none()
     }
 
+    /// Moving off an armed command takes the question back.
+    fn disarm(&mut self) {
+        if self.armed.take().is_some() {
+            self.status = None;
+        }
+    }
+
     fn run(&mut self) -> Task<Message> {
         let Some(item) = self.results.get(self.selected).cloned() else {
             return Task::none();
         };
+        if let crate::search::Action::Confirm { verb, .. } = &item.action
+            && self.armed.as_deref() != Some(item.name.as_str())
+        {
+            self.armed = Some(item.name.clone());
+            self.status = Some(format!("Press Enter again to {verb}"));
+            return Task::none();
+        }
         match self.catalog.run(&item, self.ctrl) {
             Ok(()) => iced::exit(),
             Err(e) => {
@@ -134,20 +163,23 @@ impl Launcher {
         let (mode, _) = Mode::split(&self.query);
 
         // Search row
-        let input = text_input("Type to search · > commands · / files", &self.query)
-            .id(QUERY)
-            .on_input(Message::Query)
-            .size(19)
-            .font(INTER)
-            .padding([10, 0])
-            .style(move |_, _| text_input::Style {
-                background: Background::Color(Color::TRANSPARENT),
-                border: Border::default(),
-                icon: g.muted,
-                placeholder: g.placeholder,
-                value: g.text,
-                selection: g.accent_soft,
-            });
+        let input = text_input(
+            "Type to search · > commands · / files · # clipboard",
+            &self.query,
+        )
+        .id(QUERY)
+        .on_input(Message::Query)
+        .size(19)
+        .font(INTER)
+        .padding([10, 0])
+        .style(move |_, _| text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: g.muted,
+            placeholder: g.placeholder,
+            value: g.text,
+            selection: g.accent_soft,
+        });
         let search = row![icon(icons::SEARCH, 20).color(g.muted), input, kbd("Esc", g)]
             .spacing(14)
             .align_y(Alignment::Center)
@@ -178,6 +210,7 @@ impl Launcher {
             chip("All", "", mode == Mode::All),
             chip("> Commands", "> ", mode == Mode::Commands),
             chip("/ Files", "/ ", mode == Mode::Files),
+            chip("# Clipboard", "# ", mode == Mode::Clipboard),
         ]
         .spacing(6)
         .padding([10, 20]);
@@ -203,6 +236,8 @@ impl Launcher {
         if self.results.is_empty() {
             let hint = if mode == Mode::Files && !self.catalog.files_ready() {
                 "Indexing your home folder…"
+            } else if mode == Mode::Clipboard {
+                "Nothing copied yet, or cliphist isn't running."
             } else {
                 "No matches. Start with > for commands or / for files."
             };
@@ -331,6 +366,7 @@ impl Launcher {
             Kind::App => ("Open", None),
             Kind::Command => ("Run", None),
             Kind::File => ("Open", Some(("Open folder", "Ctrl Enter"))),
+            Kind::Clip => ("Copy", None),
         };
         let mut actions = column![action_row(open, "Enter", true, g)].spacing(4);
         if let Some((label, key)) = extra {
@@ -343,6 +379,7 @@ impl Launcher {
             Kind::App => "Application",
             Kind::Command => "Nordlys command",
             Kind::File => "File",
+            Kind::Clip => "Copied earlier",
         };
         container(
             column![
@@ -464,7 +501,7 @@ fn tile(it: &Item, size: f32, g: Look) -> Element<'static, Message> {
             g.text,
         ),
         Kind::Command => (g.accent_soft, g.accent),
-        Kind::File => (g.chip, g.muted),
+        Kind::File | Kind::Clip => (g.chip, g.muted),
     };
     let face: Element<'static, Message> = match it.icon {
         Some(glyph) => icon(glyph, size * 0.46).color(fg).into(),

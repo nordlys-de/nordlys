@@ -1,0 +1,15 @@
+# Everything a Nordlys session runs. Hyprland starts it once the session's
+# environment is imported (see hyprland.lua); nordlys-session stops it when
+# Hyprland exits. Each piece restarts on its own if it crashes.
+[Unit]
+Description=Nordlys desktop session
+Documentation=https://github.com/nordlys-de/nordlys
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+Wants=nordlys-notify.service nordlys-wallpaper.service nordlys-idle.service
+Wants=nordlys-clipboard.service
+Wants=nordlys-shell@bar.service nordlys-shell@shelf.service
+Wants=nordlys-shell@ambient.service nordlys-shell@close-button.service
+# Apps that start when you log in (~/.config/autostart, set in Settings).
+Wants=xdg-desktop-autostart.target

@@ -1,5 +1,5 @@
-//! What the launcher can find (apps, Nordlys commands, files), how a query
-//! ranks them, and what happens on Enter.
+//! What the launcher can find (apps, Nordlys commands, files, clipboard
+//! history), how a query ranks them, and what happens on Enter.
 
 use crate::apps::{self, App};
 use crate::files;
@@ -17,6 +17,7 @@ pub enum Kind {
     App,
     Command,
     File,
+    Clip,
 }
 
 impl Kind {
@@ -25,6 +26,7 @@ impl Kind {
             Kind::App => "Apps",
             Kind::Command => "Commands",
             Kind::File => "Files",
+            Kind::Clip => "Clipboard",
         }
     }
 }
@@ -34,16 +36,20 @@ pub enum Mode {
     All,
     Commands,
     Files,
+    /// Only here: copied text never shows in an ordinary search.
+    Clipboard,
 }
 
 impl Mode {
-    /// `> two` searches commands, `/ toml` searches files.
+    /// `> two` searches commands, `/ toml` files, `# link` the clipboard.
     pub fn split(query: &str) -> (Mode, &str) {
         let q = query.trim_start();
         if let Some(rest) = q.strip_prefix('>') {
             (Mode::Commands, rest.trim())
         } else if let Some(rest) = q.strip_prefix('/') {
             (Mode::Files, rest.trim())
+        } else if let Some(rest) = q.strip_prefix('#') {
+            (Mode::Clipboard, rest.trim())
         } else {
             (Mode::All, q.trim())
         }
@@ -56,6 +62,12 @@ pub enum Action {
     Ipc(Request),
     Group(String),
     Shell(String),
+    /// A shell command that asks first: the launcher runs it on a second
+    /// Enter. `verb` finishes "Press Enter again to …".
+    Confirm {
+        cmd: String,
+        verb: &'static str,
+    },
     Open(PathBuf),
 }
 
@@ -77,6 +89,8 @@ impl Item {
     pub fn history_key(&self) -> String {
         match &self.action {
             Action::App(_) => format!("app:{}", self.name),
+            // Copied text stays out of the launch history.
+            _ if self.kind == Kind::Clip => String::new(),
             Action::Open(p) => format!("file:{}", p.display()),
             _ => format!("cmd:{}", self.name),
         }
@@ -87,6 +101,8 @@ pub struct Catalog {
     pub apps: Vec<App>,
     items: Vec<Item>,
     files: Vec<PathBuf>,
+    /// Clipboard history, newest first: cliphist's id and a preview.
+    clips: Vec<(u64, String)>,
     history: HashMap<String, u32>,
     config: Config,
 }
@@ -126,6 +142,7 @@ impl Catalog {
             apps,
             items,
             files: vec![],
+            clips: vec![],
             history,
             config,
         }
@@ -139,14 +156,21 @@ impl Catalog {
         !self.files.is_empty()
     }
 
+    pub fn set_clips(&mut self, clips: Vec<(u64, String)>) {
+        self.clips = clips;
+    }
+
     /// Ranked results, grouped Apps → Commands → Files.
     pub fn search(&self, query: &str) -> Vec<Item> {
         let (mode, q) = Mode::split(query);
         let q = q.to_lowercase();
+        if mode == Mode::Clipboard {
+            return self.best_clips(&q, 10);
+        }
         let (apps, cmds, file_cap) = match mode {
             Mode::All => (4, 3, if q.chars().count() >= 2 { 3 } else { 0 }),
             Mode::Commands => (0, 9, 0),
-            Mode::Files => (0, 0, 9),
+            Mode::Files | Mode::Clipboard => (0, 0, 9),
         };
         let mut out = self.best(Kind::App, &q, apps);
         out.extend(self.best(Kind::Command, &q, cmds));
@@ -215,19 +239,67 @@ impl Catalog {
             .collect()
     }
 
+    /// Newest first; a query filters them, best match first.
+    fn best_clips(&self, q: &str, cap: usize) -> Vec<Item> {
+        let mut scored: Vec<(i32, usize)> = self
+            .clips
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, text))| {
+                let lower = text.to_lowercase();
+                let s = if q.is_empty() {
+                    0
+                } else if lower.contains(q) {
+                    100
+                } else {
+                    score(q, &lower)?
+                };
+                // Recency breaks ties.
+                Some((s, i))
+            })
+            .collect();
+        scored.sort_by_key(|&(s, i)| (std::cmp::Reverse(s), i));
+        scored
+            .into_iter()
+            .take(cap)
+            .map(|(_, i)| {
+                let (id, text) = &self.clips[i];
+                let image = text.starts_with("[[ binary data");
+                Item {
+                    kind: Kind::Clip,
+                    name: one_line(text),
+                    desc: if image {
+                        "Image".into()
+                    } else {
+                        format!("{} characters", text.chars().count())
+                    },
+                    key: None,
+                    // The id is a number, so it's safe in a shell command.
+                    action: Action::Shell(format!(
+                        "printf '%s\\t\\n' {id} | cliphist decode | wl-copy"
+                    )),
+                    icon: Some(if image { icons::EYE } else { icons::FILE }),
+                    terms: vec![],
+                }
+            })
+            .collect()
+    }
+
     /// Carry out an item. `alt` is Ctrl+Enter: open a file's folder instead.
     pub fn run(&mut self, item: &Item, alt: bool) -> Result<(), String> {
         let result = match &item.action {
             Action::App(i) => self.apps[*i].launch().map_err(|e| e.to_string()),
             Action::Ipc(req) => stage_request(req.clone()),
             Action::Group(name) => self.launch_group(name),
-            Action::Shell(cmd) => apps::spawn_shell(cmd).map_err(|e| e.to_string()),
+            Action::Shell(cmd) | Action::Confirm { cmd, .. } => {
+                apps::spawn_shell(cmd).map_err(|e| e.to_string())
+            }
             Action::Open(p) => {
                 let target = if alt { p.parent().unwrap_or(p) } else { p };
                 apps::open_path(target).map_err(|e| e.to_string())
             }
         };
-        if result.is_ok() {
+        if result.is_ok() && item.kind != Kind::Clip {
             *self.history.entry(item.history_key()).or_default() += 1;
             save_history(&self.history);
         }
@@ -247,6 +319,12 @@ impl Catalog {
             .config
             .group(name)
             .ok_or(format!("no group {name:?}"))?;
+        // On Hyprland, a new workspace means its first empty one; the apps
+        // then map there. Elsewhere they open where you are.
+        if group.open_in == nordlys_config::OpenIn::NewWorkspace {
+            crate::sources::Compositor::detect().go_to_empty_workspace();
+        }
+        let dir = group.dir_path();
         for id in &group.apps {
             let wanted = id.to_lowercase();
             match self
@@ -254,8 +332,8 @@ impl Catalog {
                 .iter()
                 .find(|a| a.short_id() == wanted || a.name.to_lowercase() == wanted)
             {
-                Some(app) => app.launch().map_err(|e| e.to_string())?,
-                None => apps::spawn_shell(id).map_err(|e| e.to_string())?,
+                Some(app) => app.launch_in(dir.as_deref()).map_err(|e| e.to_string())?,
+                None => apps::spawn_shell_in(id, dir.as_deref()).map_err(|e| e.to_string())?,
             }
         }
         Ok(())
@@ -336,7 +414,7 @@ fn commands(config: &Config) -> Vec<Item> {
             icons::REFRESH,
             "Reload config",
             "~/.config/nordlys/nordlys.toml",
-            "Super Shift R",
+            "",
             Action::Ipc(Request::Reload),
             &["refresh", "settings"],
         ),
@@ -345,7 +423,7 @@ fn commands(config: &Config) -> Vec<Item> {
             "Edit Nordlys config",
             &files::pretty_dir(&config_path.join("x")),
             "",
-            Action::Open(config_path),
+            Action::Open(config_path.clone()),
             &["settings", "toml", "preferences"],
         ),
         cmd(
@@ -356,16 +434,164 @@ fn commands(config: &Config) -> Vec<Item> {
             Action::Shell(lock_command()),
             &["away", "screensaver"],
         ),
+        cmd(
+            icons::HISTORY,
+            "Clipboard history",
+            "Copy something you copied before",
+            "Super V",
+            Action::Shell(format!("{} --query '# '", launcher_command())),
+            &["paste", "copy", "clipboard"],
+        ),
+        cmd(
+            icons::MONITOR,
+            "Record a region",
+            "Pick part of the screen; the same key or the bar's dot stops it",
+            "Super R",
+            Action::Shell("nordlys-record region".into()),
+            &["screen recording", "video", "capture", "screencast"],
+        ),
+        cmd(
+            icons::MONITOR,
+            "Record the screen",
+            "Saved to ~/Videos/Recordings",
+            "Super Shift R",
+            Action::Shell("nordlys-record screen".into()),
+            &["screen recording", "video", "capture", "screencast"],
+        ),
+        cmd(
+            icons::WINDOW,
+            "Welcome and keys",
+            "The Stage, the shelf and the keys that move them",
+            "Super F1",
+            Action::Shell(format!("{} welcome", shell_exe())),
+            &["help", "tour", "shortcuts", "keyboard", "intro"],
+        ),
+        cmd(
+            icons::SETTINGS,
+            "Settings",
+            "Network, sound, display, appearance and more",
+            "Super ,",
+            Action::Shell(settings_command(&config_path)),
+            &["preferences", "control", "system"],
+        ),
+    ]);
+    let power = |icon, name: &str, desc: &str, cmd: &str, verb, terms: &[&str]| Item {
+        kind: Kind::Command,
+        icon: Some(icon),
+        name: name.into(),
+        desc: desc.into(),
+        key: None,
+        action: Action::Confirm {
+            cmd: cmd.into(),
+            verb,
+        },
+        terms: terms.iter().map(|t| t.to_string()).collect(),
+    };
+    out.extend([
+        power(
+            icons::CLOSE,
+            "Clear clipboard history",
+            "Forget everything copied so far",
+            "cliphist wipe",
+            "clear the clipboard history",
+            &["wipe", "forget", "paste", "clipboard"],
+        ),
+        power(
+            icons::ARROW_RIGHT,
+            "Log out",
+            "End the session; unsaved work is lost",
+            LOG_OUT,
+            "log out",
+            &["logout", "sign out", "exit", "session"],
+        ),
+        power(
+            icons::MOON,
+            "Suspend",
+            "Sleep now; the lock screen greets you",
+            "systemctl suspend",
+            "suspend",
+            &["sleep", "power"],
+        ),
+        power(
+            icons::RESTART,
+            "Restart",
+            "Reboot the computer",
+            "systemctl reboot",
+            "restart",
+            &["reboot", "power"],
+        ),
+        power(
+            icons::POWER,
+            "Shut down",
+            "Power off the computer",
+            "systemctl poweroff",
+            "shut down",
+            &["power off", "poweroff", "halt", "turn off"],
+        ),
     ]);
     out
 }
 
-/// This same binary's lock screen, so it works without anything on PATH.
-fn lock_command() -> String {
+/// Hyprland's own exit when it's there, else ask logind to end the session.
+const LOG_OUT: &str = "if [ -n \"$HYPRLAND_INSTANCE_SIGNATURE\" ]; \
+     then hyprctl eval 'hl.dispatch(hl.dsp.exit())'; \
+     else loginctl terminate-session \"$XDG_SESSION_ID\"; fi";
+
+/// The Settings app when it's installed, else the config file.
+fn settings_command(config: &std::path::Path) -> String {
+    format!(
+        "command -v nordlys-settings >/dev/null && exec nordlys-settings || exec xdg-open {}",
+        apps::shell_quote(&config.to_string_lossy())
+    )
+}
+
+/// This same binary, quoted, so it works without anything on PATH.
+fn shell_exe() -> String {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "nordlys-shell".into());
-    format!("{} lock", apps::shell_quote(&exe))
+    apps::shell_quote(&exe)
+}
+
+fn lock_command() -> String {
+    format!("{} lock", shell_exe())
+}
+
+fn launcher_command() -> String {
+    format!("{} launcher", shell_exe())
+}
+
+/// Clipboard history from cliphist, newest first. Empty without it.
+pub fn clip_history() -> Vec<(u64, String)> {
+    let Ok(out) = std::process::Command::new("cliphist")
+        .arg("list")
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (id, text) = l.split_once('\t')?;
+            Some((id.trim().parse().ok()?, text.to_owned()))
+        })
+        .take(500)
+        .collect()
+}
+
+/// The first line, trimmed and cut short, for a row.
+fn one_line(s: &str) -> String {
+    let line = s.trim().lines().next().unwrap_or("").trim();
+    let mut out: String = line.chars().take(90).collect();
+    if out.chars().count() < line.chars().count() || s.trim().lines().count() > 1 {
+        out.push('…');
+    }
+    if out.is_empty() {
+        "(blank)".into()
+    } else {
+        out
+    }
 }
 
 fn item_score(q: &str, it: &Item) -> Option<i32> {
@@ -459,7 +685,7 @@ fn ipc(req: Request) -> Result<(), String> {
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
     match nordlys_ipc::from_line::<Response>(&line).map_err(|e| e.to_string())? {
-        Response::Ok { .. } => Ok(()),
+        Response::Ok { .. } | Response::Version { .. } => Ok(()),
         Response::Error { message } => Err(message),
     }
 }
@@ -511,6 +737,7 @@ mod tests {
             keywords: keywords.iter().map(|s| s.to_string()).collect(),
             exec: id.into(),
             terminal: false,
+            path: None,
         }
     }
 
@@ -554,6 +781,25 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_only_in_its_mode() {
+        let mut c = catalog();
+        c.set_clips(vec![
+            (3, "https://example.org".into()),
+            (2, "firefox config".into()),
+        ]);
+        assert!(c.search("firefox").iter().all(|i| i.kind != Kind::Clip));
+        let r = c.search("#");
+        assert_eq!(names(&r), vec!["https://example.org", "firefox config"]);
+        let r = c.search("# fire");
+        assert_eq!(r[0].name, "firefox config");
+        assert_eq!(
+            r[0].action,
+            Action::Shell("printf '%s\\t\\n' 2 | cliphist decode | wl-copy".into())
+        );
+        assert_eq!(r[0].history_key(), "");
+    }
+
+    #[test]
     fn groups_become_commands_with_their_keys() {
         let c = catalog();
         let g = c.search("> nordlys dev").into_iter().next().unwrap();
@@ -581,5 +827,20 @@ mod tests {
         let r = c.search("/ notes");
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].action, Action::Open(PathBuf::from("/home/u/notes.md")));
+    }
+
+    #[test]
+    fn power_commands_ask_before_they_run() {
+        let config = Config::from_toml(include_str!("../../../config/nordlys.toml")).unwrap();
+        let all = commands(&config);
+        for name in ["Log out", "Suspend", "Restart", "Shut down"] {
+            let it = all.iter().find(|i| i.name == name).expect(name);
+            assert!(
+                matches!(it.action, Action::Confirm { .. }),
+                "{name} runs without asking"
+            );
+        }
+        let settings = all.iter().find(|i| i.name == "Settings").unwrap();
+        assert!(matches!(&settings.action, Action::Shell(c) if c.contains("nordlys-settings")));
     }
 }

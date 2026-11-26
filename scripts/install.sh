@@ -8,8 +8,10 @@
 #   sudo scripts/install.sh --vm-guest      # also the test VM's guest agent
 #
 # Installs the binaries, the session (Hyprland config, idle config,
-# wallpaper, default apps, nordlys-session) and the PAM file, and registers "Nordlys"
-# with the display manager. ~/.config/hypr is never touched.
+# wallpaper, default apps, nordlys-session, nordlys-record), the PAM file
+# and the SDDM theme, and registers "Nordlys" with the display manager.
+# The SDDM theme is only installed, not switched on (scripts/setup.sh
+# does that when it sets SDDM up). ~/.config/hypr is never touched.
 set -eu
 
 prefix=/usr/local
@@ -22,7 +24,7 @@ while [ $# -gt 0 ]; do
         --destdir) destdir=$2; shift ;;
         --uninstall) uninstall=1 ;;
         --vm-guest) vm_guest=1 ;;
-        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "install.sh: unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -34,14 +36,19 @@ data="$destdir$prefix/share/nordlys"
 # Display managers only look in /usr/share/wayland-sessions.
 sessions="$destdir/usr/share/wayland-sessions"
 pam="$destdir/etc/pam.d"
-# nordlys-comp is headless only for now, so it stays out.
-bins="nordlys-shell nordlysctl nordlys-theme"
+units="$destdir$prefix/lib/systemd/user"
+bins="nordlys-comp nordlys-shell nordlysctl nordlys-theme nordlys-settings"
+apps="$destdir$prefix/share/applications"
+portals="$destdir$prefix/share/xdg-desktop-portal"
 
 if [ -n "$uninstall" ]; then
-    for b in $bins nordlys-session nordlys-vm-agent; do rm -fv "$bin/$b"; done
+    for b in $bins nordlys-session nordlys-record nordlys-vm-agent; do rm -fv "$bin/$b"; done
+    rm -rfv "$destdir/usr/share/sddm/themes/nordlys"
     rm -fv "$destdir/etc/udev/rules.d/70-nordlys-vm.rules"
     rm -rfv "$data"
-    rm -fv "$sessions/nordlys.desktop"
+    rm -fv "$sessions/nordlys.desktop" "$sessions/nordlys-comp.desktop" "$apps/nordlys-settings.desktop"
+    rm -fv "$portals/nordlys-portals.conf"
+    for u in "$root"/session/systemd/*; do rm -fv "$units/$(basename "$u")"; done
     # The PAM file only includes `login`; it's left in place on purpose
     # so a running lock screen can still check passwords.
     echo "Left $pam/nordlys in place; remove it by hand once nothing is locked."
@@ -58,19 +65,38 @@ done
 
 install -d "$bin" "$data" "$data/xdg" "$sessions" "$pam"
 for b in $bins; do install -m755 "$release/$b" "$bin/$b"; done
-install -m755 "$root/session/nordlys-session" "$bin/nordlys-session"
+install -m755 "$root/session/nordlys-session" "$root/session/nordlys-record" "$bin/"
 install -m644 "$root/session/hyprland.lua" "$root/session/hypridle.conf" \
     "$root/session/wallpaper.jpg" "$data/"
+install -m755 "$root/session/nordlys-autostart" "$data/"
 install -m644 "$root/config/nordlys.toml" "$data/nordlys.toml.example"
 # Default apps, behind the user's own (nordlys-session adds this to XDG_CONFIG_DIRS).
 install -m644 "$root/session/xdg/mimeapps.list" "$data/xdg/mimeapps.list"
 install -m644 "$root/session/nordlys.desktop" "$sessions/nordlys.desktop"
+install -m644 "$root/session/nordlys-comp.desktop" "$sessions/nordlys-comp.desktop"
+# Portals for the nordlys-comp session (XDG_CURRENT_DESKTOP=Nordlys).
+install -d "$portals"
+install -m644 "$root/session/xdg-desktop-portal/nordlys-portals.conf" "$portals/"
+# Settings in app launchers.
+install -d "$apps"
+install -m644 "$root/crates/nordlys-settings/nordlys-settings.desktop" "$apps/"
+# User services that keep the shell running (restarted if they crash).
+install -d "$units"
+for u in "$root"/session/systemd/*; do
+    sed -e "s#@BINDIR@#$prefix/bin#g" -e "s#@DATADIR@#$prefix/share/nordlys#g" "$u" \
+        >"$units/$(basename "$u")"
+    chmod 644 "$units/$(basename "$u")"
+done
 # A prefix other than /usr isn't on every display manager's PATH.
 if [ "$prefix" != /usr ]; then
-    sed -i "s#^Exec=nordlys-session#Exec=$prefix/bin/nordlys-session#; s#^TryExec=nordlys-session#TryExec=$prefix/bin/nordlys-session#" \
-        "$sessions/nordlys.desktop"
+    sed -i "s#^Exec=nordlys-session#Exec=$prefix/bin/nordlys-session#; s#^TryExec=nordlys-#TryExec=$prefix/bin/nordlys-#" \
+        "$sessions/nordlys.desktop" "$sessions/nordlys-comp.desktop"
 fi
 [ -e "$pam/nordlys" ] || install -m644 "$root/config/pam.d/nordlys" "$pam/nordlys"
+# The login screen theme for SDDM, with the wallpaper beside it.
+sddm_theme="$destdir/usr/share/sddm/themes/nordlys"
+install -d "$sddm_theme"
+install -m644 "$root"/session/sddm/nordlys/* "$root/session/wallpaper.jpg" "$sddm_theme/"
 
 if [ -n "$vm_guest" ]; then
     install -m755 "$root/vm/nordlys-vm-agent" "$bin/nordlys-vm-agent"

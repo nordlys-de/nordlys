@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: System libraries (PAM for the lock screen, xkbcommon and Wayland for iced)
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libxkbcommon-dev libwayland-dev
+      - name: System libraries (PAM for the lock screen, xkbcommon and Wayland for iced, DRM/GBM/libinput/libseat for the compositor)
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libxkbcommon-dev libwayland-dev libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libegl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -22,3 +22,28 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # The oldest Rust the workspace says it builds with (rust-version).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libxkbcommon-dev libwayland-dev libseat-dev libinput-dev libudev-dev libgbm-dev libdrm-dev libegl-dev
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  # The session and install scripts, the Hyprland config and the VM agent.
+  session:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck lua5.4
+      - name: shellcheck
+        run: shellcheck -S warning scripts/*.sh session/nordlys-session session/nordlys-autostart session/nordlys-record vm/nordlys-vm
+      - name: hyprland.lua parses
+        run: luac5.4 -p session/hyprland.lua
+      - name: VM agent compiles
+        run: python3 -m py_compile vm/nordlys-vm-agent vm/clipboard.py

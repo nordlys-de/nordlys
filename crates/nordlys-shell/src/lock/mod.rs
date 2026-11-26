@@ -93,7 +93,13 @@ pub struct Lock {
     confirm: Option<(Power, Instant)>,
     ticks: u32,
     preview: bool,
+    /// `reduce_motion`: a wrong password doesn't shake the card.
+    still: bool,
 }
+
+/// Room for any password without the String growing, since growing would
+/// leave copies of what was typed in freed memory.
+const ROOM: usize = 256;
 
 impl Lock {
     pub fn new(config: &Config, preview: bool) -> Self {
@@ -112,7 +118,7 @@ impl Lock {
             palette: config.palette(),
             login,
             name,
-            password: String::new(),
+            password: String::with_capacity(ROOM),
             show: false,
             status: Status::Idle,
             shake: None,
@@ -126,6 +132,7 @@ impl Lock {
             confirm: None,
             ticks: 0,
             preview,
+            still: config.theme.reduce_motion,
         };
         me.tick();
         me
@@ -156,7 +163,9 @@ impl Lock {
 
     fn fail(&mut self, status: Status) {
         self.status = status;
-        self.shake = Some(Instant::now());
+        if !self.still {
+            self.shake = Some(Instant::now());
+        }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -169,7 +178,9 @@ impl Lock {
             }
             Message::Type(Typed(t), caps) => {
                 if self.status != Status::Checking {
-                    self.password.push_str(&t);
+                    if self.password.len() + t.len() <= ROOM {
+                        self.password.push_str(&t);
+                    }
                     self.status = Status::Idle;
                 }
                 if let Some(c) = caps {
@@ -197,7 +208,10 @@ impl Lock {
                     return Task::none();
                 }
                 self.status = Status::Checking;
-                let secret = Secret::new(std::mem::take(&mut self.password));
+                let secret = Secret::new(std::mem::replace(
+                    &mut self.password,
+                    String::with_capacity(ROOM),
+                ));
                 return Task::perform(
                     check(self.login.clone(), secret, self.preview),
                     Message::Checked,

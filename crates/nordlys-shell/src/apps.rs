@@ -16,6 +16,8 @@ pub struct App {
     /// Exec line with field codes (%f, %U…) removed.
     pub exec: String,
     pub terminal: bool,
+    /// `Path=`: the folder the app wants to start in.
+    pub path: Option<PathBuf>,
 }
 
 impl App {
@@ -26,6 +28,14 @@ impl App {
     }
 
     pub fn launch(&self) -> std::io::Result<()> {
+        self.launch_in(None)
+    }
+
+    /// Launch with `dir` as the working folder (an app group's `dir`),
+    /// else the entry's own `Path=`.
+    pub fn launch_in(&self, dir: Option<&Path>) -> std::io::Result<()> {
+        let dir = dir.or(self.path.as_deref());
+        let id = self.id.strip_suffix(".desktop").unwrap_or(&self.id);
         if self.terminal {
             let term = terminal().ok_or_else(|| {
                 std::io::Error::new(
@@ -33,9 +43,13 @@ impl App {
                     "no terminal found; set $TERMINAL",
                 )
             })?;
-            spawn_shell(&format!("{term} -e sh -c {}", shell_quote(&self.exec)))
+            spawn(
+                &format!("{term} -e sh -c {}", shell_quote(&self.exec)),
+                dir,
+                Some(id),
+            )
         } else {
-            spawn_shell(&self.exec)
+            spawn(&self.exec, dir, Some(id))
         }
     }
 }
@@ -81,6 +95,7 @@ impl App {
             keywords: vec![],
             exec: String::new(),
             terminal: false,
+            path: None,
         }
     }
 }
@@ -131,7 +146,62 @@ fn desktop_id(root: &Path, path: &Path) -> Option<String> {
 }
 
 /// Parse the `[Desktop Entry]` group. None for anything that shouldn't be listed.
+/// Parse an entry for this desktop and language.
 pub fn parse(id: &str, text: &str) -> Option<App> {
+    parse_for(id, text, &locale_suffixes(), &current_desktops())
+}
+
+/// The `[xx]` suffixes to look for, best first, from LC_ALL, LC_MESSAGES
+/// or LANG: `de_AT.UTF-8@euro` gives de_AT@euro, de_AT, de@euro, de.
+pub fn locale_suffixes() -> Vec<String> {
+    let lang = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_default();
+    suffixes_of(&lang)
+}
+
+fn suffixes_of(lang: &str) -> Vec<String> {
+    let (rest, modifier) = match lang.split_once('@') {
+        Some((r, m)) => (r, Some(m)),
+        None => (lang, None),
+    };
+    let rest = rest.split('.').next().unwrap_or(rest);
+    if rest.is_empty() || rest == "C" || rest == "POSIX" {
+        return vec![];
+    }
+    let (language, country) = match rest.split_once('_') {
+        Some((l, c)) => (l, Some(c)),
+        None => (rest, None),
+    };
+    let mut out = vec![];
+    if let (Some(c), Some(m)) = (country, modifier) {
+        out.push(format!("{language}_{c}@{m}"));
+    }
+    if let Some(c) = country {
+        out.push(format!("{language}_{c}"));
+    }
+    if let Some(m) = modifier {
+        out.push(format!("{language}@{m}"));
+    }
+    out.push(language.to_owned());
+    out
+}
+
+/// This session's desktop names for OnlyShowIn/NotShowIn: whatever
+/// XDG_CURRENT_DESKTOP says (Hyprland in the Nordlys session), plus Nordlys.
+pub fn current_desktops() -> Vec<String> {
+    let mut d: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    d.push("Nordlys".into());
+    d
+}
+
+pub fn parse_for(id: &str, text: &str, locales: &[String], desktops: &[String]) -> Option<App> {
     let mut in_entry = false;
     let mut kv: HashMap<&str, &str> = HashMap::new();
     for line in text.lines() {
@@ -151,20 +221,38 @@ pub fn parse(id: &str, text: &str) -> Option<App> {
     if kv.get("Type").copied() != Some("Application") || yes("NoDisplay") || yes("Hidden") {
         return None;
     }
+    let list = |k: &str| -> Vec<&str> {
+        kv.get(k)
+            .map(|v| v.split(';').filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    let here = |names: &[&str]| names.iter().any(|n| desktops.iter().any(|d| d == n));
+    let only = list("OnlyShowIn");
+    if (!only.is_empty() && !here(&only)) || here(&list("NotShowIn")) {
+        return None;
+    }
     if let Some(try_exec) = kv.get("TryExec")
         && !on_path(try_exec)
     {
         return None;
     }
     let exec = strip_field_codes(kv.get("Exec")?);
-    let opt = |k: &str| kv.get(k).filter(|v| !v.is_empty()).map(|v| v.to_string());
+    // The best translation there is, else the plain key.
+    let local = |k: &str| {
+        locales
+            .iter()
+            .find_map(|l| kv.get(format!("{k}[{l}]").as_str()))
+            .or_else(|| kv.get(k))
+            .copied()
+    };
+    let opt = |k: &str| local(k).filter(|v| !v.is_empty()).map(str::to_owned);
     Some(App {
         id: id.to_owned(),
         name: opt("Name")?,
         generic: opt("GenericName"),
         comment: opt("Comment"),
-        keywords: kv
-            .get("Keywords")
+        path: kv.get("Path").filter(|p| !p.is_empty()).map(PathBuf::from),
+        keywords: local("Keywords")
             .map(|k| {
                 k.split(';')
                     .filter(|s| !s.is_empty())
@@ -224,11 +312,73 @@ fn terminal() -> Option<String> {
 
 /// Run a command line detached: own process group, no inherited stdio.
 pub fn spawn_shell(cmdline: &str) -> std::io::Result<()> {
+    spawn(cmdline, None, None)
+}
+
+/// [`spawn_shell`], in `dir` when it's given and exists.
+pub fn spawn_shell_in(cmdline: &str, dir: Option<&Path>) -> std::io::Result<()> {
+    spawn(cmdline, dir, None)
+}
+
+/// A systemd user manager is there to put apps in scopes of their own.
+fn user_manager() -> bool {
+    static THERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *THERE.get_or_init(|| {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .is_some_and(|r| Path::new(&r).join("systemd/private").exists())
+            && on_path("systemd-run")
+    })
+}
+
+/// `app-nordlys-<id>-<random>.scope`, as the systemd desktop spec names
+/// app scopes. Characters a unit name can't hold become `_`.
+fn scope_name(id: &str) -> String {
+    let id: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("app-nordlys-{id}-{}{nonce:x}.scope", std::process::id())
+}
+
+/// Start a command line detached. Under systemd it gets a scope of its own
+/// in app.slice, so it isn't part of the shell piece that started it: the
+/// bar restarting doesn't take your apps with it.
+fn spawn(cmdline: &str, dir: Option<&Path>, id: Option<&str>) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("exec {cmdline}"))
-        .stdin(Stdio::null())
+    let script = format!("exec {cmdline}");
+    let mut cmd = if user_manager() {
+        let program = cmdline.split_whitespace().next().unwrap_or("app");
+        let program = program.rsplit('/').next().unwrap_or(program);
+        let mut c = Command::new("systemd-run");
+        c.args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--slice=app.slice",
+        ])
+        .arg(format!("--unit={}", scope_name(id.unwrap_or(program))))
+        .args(["--", "sh", "-c", &script]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", &script]);
+        c
+    };
+    if let Some(d) = dir.filter(|d| d.is_dir()) {
+        cmd.current_dir(d);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
@@ -317,6 +467,44 @@ Exec=firefox --new-window %u
             ..App::placeholder(String::new())
         };
         assert_eq!(a.short_id(), "nautilus");
+    }
+
+    #[test]
+    fn translations_and_desktops() {
+        let text = "[Desktop Entry]\nType=Application\nExec=files\nName=Files\n\
+                    Name[de]=Dateien\nName[de_AT]=Dateien (AT)\nKeywords[de]=Ordner;\n\
+                    Path=/srv/work\nNotShowIn=KDE;\n";
+        let de = parse_for("f.desktop", text, &suffixes_of("de_DE.UTF-8"), &[]).unwrap();
+        assert_eq!(de.name, "Dateien");
+        assert_eq!(de.keywords, ["Ordner"]);
+        assert_eq!(de.path.as_deref(), Some(Path::new("/srv/work")));
+        let at = parse_for("f.desktop", text, &suffixes_of("de_AT"), &[]).unwrap();
+        assert_eq!(at.name, "Dateien (AT)");
+        let en = parse_for("f.desktop", text, &suffixes_of("en_US.UTF-8"), &[]).unwrap();
+        assert_eq!(en.name, "Files");
+        assert!(parse_for("f.desktop", text, &[], &["KDE".into()]).is_none());
+
+        let gnome_only = "[Desktop Entry]\nType=Application\nExec=x\nName=X\nOnlyShowIn=GNOME;\n";
+        assert!(parse_for("x.desktop", gnome_only, &[], &["Hyprland".into()]).is_none());
+        assert!(parse_for("x.desktop", gnome_only, &[], &["GNOME".into()]).is_some());
+    }
+
+    #[test]
+    fn locale_suffixes_follow_the_spec() {
+        assert_eq!(
+            suffixes_of("sr_RS.UTF-8@latin"),
+            ["sr_RS@latin", "sr_RS", "sr@latin", "sr"]
+        );
+        assert_eq!(suffixes_of("fr"), ["fr"]);
+        assert!(suffixes_of("C.UTF-8").is_empty());
+        assert!(suffixes_of("").is_empty());
+    }
+
+    #[test]
+    fn scope_names_are_valid_units() {
+        let n = scope_name("org.gnome.Nautilus");
+        assert!(n.starts_with("app-nordlys-org.gnome.Nautilus-") && n.ends_with(".scope"));
+        assert!(scope_name("my app/x").starts_with("app-nordlys-my_app_x-"));
     }
 
     #[test]

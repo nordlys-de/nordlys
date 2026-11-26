@@ -1,0 +1,14 @@
+[Unit]
+Description=Nordlys wallpaper
+Documentation=https://github.com/nordlys-de/nordlys
+PartOf=nordlys-session.target
+After=graphical-session.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+# The wallpaper and fit picked in Settings (~/.config/nordlys/wallpaper and
+# wallpaper-mode), else the Nordlys one. $$ is a literal $ for the shell.
+ExecStart=/bin/sh -c 'c="$${XDG_CONFIG_HOME:-$$HOME/.config}/nordlys"; w="$$c/wallpaper"; [ -e "$$w" ] || w=@DATADIR@/wallpaper.jpg; m=$$(cat "$$c/wallpaper-mode" 2>/dev/null); case "$$m" in fill|fit|center|tile) ;; *) m=fill ;; esac; exec swaybg -m "$$m" -i "$$w"'
+Restart=on-failure
+RestartSec=1

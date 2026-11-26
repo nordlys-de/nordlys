@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+GenericName=Nordlys Settings
+Comment=Appearance, windows, network, sound, screens, power and the rest of the desktop
+Exec=nordlys-settings %u
+TryExec=nordlys-settings
+Icon=preferences-system
+Terminal=false
+Categories=Settings;DesktopSettings;System;
+Keywords=settings;preferences;control;wifi;bluetooth;sound;display;power;keyboard;mouse;wallpaper;
+StartupWMClass=nordlys-settings
+OnlyShowIn=Nordlys;Hyprland;

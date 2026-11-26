@@ -1,18 +1,23 @@
 //! The top bar: workspaces and what's on stage on the left, the clock in
-//! the centre, layout and battery on the right. Matches the canvas.
+//! the centre, the tray, layout and battery on the right. Matches the canvas.
 //!
 //! The same state, update and view run as a layer-shell surface on Wayland
 //! and as a plain preview window anywhere else.
 
 use crate::apps;
 use crate::calendar;
+use crate::events;
 use crate::icons::{self, icon};
 use crate::sources::{self, Battery, Compositor, Desk};
+use crate::system;
+use crate::tray;
 use chrono::{Datelike, NaiveDate};
 use iced::alignment::Horizontal;
 use iced::font::Weight;
 use iced::gradient::Linear;
-use iced::widget::{button, column, container, mouse_area, row, text};
+use iced::widget::{
+    Space, button, column, container, image, mouse_area, row, scrollable, svg, text,
+};
 use iced::{
     Alignment, Background, Border, Color, Element, Font, Length, Radians, Shadow, Subscription,
     Task, Vector,
@@ -51,12 +56,36 @@ pub struct Bar {
     month: Option<NaiveDate>,
     /// Draw a stand-in wallpaper behind the bar (preview window only).
     preview: bool,
+    reads: system::Reads,
+    /// The screen this bar is on, when it was given one.
+    screen: Option<String>,
+    /// Tray icons, newest registration last.
+    tray: Vec<tray::Item>,
+    /// An app's tray menu, open under the bar.
+    menu: Option<Menu>,
+    /// How long the screen has been recording, while it is.
+    recording: Option<Duration>,
+}
+
+/// A tray menu on show. Submenus stack on the levels; Back pops one.
+struct Menu {
+    service: String,
+    path: String,
+    title: String,
+    /// Empty while it loads.
+    levels: Vec<Vec<tray::Entry>>,
 }
 
 #[to_layer_message]
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Once a second, for the clock and battery.
     Tick,
+    /// nordlys.toml was saved.
+    Config(Config),
+    /// The compositor reported a change to workspaces or windows.
+    Changed,
+    Desk(Option<Desk>),
     Switch(usize),
     Launcher,
     /// Open or close the calendar under the clock.
@@ -66,6 +95,19 @@ pub enum Message {
     Today,
     /// A click on the calendar itself, which mustn't close it.
     Keep,
+    /// The tray's icons changed.
+    Tray(Vec<tray::Item>),
+    TrayClick(usize),
+    TrayMiddle(usize),
+    /// Right click: the app's menu.
+    TrayMenu(usize),
+    TrayScroll(usize, i32),
+    MenuLoaded(String, String, Option<Vec<tray::Entry>>),
+    MenuPick(tray::Entry),
+    MenuBack,
+    /// A click beside an open menu.
+    Dismiss,
+    StopRecording,
 }
 
 /// The surface's height with the calendar closed and open.
@@ -73,9 +115,12 @@ pub const SURFACE: u32 = BAR_HEIGHT + BAR_GAP * 2;
 const SURFACE_OPEN: u32 = SURFACE + CALENDAR_HEIGHT;
 const CALENDAR_HEIGHT: u32 = 320;
 const CALENDAR_WIDTH: f32 = 300.0;
+const MENU_WIDTH: f32 = 270.0;
+const MENU_ROW: u32 = 30;
+const MENU_MAX: u32 = 440;
 
 impl Bar {
-    pub fn new(config: &Config, preview: bool) -> Self {
+    pub fn new(config: &Config, preview: bool, screen: Option<String>) -> (Self, Task<Message>) {
         let compositor = Compositor::detect();
         let mut bar = Self {
             palette: config.palette(),
@@ -86,20 +131,83 @@ impl Bar {
             month: None,
             compositor,
             preview,
+            reads: system::Reads::default(),
+            screen,
+            tray: vec![],
+            menu: None,
+            recording: None,
         };
-        bar.refresh();
-        bar
+        bar.tick();
+        let first = bar.read_desk();
+        (bar, first)
     }
 
-    fn refresh(&mut self) {
-        self.desk = self.compositor.desk();
+    fn tick(&mut self) {
         self.battery = sources::battery();
         self.clock = sources::clock_text(chrono::Local::now());
+        self.recording = recording();
+    }
+
+    /// Open `item`'s menu: its dbusmenu when it has one, else the app's own.
+    fn open_menu(&mut self, i: usize) -> Task<Message> {
+        let Some(item) = self.tray.get(i) else {
+            return Task::none();
+        };
+        let Some(path) = item.menu.clone() else {
+            tray::context_menu(item);
+            return Task::none();
+        };
+        let service = item.service.clone();
+        self.month = None;
+        self.menu = Some(Menu {
+            service: service.clone(),
+            path: path.clone(),
+            title: item.title.clone(),
+            levels: vec![],
+        });
+        Task::batch([
+            self.resize(),
+            Task::perform(
+                system::background(move || {
+                    let entries = tray::read_menu(&service, &path);
+                    (service, path, entries)
+                }),
+                |r| match r {
+                    Some((s, p, e)) => Message::MenuLoaded(s, p, e),
+                    None => Message::Dismiss,
+                },
+            ),
+        ])
+    }
+
+    fn read_desk(&mut self) -> Task<Message> {
+        if !self.reads.start() {
+            return Task::none();
+        }
+        let (c, screen) = (self.compositor.clone(), self.screen.clone());
+        Task::perform(
+            system::background(move || c.desk(screen.as_deref())),
+            Message::Desk,
+        )
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => self.refresh(),
+            Message::Tick => self.tick(),
+            Message::Config(c) => {
+                self.palette = c.palette();
+                self.layout = c.stage.layout;
+            }
+            Message::Changed => return self.read_desk(),
+            Message::Desk(desk) => {
+                let again = self.reads.done();
+                if let Some(d) = desk {
+                    self.desk = d;
+                }
+                if again {
+                    return self.read_desk();
+                }
+            }
             Message::Launcher => {
                 // The preview has no layer shell to open it in.
                 if !self.preview
@@ -112,9 +220,10 @@ impl Bar {
                 if let Some(ws) = self.desk.workspaces.get(i) {
                     self.compositor.switch_to(ws);
                 }
-                self.refresh();
+                return self.read_desk();
             }
             Message::Calendar => {
+                self.menu = None;
                 self.month = match self.month {
                     Some(_) => None,
                     None => Some(calendar::first_of(today())),
@@ -126,6 +235,94 @@ impl Bar {
             }
             Message::Today => {
                 self.month = self.month.map(|_| calendar::first_of(today()));
+            }
+            Message::Tray(items) => {
+                self.tray = items;
+                // The app whose menu is open went away.
+                if let Some(m) = &self.menu
+                    && !self.tray.iter().any(|t| t.service == m.service)
+                {
+                    self.menu = None;
+                    return self.resize();
+                }
+            }
+            Message::TrayClick(i) => {
+                if let Some(item) = self.tray.get(i) {
+                    if item.only_menu {
+                        return self.open_menu(i);
+                    }
+                    tray::click(item, tray::Click::Primary);
+                }
+            }
+            Message::TrayMiddle(i) => {
+                if let Some(item) = self.tray.get(i) {
+                    tray::click(item, tray::Click::Middle);
+                }
+            }
+            Message::TrayMenu(i) => {
+                let same = match (&self.menu, self.tray.get(i)) {
+                    (Some(m), Some(t)) => m.service == t.service,
+                    _ => false,
+                };
+                if same {
+                    self.menu = None;
+                    return self.resize();
+                }
+                return self.open_menu(i);
+            }
+            Message::TrayScroll(i, delta) => {
+                if let Some(item) = self.tray.get(i) {
+                    tray::scroll(item, delta);
+                }
+            }
+            Message::MenuLoaded(service, path, entries) => {
+                if let Some(m) = &mut self.menu
+                    && m.service == service
+                    && m.path == path
+                {
+                    match entries {
+                        Some(e) if !e.is_empty() => {
+                            m.levels = vec![e];
+                        }
+                        // No menu after all: let the app show its own.
+                        _ => {
+                            if let Some(item) = self.tray.iter().find(|t| t.service == service) {
+                                tray::context_menu(item);
+                            }
+                            self.menu = None;
+                        }
+                    }
+                    return self.resize();
+                }
+            }
+            Message::MenuPick(entry) => {
+                if let Some(m) = &mut self.menu {
+                    if entry.children.is_empty() {
+                        tray::menu_clicked(&m.service, &m.path, entry.id);
+                        self.menu = None;
+                    } else {
+                        m.levels.push(entry.children);
+                    }
+                    return self.resize();
+                }
+            }
+            Message::MenuBack => {
+                if let Some(m) = &mut self.menu
+                    && m.levels.len() > 1
+                {
+                    m.levels.pop();
+                    return self.resize();
+                }
+            }
+            Message::Dismiss => {
+                self.menu = None;
+                self.month = None;
+                return self.resize();
+            }
+            Message::StopRecording => {
+                if let Err(e) = apps::spawn_shell("nordlys-record stop") {
+                    eprintln!("nordlys-shell: can't stop the recording: {e}");
+                }
             }
             // Layer-shell control messages added by `to_layer_message`.
             _ => {}
@@ -141,6 +338,8 @@ impl Bar {
         }
         let height = if self.month.is_some() {
             SURFACE_OPEN
+        } else if let Some(m) = &self.menu {
+            SURFACE + menu_height(m) + BAR_GAP
         } else {
             SURFACE
         };
@@ -148,7 +347,14 @@ impl Bar {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
+            events::changes(&self.compositor).map(|_| Message::Changed),
+            events::config_changes().map(Message::Config),
+            tray::items().map(Message::Tray),
+            // In case an event is ever missed.
+            iced::time::every(Duration::from_secs(15)).map(|_| Message::Changed),
+        ])
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -273,7 +479,14 @@ impl Bar {
             ..container::Style::default()
         });
 
-        let mut right = row![chip].spacing(12).align_y(Alignment::Center);
+        let mut right = row![].spacing(12).align_y(Alignment::Center);
+        if let Some(t) = self.recording {
+            right = right.push(recording_chip(p, glass, t));
+        }
+        if !self.tray.is_empty() {
+            right = right.push(tray_icons(p, glass, &self.tray, self.menu.as_ref()));
+        }
+        right = right.push(chip);
         if let Some(b) = self.battery {
             right = right.push(battery(p, b));
         }
@@ -331,7 +544,21 @@ impl Bar {
                 .on_press(Message::Calendar),
             ]
             .into(),
-            None => framed.into(),
+            None => match &self.menu {
+                Some(menu) => column![
+                    framed,
+                    mouse_area(
+                        container(mouse_area(menu_panel(p, glass, menu)).on_press(Message::Keep))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .padding([0.0, 12.0])
+                            .align_x(Horizontal::Right)
+                    )
+                    .on_press(Message::Dismiss),
+                ]
+                .into(),
+                None => framed.into(),
+            },
         };
         if !self.preview {
             return framed;
@@ -479,6 +706,235 @@ fn calendar_panel<'a>(
             ..container::Style::default()
         })
         .into()
+}
+
+/// The tray's icons, each a little button: left click activates, middle
+/// is the app's second action, right opens the menu, scroll scrolls.
+fn tray_icons<'a>(
+    p: &Palette,
+    glass: Glass,
+    items: &'a [tray::Item],
+    open: Option<&Menu>,
+) -> Element<'a, Message> {
+    let ink = color(p.text);
+    let alert = color(p.ansi[1]);
+    row(items.iter().enumerate().map(|(i, item)| {
+        let size = f32::from(tray::SIZE);
+        let face: Element<'a, Message> = match &item.icon {
+            tray::Icon::Image(h) => image(h.clone()).width(size).height(size).into(),
+            tray::Icon::Svg(h, symbolic) => {
+                let tint = *symbolic;
+                svg(h.clone())
+                    .width(size)
+                    .height(size)
+                    .style(move |_, _| svg::Style {
+                        color: tint.then_some(ink),
+                    })
+                    .into()
+            }
+            tray::Icon::Letter(c) => text(c.to_string())
+                .font(INTER_SEMIBOLD)
+                .size(12)
+                .color(ink)
+                .into(),
+        };
+        let lit = open.is_some_and(|m| m.service == item.service);
+        let attention = item.attention;
+        mouse_area(
+            container(face)
+                .width(26)
+                .height(26)
+                .align_x(Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center)
+                .style(move |_| container::Style {
+                    background: lit.then_some(Background::Color(glass.chip_hover)),
+                    border: Border {
+                        radius: 7.0.into(),
+                        width: if attention { 1.0 } else { 0.0 },
+                        color: alert,
+                    },
+                    ..container::Style::default()
+                }),
+        )
+        .on_press(Message::TrayClick(i))
+        .on_middle_press(Message::TrayMiddle(i))
+        .on_right_press(Message::TrayMenu(i))
+        .on_scroll(move |d| {
+            let y = match d {
+                iced::mouse::ScrollDelta::Lines { y, .. } => y * 120.0,
+                iced::mouse::ScrollDelta::Pixels { y, .. } => y,
+            };
+            Message::TrayScroll(i, -y.round() as i32)
+        })
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
+    }))
+    .spacing(2)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Height of a menu's panel: a title row, its rows, capped (it scrolls).
+fn menu_height(m: &Menu) -> u32 {
+    let rows: u32 = match m.levels.last() {
+        Some(level) => {
+            level
+                .iter()
+                .map(|e| if e.separator { 9 } else { MENU_ROW })
+                .sum::<u32>()
+                + if m.levels.len() > 1 { MENU_ROW } else { 0 }
+        }
+        None => MENU_ROW,
+    };
+    (rows + MENU_ROW + 20).min(MENU_MAX)
+}
+
+fn menu_panel<'a>(p: &Palette, glass: Glass, m: &Menu) -> Element<'a, Message> {
+    let (ink, dim, muted) = (color(p.text), color(p.dim), color(p.muted));
+    let row_button = |label: Element<'a, Message>, message: Option<Message>| {
+        button(label)
+            .width(Length::Fill)
+            .height(MENU_ROW as f32)
+            .padding([6, 10])
+            .on_press_maybe(message)
+            .style(move |_, status| button::Style {
+                background: (status == button::Status::Hovered)
+                    .then_some(Background::Color(glass.chip_hover)),
+                text_color: if status == button::Status::Disabled {
+                    dim
+                } else {
+                    ink
+                },
+                border: Border {
+                    radius: 7.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            })
+    };
+    let mut list = column![
+        container(
+            text(m.title.clone())
+                .font(INTER_SEMIBOLD)
+                .size(11)
+                .color(muted)
+        )
+        .height(MENU_ROW as f32)
+        .padding([8, 10])
+    ];
+    if m.levels.len() > 1 {
+        list = list.push(row_button(
+            text("‹  Back").font(INTER).size(13).into(),
+            Some(Message::MenuBack),
+        ));
+    }
+    match m.levels.last() {
+        None => {
+            list = list
+                .push(container(text("Loading…").font(INTER).size(13).color(dim)).padding([6, 10]));
+        }
+        Some(level) => {
+            for e in level {
+                if e.separator {
+                    list = list.push(
+                        container(
+                            container(Space::new().width(Length::Fill).height(1.0)).style(
+                                move |_| container::Style {
+                                    background: Some(Background::Color(glass.chip_border)),
+                                    ..container::Style::default()
+                                },
+                            ),
+                        )
+                        .padding([4, 8]),
+                    );
+                    continue;
+                }
+                let mark = match e.toggle {
+                    Some(true) => "✓",
+                    _ => "",
+                };
+                let label = row![
+                    text(mark).font(INTER).size(12).width(14),
+                    text(e.label.clone())
+                        .font(INTER)
+                        .size(13)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    text(if e.children.is_empty() { "" } else { "›" })
+                        .font(INTER)
+                        .size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+                list = list.push(row_button(
+                    label.into(),
+                    e.enabled.then(|| Message::MenuPick(e.clone())),
+                ));
+            }
+        }
+    }
+    let ground = color(p.ground);
+    container(scrollable(list.spacing(1)).height(Length::Fill))
+        .width(MENU_WIDTH)
+        .height(menu_height(m) as f32)
+        .padding(8)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(Color { a: 0.94, ..ground })),
+            border: Border {
+                radius: 14.0.into(),
+                width: 1.0,
+                color: glass.bar_border,
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// While `nordlys-record` runs: its pid file, and how long ago it started.
+fn recording() -> Option<Duration> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let file = std::path::Path::new(&dir).join("nordlys-record.pid");
+    let pid = std::fs::read_to_string(&file).ok()?;
+    let pid = pid.trim();
+    if pid.is_empty() || !std::path::Path::new("/proc").join(pid).exists() {
+        return None;
+    }
+    let started = std::fs::metadata(&file).ok()?.modified().ok()?;
+    Some(started.elapsed().unwrap_or_default())
+}
+
+/// A red dot and the time; a click stops the recording.
+fn recording_chip<'a>(p: &Palette, glass: Glass, t: Duration) -> Element<'a, Message> {
+    let red = color(p.ansi[1]);
+    let ink = color(p.text);
+    let secs = t.as_secs();
+    button(
+        row![
+            text("●").font(INTER).size(11).color(red),
+            text(format!("{}:{:02}", secs / 60, secs % 60))
+                .font(MONO)
+                .size(11),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding([4, 9])
+    .on_press(Message::StopRecording)
+    .style(move |_, status| button::Style {
+        background: Some(Background::Color(if status == button::Status::Hovered {
+            glass.chip_hover
+        } else {
+            glass.chip
+        })),
+        text_color: ink,
+        border: Border {
+            radius: 7.0.into(),
+            width: 1.0,
+            color: Color { a: 0.6, ..red },
+        },
+        ..button::Style::default()
+    })
+    .into()
 }
 
 /// Translucent fills from the canvas. The compositor supplies the blur.

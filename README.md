@@ -7,20 +7,23 @@ replaces goes to the front of the shelf beside it. Workspaces, app groups
 and the same keys work on every screen size, from ultrawide to laptop.
 
 > Early days. The shell (bar, launcher, shelves, notifications, lock
-> screen) runs as a session on Hyprland; nordlys-comp, the Stage
-> compositor, is headless only so far.
+> screen) runs as a session on Hyprland. nordlys-comp, the Stage
+> compositor, runs real apps nested in a window, and as a session of its
+> own on one screen ("Nordlys (own compositor)" at login), which is new
+> and less tried than the Hyprland one.
 
 ## Crates
 
 | Crate | What it is | State |
 |---|---|---|
-| `nordlys-stage` | The Stage layout model: bring, two-up, swap, shelf, close. Pure logic, no Wayland types. | Working, tested |
-| `nordlys-ipc` | JSON-lines protocol over `$XDG_RUNTIME_DIR/nordlys.sock`. | Working, tested |
+| `nordlys-stage` | The Stage layout model: bring, two-up, swap, shelf, close, one stage per workspace. Pure logic, no Wayland types. | Working, tested |
+| `nordlys-ipc` | JSON-lines protocol over `$XDG_RUNTIME_DIR/nordlys.sock`, versioned, with `subscribe` for live updates. | Working, tested |
 | `nordlys-config` | `nordlys.toml` (theme, stage, app groups) and the shared palette. | Working, tested |
 | `nordlys-theme` | Writes the palette for GTK 3/4 (libadwaita), qt6ct and the default apps, and their starting dotfiles. | Working |
 | `nordlysctl` | Command-line control: `nordlysctl two-up`, `nordlysctl group d`… | Working |
-| `nordlys-comp` | The compositor, on Smithay. `--headless` runs the Stage model over IPC with no display. | Headless only |
+| `nordlys-comp` | The compositor, on Smithay: real windows laid out by the Stage model, layer-shell for the shell, blur, shelf previews, session lock, X11 apps through xwayland-satellite. `--tty` drives the screen; nested in a window otherwise; `--headless` runs the model over IPC with no display. | Working nested; the TTY session is new, one screen only |
 | `nordlys-shell` | Bar, launcher, shelves, notifications, lock screen, on iced and layer-shell. | Working on Hyprland |
+| `nordlys-settings` | The Settings app: the desktop's own options and the system's (network, Bluetooth, sound, screens, power, time, apps, services). | Working on Hyprland |
 
 ## Install it
 
@@ -31,10 +34,12 @@ CachyOS:
 sudo pacman -S --needed rust git hyprland hypridle swaybg hyprpolkitagent \
     xdg-desktop-portal-hyprland inter-font ttf-jetbrains-mono \
     wireplumber playerctl networkmanager bluez-utils brightnessctl \
+    power-profiles-daemon \
     grim slurp wl-clipboard foot \
     xdg-desktop-portal-gtk xdg-user-dirs dconf adw-gtk-theme libnotify \
     nautilus gvfs ffmpegthumbnailer imv mpv mpv-mpris zathura-pdf-mupdf \
-    gnome-text-editor helix btop pavucontrol file-roller
+    gnome-text-editor helix btop pavucontrol file-roller \
+    gnome-keyring libsecret seahorse wf-recorder cliphist
 git clone https://github.com/nordlys-de/nordlys && cd nordlys
 cargo build --release
 sudo scripts/install.sh            # into /usr/local; --uninstall removes it
@@ -49,11 +54,26 @@ acceleration (virtio-gpu with OpenGL, or VMware's 3D); Hyprland needs it.
 
 What you get:
 
-- `nordlys-session` starts Hyprland with Nordlys's own config
+- `nordlys-session` makes sure the keyring is running, so browsers, VS
+  Code and git keep their passwords (see [Saved passwords](#saved-passwords)),
+  then starts Hyprland with Nordlys's own config
   (`share/nordlys/hyprland.lua`), so your `~/.config/hypr` is left alone.
 - It starts the bar, shelf, ambient rail, notification daemon, hypridle
   (dim at 4 min, lock at 5, screen off at 6, suspend at 30), the polkit
   agent and the aurora wallpaper, and blurs every shell surface.
+- Those run as systemd user services under `nordlys-session.target`, so
+  a piece that crashes comes back a second later
+  (`systemctl --user status 'nordlys-*'` shows them, `journalctl --user
+  -u nordlys-shell@bar` their logs). Without the units they're started
+  directly, without the safety net.
+- The bar, rails and close button appear on every screen, and follow
+  screens as you plug them in and out.
+- On first login it copies the example `nordlys.toml` to
+  `~/.config/nordlys/`. Saving that file recolours the shell live.
+- On first login a welcome page explains the stage and the shelf and lists
+  the keys. Super+F1 brings it back.
+- Everything you copy goes to a clipboard history (cliphist, as the
+  `nordlys-clipboard` service); Super+V picks from it.
 - At every login, `nordlys-theme` themes GTK, Qt and the default apps
   from `nordlys.toml` and writes any of their starting dotfiles that are
   missing (see [The apps](#the-apps)). Files you've made your own are left
@@ -80,7 +100,7 @@ you hover.
 | Keys | Does |
 |---|---|
 | Super Space · Super Shift Space | Launcher · commands |
-| Super Enter · E · , | Terminal · editor · `nordlys.toml` |
+| Super Enter · E · , | Terminal · editor · Settings |
 | Super K · J | Previous window to stage · cycle the shelf |
 | Super T · Tab · S | Tiled view on/off · swap · send to shelf |
 | Super G | App groups (the launcher's commands) |
@@ -92,8 +112,12 @@ you hover.
 | Ctrl Shift Esc | System monitor (btop) |
 | Super Shift S | Screenshot a region to the clipboard |
 | Print · Shift Print | Save the screen · a region to ~/Pictures/Screenshots (and copy it) |
+| Super R · Shift R | Record a region · the screen to ~/Videos/Recordings; again to stop |
+| Super V | Clipboard history |
+| Super F1 | Welcome page and keys |
 | Super Esc or L | Lock |
-| Super Shift Esc | Log out |
+| Volume, mute, brightness keys | Change it and show the level on screen |
+| Super Shift Esc (twice) | Log out |
 | Super drag · right-drag | Move · resize a window |
 
 On other distros you need the development files for PAM, xkbcommon and
@@ -141,12 +165,114 @@ cargo run -p nordlys-comp -- --headless
 cargo run -p nordlysctl -- group d        # launch the "Nordlys dev" group
 cargo run -p nordlysctl -- two-up
 cargo run -p nordlysctl -- bring nautilus
+cargo run -p nordlysctl -- move-to 2      # main window to workspace 2
+cargo run -p nordlysctl -- workspace 2
+
+# Terminal 3: print the stage after every change
+cargo run -p nordlysctl -- watch
 
 # Preview generated theme files without touching ~/.config
 cargo run -p nordlys-theme -- --config config/nordlys.toml --dry-run
 ```
 
 Copy `config/nordlys.toml` to `~/.config/nordlys/nordlys.toml` to customise.
+The shell and nordlys-comp pick up changes when the file is saved.
+
+## The compositor, nested
+
+```sh
+cargo build                                    # nordlys-shell too, for the bar
+cargo run -p nordlys-comp -- --run kitty --run target/debug/nordlys-shell
+```
+
+Inside Hyprland (or any Wayland or X11 desktop) this opens a window with a
+Wayland display of its own, and apps started in it are laid out by the
+real Stage model: the newest window takes the stage, the one it replaces
+waits, unmapped, on the shelf, two-up splits the stage with an accent ring
+around the window that has the keys, and every workspace keeps a stage of
+its own. Dialogs float over their parent. The bar, rails, launcher and
+toasts run inside as layer-shell surfaces, and the space the bar reserves
+comes off the stage.
+
+The Nordlys key is **Alt** here, so the desktop around it keeps Super
+(`NORDLYS_MOD=super` to change that). The keys are the session's: Alt+Enter
+terminal, Alt+Space launcher, Alt+K/J/T/Tab/S, Alt+Q close, Alt+1–9 and
+Alt+Shift+1–9 for workspaces, Alt+← → to move the keyboard between the
+panes, and Alt+Shift+Esc closes the compositor.
+
+It takes an IPC socket of its own, `$XDG_RUNTIME_DIR/nordlys-wayland-N.sock`
+(printed at start), so the shell on the desktop around it isn't confused,
+and apps started inside find it through `NORDLYS_SOCKET`. From outside:
+
+```sh
+export NORDLYS_SOCKET=/run/user/1000/nordlys-wayland-2.sock
+nordlysctl watch                  # the stage after every change
+nordlysctl two-up
+nordlysctl screenshot stage.png   # what the compositor shows, as a PNG
+```
+
+`nordlysctl close` asks the app to close its window, and `nordlysctl group`
+starts the group's apps (on an empty workspace, if the group says so).
+
+Glass shell surfaces (bar, launcher, rails, toasts, OSD, welcome) get a
+dual-kawase blur of what's under them, `theme.blur` strong; reduce
+transparency or `theme.blur = 0` turns it off. Shelved windows keep
+drawing at `stage.shelf_fps`, small, into a `.previews` folder beside the
+IPC socket, for the shelf's flyout.
+`nordlys-shell lock` locks it through `ext-session-lock-v1`, and idle
+tools (hypridle) see it through `ext-idle-notify-v1`. X11 apps open when
+`xwayland-satellite` is installed.
+
+## The compositor as the session
+
+Pick **Nordlys (own compositor)** in the display manager, or from a TTY:
+
+```sh
+nordlys-session --comp
+```
+
+That runs `nordlys-comp --tty`: DRM/KMS for the screen, libinput for
+keyboards, mice and touchpads (tap to click), libseat (logind or seatd)
+for the right to use them, so no root. The Nordlys key is **Super**,
+Ctrl+Alt+F1–F12 switch VTs, and the media, brightness and Print keys work
+as on the Hyprland session. It starts the same user services
+(`nordlys-session.target`) through `session/nordlys-autostart`, sets
+`XDG_CURRENT_DESKTOP=Nordlys`, and its portals come from
+`xdg-desktop-portal-gtk` (`nordlys-portals.conf`).
+
+What it doesn't do yet: more than one screen (it takes the laptop panel,
+else the first connected one, in its preferred mode), screen sharing (no
+portal knows nordlys-comp), fractional scaling (it picks 1 or 2 from the
+screen's density; `NORDLYS_SCALE` overrides), and hardware cursor planes
+are left to Smithay to choose.
+
+## Settings
+
+Super+, (or **Settings** in the launcher) opens `nordlys-settings`.
+`nordlys-settings network` opens straight on a page; `--pages` lists them.
+Changes apply as you make them; there's no Apply button.
+
+| Group | Pages |
+|---|---|
+| Desktop | Appearance (dark/light, accent, blur, wallpaper), Windows (layout, gaps, borders, focus), App groups, Notifications, Lock & idle, Keyboard, Mouse & touchpad |
+| System | Network, Bluetooth, Sound, Displays, Power, Date & time, Default apps, Startup apps |
+| Nordlys | Services, Advanced, About |
+
+Where it keeps things, all in `~/.config/nordlys/`:
+
+- `nordlys.toml`: edited in place, comments kept. Every change is checked
+  against the shell's own parser first, so a change the shell would reject
+  is never written.
+- `settings.lua`: the Hyprland options it changes, applied live with
+  `hyprctl eval` and loaded at login before your own `hyprland.lua`, so
+  yours still wins. Advanced lists each one with a reset button.
+- `hypridle.conf`: written when you change Lock & idle.
+- `wallpaper` and `wallpaper-mode`: the image and how it fits.
+
+Screens changed under Displays go back on their own after 15 seconds
+unless you press **Keep**. Wi-Fi passwords go to NetworkManager over
+D-Bus, never on a command line. Time, time zone, locale and system
+services ask for your password through polkit.
 
 ## The apps
 
@@ -215,11 +341,38 @@ cargo run -p nordlys-shell -- --window  # preview window (automatic on X11)
 ```
 
 It shows workspaces (click to switch), what's on stage, the clock, the
-layout and the battery. Workspaces come from nordlys-comp when its socket
+tray, the layout and the battery, and a red dot with the time while the
+screen is recording (click it to stop). Workspaces come from nordlys-comp when its socket
 is up, from Hyprland's IPC on Hyprland, and from a demo set otherwise.
+It redraws when the compositor reports a change (Hyprland's event socket,
+or nordlys-comp's `subscribe`), not on a timer.
+
+On Hyprland, `nordlys-shell` without `--output` runs one bar per screen;
+each shows its own screen's workspace. `--output DP-1` runs just one.
 
 The Nordlys session starts it and has Hyprland blur it (layer namespace
 `nordlys-bar`).
+
+### The tray
+
+Apps that put an icon in the tray (Discord, Steam, Nextcloud, VPN clients,
+nm-applet, blueman…) show it on the right of the bar. Left click does the
+app's main action (or opens its menu, if that's all it has), middle click
+its second one, right click opens its menu under the bar, and scrolling
+goes to the app. An icon asking for attention gets a red ring.
+
+It's the StatusNotifierItem standard that KDE, libappindicator, Qt and
+Electron apps use. Each bar offers to be the `org.kde.StatusNotifierWatcher`
+the apps register with; the first one gets it, and if it exits another
+takes over and the apps register again. Menus are their `dbusmenu`s.
+To see what the tray sees:
+
+```sh
+nordlys-shell tray      # each icon and its menu
+```
+
+Apps that only know the old X11 tray (XEmbed) don't show; most offer an
+AppIndicator option.
 
 The bar asks for the **Inter** and **JetBrains Mono** fonts and falls back
 to the system fonts when they're missing.
@@ -238,12 +391,22 @@ One panel finds:
 
 - **Apps** from `.desktop` files (your own entries override system ones).
 - **Commands**: your app groups from `nordlys.toml`, the Stage actions
-  (two-up, send to shelf, previous, swap), reload config, edit config and
-  lock screen.
+  (two-up, send to shelf, previous, swap), reload config, edit config,
+  Settings, clipboard history, screen recording, the welcome page, lock
+  screen, and clear clipboard history, log out, suspend, restart and shut
+  down. Those last five ask first: Enter arms them, a second Enter runs them.
 - **Files** under your home folder: a few levels deep, skipping hidden and
   build folders.
 
-Type `>` for commands only and `/` for files only. Use ↑ ↓ or Tab to
+Names and keywords come in your language when the entry has them, and
+entries marked `OnlyShowIn`/`NotShowIn` for other desktops stay hidden.
+Under systemd each app starts in a scope of its own (`app-nordlys-….scope`
+in `app.slice`), so restarting a shell piece never takes your apps with it.
+
+Type `>` for commands only, `/` for files only and `#` for the clipboard
+history: what you copied, newest first, and Enter copies it again. Copied
+text only shows after `#`, never in an ordinary search, and isn't counted
+in the launch history. "Clear clipboard history" forgets it all. Use ↑ ↓ or Tab to
 move, Enter to open, Ctrl+Enter to open a file's folder, and Esc or a
 click outside to close. Things you open often rise to the top; the counts
 live in `~/.local/state/nordlys/launcher-history`.
@@ -271,17 +434,19 @@ cargo run -p nordlys-shell -- ambient --window
 **The shelf** (left) holds the windows waiting on this workspace, most
 recent first, numbered by slot. Hover a tile to see its app and title;
 click it to bring it on stage. Windows come from nordlys-comp, from
-Hyprland's client list, or from a demo set. Live thumbnails need the
-compositor to share window pictures, so they arrive with nordlys-comp;
-until then each tile shows the app's initial.
+Hyprland's client list, or from a demo set. On nordlys-comp the flyout
+also shows a live picture of the window, which the compositor keeps
+drawing while it waits; elsewhere each tile shows the app's initial.
 
 **The ambient rail** (right) carries what matters on every workspace: now
 playing, quick settings and notifications. Any tile opens the panel, which
 has play/pause and next, Wi-Fi, Bluetooth and Do not disturb toggles, a
 volume slider (click the percentage to mute) and the notification count.
-For now it talks to the standard tools: `playerctl`, `wpctl`, `nmcli`,
-`bluetoothctl` and `dunstctl`. A toggle whose tool is missing shows
-"Unavailable". Talking to D-Bus directly comes later.
+Media (MPRIS), Wi-Fi (NetworkManager) and Bluetooth (BlueZ) go straight
+over D-Bus. Volume uses `wpctl`, and anything D-Bus can't reach falls back
+to `playerctl`, `nmcli`, `bluetoothctl` or `dunstctl`. Everything is read
+at once and off the UI thread, so a slow service never freezes the rail.
+A toggle with nothing to talk to shows "Unavailable".
 
 Each rail reserves 88 px on its edge, so windows sit between them. The
 surface widens while a hover card or the panel is open.
@@ -360,6 +525,79 @@ If the lock screen ever crashes, Hyprland shows a red screen and stays
 locked. The session allows a new lock screen to take over: from another
 TTY, run `WAYLAND_DISPLAY=wayland-1 nordlys-shell lock` as yourself.
 
+## Saved passwords
+
+Browsers, VS Code, git and most apps keep passwords in the Secret Service,
+which gnome-keyring provides. For the keyring to open without asking, your
+login screen has to hand it your password, through two optional lines in
+its PAM file. GDM has them already; `scripts/setup.sh` adds them for SDDM,
+greetd, LightDM, ly and the TTY login if they're missing, keeping a copy of
+each file as `*.pre-nordlys` (`--no-keyring` skips this). By hand:
+
+```
+-auth       optional    pam_gnome_keyring.so
+-session    optional    pam_gnome_keyring.so auto_start
+```
+
+`nordlys-session` starts the daemon if PAM hasn't, and uses its SSH agent
+(`gcr-ssh-agent`) unless you have one. The lock screen unlocks the keyring
+again too. Seahorse ("Passwords and Keys") shows what's saved. For git:
+`git config --global credential.helper /usr/lib/git-core/git-credential-libsecret`.
+
+## Screen recording
+
+```sh
+nordlys-record region     # pick a region, then record (Super+R)
+nordlys-record screen     # the screen with the pointer (Super+Shift+R)
+nordlys-record stop
+nordlys-record region --audio   # with what the computer plays
+```
+
+The same key stops it, and so does the red dot that shows on the bar while
+it records. Videos go to `~/Videos/Recordings` as MP4, and a notification
+says where. It uses wf-recorder, or gpu-screen-recorder when that's what
+you have. Sharing your screen in a call goes through the portal
+(xdg-desktop-portal-hyprland) and needs nothing from Nordlys.
+
+## The login screen
+
+`session/sddm/nordlys` is an SDDM theme (Qt 6) in the same look: the
+aurora wallpaper, a large clock and a frosted card with the user, password
+and session, and suspend, restart and shut down in the corner. `install.sh`
+puts it in `/usr/share/sddm/themes/nordlys`; `setup.sh` switches it on
+when it installs SDDM itself, or with `--sddm-theme`. By hand:
+
+```sh
+printf '[Theme]\nCurrent=nordlys\n' | sudo tee /etc/sddm.conf.d/nordlys.conf
+sddm-greeter-qt6 --test-mode --theme /usr/share/sddm/themes/nordlys   # try it first
+```
+
+## Not there yet
+
+- **Printing**: no printer settings of their own. Install `cups` and
+  `system-config-printer` (it floats over the stage) and print from apps.
+- **Fingerprint login**: the lock screen asks for a password only.
+- **Software updates**: use your package manager.
+- **Accessibility**: Settings has reduce motion and reduce transparency.
+  There's no screen reader, magnifier or on-screen keyboard yet.
+- **Languages**: the interface is in English only.
+
+## Volume and brightness
+
+```sh
+nordlys-shell osd volume up       # also: down, mute, show
+nordlys-shell osd brightness down
+nordlys-shell osd mic mute
+nordlys-shell osd volume show --window   # print the level instead
+```
+
+The session binds the media keys to these. Each changes the level by 5%
+(volume stops at 100%, and turning it up unmutes) and shows it in a glass
+pill near the bottom of the screen. The first press of a burst opens the
+pill; later presses hand it the new level, and it closes once the keys have
+been quiet for a moment, so nothing waits on screen in between. Volume uses
+`wpctl`, brightness `brightnessctl`.
+
 ## Roadmap
 
 1. **Shell on Hyprland.** iced and layer-shell top bar, launcher, shelves,
@@ -367,11 +605,15 @@ TTY, run `WAYLAND_DISPLAY=wayland-1 nordlys-shell lock` as yourself.
    D-Bus (NetworkManager, BlueZ, UPower, MPRIS) and the lock screen
    (`ext-session-lock-v1`). Hyprland blurs layer surfaces, so the frosted
    look works from day one.
-2. **nordlys-comp on Smithay.** DRM/KMS and libinput through libseat, the
-   Stage layout from `nordlys-stage`, shelf previews at a low frame rate,
-   dual-kawase blur, xwayland-satellite for X11 apps.
+2. **nordlys-comp on Smithay.** Done: nested in a window, real windows
+   in the Stage layout from `nordlys-stage`, layer-shell for the shell,
+   dmabuf for GPU clients, screenshots over IPC, DRM/KMS and libinput
+   through libseat, shelf previews at a low frame rate, dual-kawase blur,
+   session lock and idle notification, xwayland-satellite for X11 apps.
+   Next: more than one screen, and a screencast portal.
 3. **Polish.** Adaptive shelves (ultrawide, rails, peek), app groups in
-   their own workspaces, the SDDM theme (separate repo), a settings app.
+   their own workspaces. Done: the SDDM theme, the Settings app, the tray,
+   clipboard history, screen recording and the welcome page.
 
 ## Reused, not rewritten
 

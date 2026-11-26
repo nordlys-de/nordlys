@@ -41,23 +41,48 @@ hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" 
 ---- AUTOSTART ----
 -------------------
 
-hl.on("hyprland.start", function()
-    -- Portals and apps started by D-Bus need the session's environment.
-    hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE XDG_CONFIG_DIRS QT_QPA_PLATFORMTHEME")
+-- Without the systemd user units (a build tree, or no systemd), start the
+-- same pieces directly. They won't come back if they crash.
+local idle = os.getenv("NORDLYS_IDLE") or (data .. "/hypridle.conf")
+-- The wallpaper and its fit picked in Settings, else the Nordlys one.
+local conf = (os.getenv("XDG_CONFIG_HOME") or (home .. "/.config")) .. "/nordlys"
+local wallpaper, wallpaper_mode = data .. "/wallpaper.jpg", "fill"
+local wf = io.open(conf .. "/wallpaper", "r")
+if wf then
+    wf:close()
+    wallpaper = conf .. "/wallpaper"
+end
+local mf = io.open(conf .. "/wallpaper-mode", "r")
+if mf then
+    local m = mf:read("l")
+    mf:close()
+    if m == "fill" or m == "fit" or m == "center" or m == "tile" then wallpaper_mode = m end
+end
+local by_hand = table.concat({
+    "nordlys-shell notify &",
+    "nordlys-shell &",
+    "nordlys-shell shelf &",
+    "nordlys-shell ambient &",
+    "nordlys-shell close-button &",
+    "swaybg -m " .. wallpaper_mode .. " -i '" .. wallpaper .. "' &",
+    "hypridle -c '" .. idle .. "' &",
+    "{ command -v cliphist >/dev/null && wl-paste --watch cliphist store; } &",
+}, " ")
 
-    hl.exec_cmd("swaybg -m fill -i " .. data .. "/wallpaper.jpg")
+hl.on("hyprland.start", function()
+    -- Portals, D-Bus apps and the session's user services need the
+    -- session's environment, so import it before starting them. The
+    -- services restart if they crash (session/systemd/).
+    hl.exec_cmd("sh -c 'dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP HYPRLAND_INSTANCE_SIGNATURE NORDLYS_DATA NORDLYS_IDLE PATH XDG_CONFIG_DIRS QT_QPA_PLATFORMTHEME SSH_AUTH_SOCK"
+        .. " && systemctl --user --no-block start nordlys-session.target"
+        .. " || { " .. by_hand:gsub("'", "'\\''") .. " }'")
+
     -- Theme GTK, Qt and the default apps from nordlys.toml, and write the
     -- starting dotfiles that are missing. Files you've made your own are
     -- left alone (see nordlys-theme --dry-run).
     hl.exec_cmd("nordlys-theme --quiet")
     -- ~/Pictures, ~/Downloads… for the file manager's sidebar and Print.
     hl.exec_cmd("sh -c 'command -v xdg-user-dirs-update >/dev/null && xdg-user-dirs-update'")
-    hl.exec_cmd("nordlys-shell notify")
-    hl.exec_cmd("nordlys-shell")
-    hl.exec_cmd("nordlys-shell shelf")
-    hl.exec_cmd("nordlys-shell ambient")
-    hl.exec_cmd("nordlys-shell close-button")
-    hl.exec_cmd("hypridle -c " .. (os.getenv("NORDLYS_IDLE") or (data .. "/hypridle.conf")))
 
     -- In a test VM (scripts/setup.sh installs it): shared clipboard and
     -- a screen that follows the window size.
@@ -65,6 +90,9 @@ hl.on("hyprland.start", function()
 
     -- Password prompts for apps that ask for admin rights.
     hl.exec_cmd("sh -c 'systemctl --user start hyprpolkitagent || /usr/lib/hyprpolkitagent/hyprpolkitagent'")
+
+    -- The first login: what the Stage is and the keys (Super+F1 again later).
+    hl.exec_cmd("sh -c 'sleep 2; exec nordlys-shell welcome --first-run'")
 end)
 
 -------------------------------
@@ -165,11 +193,11 @@ hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
 ---- SHELL SURFACES ---
 -----------------------
 
--- Blur behind the bar, launcher, rails and toasts. ignore_alpha keeps the
+-- Blur behind the bar, launcher, rails, toasts and the OSD. ignore_alpha keeps the
 -- blur to the painted parts, not the clear margins around them.
 hl.layer_rule({
     name  = "nordlys-glass",
-    match = { namespace = "^nordlys-(bar|launcher|shelf|ambient|notify)$" },
+    match = { namespace = "^nordlys-(bar|launcher|shelf|ambient|notify|osd|welcome)$" },
     blur  = true,
     ignore_alpha = 0.3,
 })
@@ -182,6 +210,9 @@ for i, class in ipairs({
     "^(org.gnome.FileRoller|file-roller)$",
     "^(org.gnome.Calculator|qalculate-gtk)$",
     "^(hyprpolkitagent|polkit-gnome-authentication-agent-1)$",
+    -- The keyring asking for its password, and printer setup.
+    "^(gcr-prompter|org.gnome.keyring.SystemPrompter)$",
+    "^(system-config-printer|org.gnome.Seahorse)$",
 }) do
     hl.window_rule({ name = "nordlys-float-" .. i, match = { class = class }, float = true })
 end
@@ -271,26 +302,44 @@ hl.bind(key("E"),             run(editor),                                 { des
 hl.bind(key("N"),             run(files),                                  { desc = "Files" })
 hl.bind(key("B"),             run(browser),                                { desc = "Browser" })
 hl.bind("CTRL + SHIFT + ESCAPE", run(monitor),                             { desc = "System monitor" })
-hl.bind(key("comma"),         run("xdg-open " .. home .. "/.config/nordlys/nordlys.toml"), { desc = "Settings" })
+hl.bind(key("comma"),         run(first_of("nordlys-settings") .. " || xdg-open '" .. conf .. "/nordlys.toml'"), { desc = "Settings" })
 hl.bind(key("SHIFT + S"),     run("sh -c 'grim -g \"$(slurp)\" - | wl-copy'"), { desc = "Screenshot to clipboard" })
+-- Screen recording to ~/Videos/Recordings; the same key stops it.
+hl.bind(key("R"),             run("nordlys-record region"),                { desc = "Record a region" })
+hl.bind(key("SHIFT + R"),     run("nordlys-record screen"),                { desc = "Record the screen" })
+hl.bind(key("V"),             run("nordlys-shell launcher --query '# '"),  { desc = "Clipboard history" })
+hl.bind(key("F1"),            run("nordlys-shell welcome"),                { desc = "Welcome and keys" })
 hl.bind("Print",              run(screenshot(false)),                      { desc = "Save a screenshot" })
 hl.bind("SHIFT + Print",      run(screenshot(true)),                       { desc = "Save a screenshot of a region" })
 hl.bind(key("ESCAPE"),        run("nordlys-shell lock"),                   { desc = "Lock" })
 hl.bind(key("L"),             run("nordlys-shell lock"),                   { desc = "Lock" })
-hl.bind(key("SHIFT + ESCAPE"), hl.dsp.exit(),                              { desc = "Log out" })
+-- Logging out closes every app, so it takes the keys twice within three
+-- seconds. The first press says so in a notification.
+local logout_asked = -math.huge
+hl.bind(key("SHIFT + ESCAPE"), function()
+    local now = os.time()
+    if now - logout_asked <= 3 then
+        hl.dispatch(hl.dsp.exit())
+    else
+        logout_asked = now
+        hl.exec_cmd("notify-send -a Nordlys -u critical -t 3000 -h string:x-canonical-private-synchronous:nordlys-logout "
+            .. "'Log out?' 'Press Super+Shift+Esc again to log out.'")
+    end
+end, { desc = "Log out (press twice)" })
 
 -- Mouse: Super+drag moves, Super+right-drag resizes.
 hl.bind(key("mouse:272"), hl.dsp.window.drag(),   { mouse = true })
 hl.bind(key("mouse:273"), hl.dsp.window.resize(), { mouse = true })
 
--- Media and brightness keys, also on the lock screen.
+-- Media and brightness keys, also on the lock screen. `nordlys-shell osd`
+-- makes the change and shows the new level in a pill near the bottom.
 local media = { locked = true, repeating = true }
-hl.bind("XF86AudioRaiseVolume",  run("wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+"), media)
-hl.bind("XF86AudioLowerVolume",  run("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"),      media)
-hl.bind("XF86AudioMute",         run("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"),     media)
-hl.bind("XF86AudioMicMute",      run("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"),   media)
-hl.bind("XF86MonBrightnessUp",   run("brightnessctl -e4 -n2 set 5%+"),                  media)
-hl.bind("XF86MonBrightnessDown", run("brightnessctl -e4 -n2 set 5%-"),                  media)
+hl.bind("XF86AudioRaiseVolume",  run("nordlys-shell osd volume up"),       media)
+hl.bind("XF86AudioLowerVolume",  run("nordlys-shell osd volume down"),     media)
+hl.bind("XF86AudioMute",         run("nordlys-shell osd volume mute"),     media)
+hl.bind("XF86AudioMicMute",      run("nordlys-shell osd mic mute"),        media)
+hl.bind("XF86MonBrightnessUp",   run("nordlys-shell osd brightness up"),   media)
+hl.bind("XF86MonBrightnessDown", run("nordlys-shell osd brightness down"), media)
 hl.bind("XF86AudioNext",  run("playerctl next"),       { locked = true })
 hl.bind("XF86AudioPrev",  run("playerctl previous"),   { locked = true })
 hl.bind("XF86AudioPlay",  run("playerctl play-pause"), { locked = true })
@@ -301,6 +350,18 @@ local vm = io.open(data .. "/vm-guest", "r")
 if vm then
     vm:close()
     hl.config({ cursor = { no_hardware_cursors = true } })
+end
+
+-- What you changed in Settings (nordlys-settings writes this file). A
+-- broken one is skipped, so the session still starts.
+local made = conf .. "/settings.lua"
+local sf = io.open(made, "r")
+if sf then
+    sf:close()
+    local ok, err = pcall(dofile, made)
+    if not ok then
+        hl.exec_cmd("notify-send -a Nordlys -u critical 'Settings not applied' '" .. tostring(err):gsub("'", "") .. "'")
+    end
 end
 
 -----------------------

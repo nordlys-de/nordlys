@@ -2,19 +2,24 @@
 //! canvas): windows waiting on this workspace, most recent first, with slot
 //! numbers. Hover one for its name and title; click to bring it on stage.
 //!
-//! Live thumbnails need the compositor to share window pictures, so they
-//! come with nordlys-comp. Until then the flyout shows name and title.
+//! On nordlys-comp the flyout shows a live picture of the window: the
+//! compositor keeps drawing shelved windows small (at `stage.shelf_fps`)
+//! into files beside its socket, and the flyout re-reads the hovered one's
+//! a few times a second while it's open. Elsewhere it's name and title.
 
 use crate::bar::{INTER, INTER_SEMIBOLD, color};
+use crate::events;
 use crate::icons::{self, icon};
 use crate::sources::{Compositor, ShelfWindow};
+use crate::system;
 use crate::ui::{self, Rail};
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{Space, button, column, container, mouse_area, row, stack, text};
-use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task};
+use iced::widget::{Space, button, column, container, image, mouse_area, row, stack, text};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Subscription, Task};
 use iced_layershell::to_layer_message;
 use nordlys_config::{Config, Palette};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 pub const RAIL: f32 = 76.0;
 /// Space the rail reserves at the screen edge: rail plus its margin.
@@ -30,22 +35,42 @@ pub struct Shelf {
     windows: Vec<ShelfWindow>,
     hover: Option<usize>,
     preview: bool,
+    reads: system::Reads,
+    /// The screen this shelf is on, when it was given one.
+    screen: Option<String>,
+    /// The hovered window's picture: its id, the file's age, the pixels.
+    picture: Option<(String, SystemTime, image::Handle)>,
+}
+
+/// What reading a preview file found.
+#[derive(Debug, Clone)]
+pub enum Picture {
+    New(SystemTime, image::Handle),
+    Unchanged,
+    Missing,
 }
 
 #[to_layer_message]
 #[derive(Debug, Clone)]
 pub enum Message {
-    Tick,
+    /// The compositor reported a change (or the slow fallback timer fired).
+    Changed,
+    Windows(Option<Vec<ShelfWindow>>),
+    /// nordlys.toml was saved.
+    Config(Config),
     Hover(usize),
     Unhover,
     Pick(usize),
     Close(usize),
+    /// Time to re-read the hovered window's picture.
+    Look,
+    Picture(String, Picture),
 }
 
 impl Shelf {
-    pub fn new(config: &Config, preview: bool) -> Self {
+    pub fn new(config: &Config, preview: bool, screen: Option<String>) -> Self {
         let compositor = Compositor::detect();
-        let windows = compositor.shelf();
+        let windows = compositor.shelf(screen.as_deref());
         Self {
             palette: config.palette(),
             compositor,
@@ -53,7 +78,41 @@ impl Shelf {
             hover: (preview && !windows.is_empty()).then_some(0),
             windows,
             preview,
+            reads: system::Reads::default(),
+            screen,
+            picture: None,
         }
+    }
+
+    /// Read the hovered window's picture, unless the file hasn't changed.
+    fn look(&self) -> Task<Message> {
+        let Some(w) = self.hover.and_then(|i| self.windows.get(i)) else {
+            return Task::none();
+        };
+        let Some(path) = w.preview.clone() else {
+            return Task::none();
+        };
+        let seen = self
+            .picture
+            .as_ref()
+            .filter(|(id, ..)| *id == w.id)
+            .map(|(_, t, _)| *t);
+        let id = w.id.clone();
+        Task::perform(
+            system::background(move || read_picture(&path, seen)),
+            move |p| Message::Picture(id.clone(), p.unwrap_or(Picture::Missing)),
+        )
+    }
+
+    fn refresh(&mut self) -> Task<Message> {
+        if !self.reads.start() {
+            return Task::none();
+        }
+        let (c, screen) = (self.compositor.clone(), self.screen.clone());
+        Task::perform(
+            system::background(move || c.shelf(screen.as_deref())),
+            Message::Windows,
+        )
     }
 
     /// The layer surface widens while a flyout is open, and shrinks back after.
@@ -71,20 +130,42 @@ impl Shelf {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => {
-                self.windows = self.compositor.shelf();
+            Message::Changed => return self.refresh(),
+            Message::Config(c) => self.palette = c.palette(),
+            Message::Windows(windows) => {
+                let again = self.reads.done();
+                if let Some(w) = windows {
+                    self.windows = w;
+                }
+                let mut tasks = vec![];
                 if self.hover.is_some_and(|i| i >= self.windows.len()) {
                     self.hover = None;
-                    return self.resize();
+                    tasks.push(self.resize());
                 }
+                if again {
+                    tasks.push(self.refresh());
+                }
+                return Task::batch(tasks);
             }
             Message::Hover(i) => {
                 let was = self.hover.is_some();
                 self.hover = Some(i);
+                let look = self.look();
                 if !was {
-                    return self.resize();
+                    return Task::batch([self.resize(), look]);
                 }
+                return look;
             }
+            Message::Look => return self.look(),
+            Message::Picture(id, p) => match p {
+                Picture::New(t, h) => self.picture = Some((id, t, h)),
+                Picture::Missing => {
+                    if self.picture.as_ref().is_some_and(|(seen, ..)| *seen == id) {
+                        self.picture = None;
+                    }
+                }
+                Picture::Unchanged => {}
+            },
             Message::Unhover => {
                 self.hover = None;
                 return self.resize();
@@ -105,8 +186,7 @@ impl Shelf {
                     self.compositor.bring(w);
                 }
                 self.hover = None;
-                self.windows = self.compositor.shelf();
-                return self.resize();
+                return Task::batch([self.resize(), self.refresh()]);
             }
             _ => {}
         }
@@ -114,7 +194,17 @@ impl Shelf {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(750)).map(|_| Message::Tick)
+        Subscription::batch([
+            events::changes(&self.compositor).map(|_| Message::Changed),
+            events::config_changes().map(Message::Config),
+            // In case an event is ever missed.
+            iced::time::every(Duration::from_secs(15)).map(|_| Message::Changed),
+            if self.hover.is_some() && matches!(self.compositor, Compositor::Nordlys(_)) {
+                iced::time::every(Duration::from_millis(250)).map(|_| Message::Look)
+            } else {
+                Subscription::none()
+            },
+        ])
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -149,7 +239,12 @@ impl Shelf {
 
         let mut layout = row![rail].spacing(12);
         if let Some(w) = self.hover.and_then(|i| self.windows.get(i).map(|w| (i, w))) {
-            layout = layout.push(flyout(w.0, w.1, r));
+            let picture = self
+                .picture
+                .as_ref()
+                .filter(|(id, ..)| *id == w.1.id)
+                .map(|(.., h)| h.clone());
+            layout = layout.push(flyout(w.0, w.1, picture, r));
         }
         let page = container(layout)
             .padding(iced::Padding {
@@ -280,9 +375,25 @@ fn close_badge(i: usize, r: Rail) -> Element<'static, Message> {
     .into()
 }
 
-fn flyout(i: usize, w: &ShelfWindow, r: Rail) -> Element<'static, Message> {
+fn flyout(
+    i: usize,
+    w: &ShelfWindow,
+    picture: Option<image::Handle>,
+    r: Rail,
+) -> Element<'static, Message> {
     // Line the flyout up with its tile: rail padding, header, then one tile pitch per slot.
     let top = 12.0 + 12.0 + GAP + i as f32 * (TILE + 6.0 + GAP) - 4.0;
+    let shot = picture.map(|h| {
+        container(
+            image(h)
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .content_fit(ContentFit::Contain),
+        )
+        .width(Length::Fill)
+        .max_height(FLYOUT * 0.75)
+        .align_x(Horizontal::Center)
+    });
     let card = container(
         column![
             row![
@@ -312,10 +423,51 @@ fn flyout(i: usize, w: &ShelfWindow, r: Rail) -> Element<'static, Message> {
                 .size(11)
                 .color(r.dim),
         ]
+        .push(shot)
         .spacing(8),
     )
     .width(FLYOUT)
     .padding([12, 14])
     .style(r.panel_style());
     column![Space::new().height(top.max(0.0)), card].into()
+}
+
+/// The picture at `path` as pixels, if it changed since `seen`.
+fn read_picture(path: &PathBuf, seen: Option<SystemTime>) -> Picture {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return Picture::Missing;
+    };
+    if seen == Some(modified) {
+        return Picture::Unchanged;
+    }
+    match std::fs::read(path)
+        .ok()
+        .and_then(|b| nordlys_ipc::decode_preview(&b))
+    {
+        Some((w, h, px)) => Picture::New(modified, image::Handle::from_rgba(w, h, px)),
+        None => Picture::Missing,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pictures_are_read_once_until_the_file_changes() {
+        let dir = std::env::temp_dir().join(format!("nordlys-shelf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("term.rgba");
+        assert!(matches!(read_picture(&path, None), Picture::Missing));
+
+        std::fs::write(&path, nordlys_ipc::encode_preview(2, 1, &[9; 8])).unwrap();
+        let Picture::New(t, _) = read_picture(&path, None) else {
+            panic!("a fresh picture should be read");
+        };
+        assert!(matches!(read_picture(&path, Some(t)), Picture::Unchanged));
+
+        std::fs::write(&path, b"junk").unwrap();
+        assert!(matches!(read_picture(&path, None), Picture::Missing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

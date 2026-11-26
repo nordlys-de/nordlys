@@ -50,6 +50,8 @@ pub struct Toasts {
 pub enum Message {
     Bus(Event),
     Tick,
+    /// nordlys.toml was saved.
+    Config(nordlys_config::Config),
     Hover(u32),
     Unhover(u32),
     Dismiss(u32),
@@ -137,6 +139,10 @@ impl Toasts {
                 self.sync()
             }
             Message::Bus(Event::Changed) => self.sync(),
+            Message::Config(c) => {
+                self.palette = c.palette();
+                Task::none()
+            }
             Message::Bus(Event::Failed(e)) => {
                 eprintln!("nordlys-shell notify: {e}");
                 if self.preview {
@@ -201,11 +207,13 @@ impl Toasts {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let bus = Subscription::run(server::serve).map(Message::Bus);
+        let config = crate::events::config_changes().map(Message::Config);
         if self.shown.is_empty() {
-            bus
+            Subscription::batch([bus, config])
         } else {
             Subscription::batch([
                 bus,
+                config,
                 iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
             ])
         }

@@ -1,0 +1,21 @@
+[package]
+name = "nordlys-settings"
+description = "Settings for the Nordlys desktop and the system under it (iced)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+futures = "0.3"
+iced = { version = "0.14", features = ["tokio", "svg"] }
+nordlys-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml_edit = "0.25"
+# Same major as nordlys-shell, for the notification daemon's control interface.
+zbus = "5"
+
+[lints]
+workspace = true

@@ -1,17 +1,96 @@
-//! Quick settings and media, through the standard command-line tools:
-//! playerctl (MPRIS), wpctl (PipeWire), nmcli (NetworkManager),
-//! bluetoothctl (BlueZ) and dunstctl (notifications).
-//!
-//! Shelling out keeps this simple and works on any distro that has the
-//! tools. Talking to D-Bus directly is the later, lighter replacement.
+//! Quick settings and media. Media, Wi-Fi and Bluetooth go over D-Bus
+//! (`crate::dbus`); when a service can't be reached there, and for volume
+//! (PipeWire has no simple D-Bus interface), the standard command-line
+//! tools step in: playerctl, nmcli, bluetoothctl, wpctl and dunstctl.
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long any tool may take. These run on the UI thread, and some never
-/// return: `bluetoothctl` waits forever when bluetoothd isn't running.
+/// How long any tool may take. Some never return: `bluetoothctl` waits
+/// forever when bluetoothd isn't running.
 const PATIENCE: Duration = Duration::from_millis(800);
+
+/// Run blocking work (these tools, D-Bus calls) on a thread of its own, so
+/// the UI never waits on it. None only if the work panicked.
+pub async fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.await.ok()
+}
+
+/// One background read at a time: asks that arrive while a read is under
+/// way are folded into a single read once it lands.
+#[derive(Debug, Default)]
+pub struct Reads {
+    busy: bool,
+    again: bool,
+}
+
+impl Reads {
+    /// True if a read should start now.
+    pub fn start(&mut self) -> bool {
+        if self.busy {
+            self.again = true;
+            false
+        } else {
+            self.busy = true;
+            true
+        }
+    }
+
+    /// A read landed. True if another one was asked for meanwhile.
+    pub fn done(&mut self) -> bool {
+        self.busy = false;
+        std::mem::take(&mut self.again)
+    }
+
+    /// Ask for a fresh read after the current one, if one is running.
+    pub fn invalidate(&mut self) {
+        self.again |= self.busy;
+    }
+}
+
+/// Everything the ambient rail shows, read in one go.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Snapshot {
+    pub playing: Option<NowPlaying>,
+    pub notices: Option<Notices>,
+    /// Only read while the panel is open.
+    pub controls: Option<Controls>,
+}
+
+/// The quick settings in the ambient panel.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Controls {
+    pub volume: Option<Volume>,
+    pub wifi: Option<bool>,
+    pub bluetooth: Option<bool>,
+}
+
+impl Snapshot {
+    /// Ask every tool at once, so the whole read takes as long as the
+    /// slowest tool rather than the sum of them. Blocking: call it through
+    /// [`background`].
+    pub fn read(controls: bool) -> Self {
+        std::thread::scope(|s| {
+            let playing = s.spawn(now_playing);
+            let notices = s.spawn(notices);
+            let controls = controls.then(|| (s.spawn(volume), s.spawn(wifi), s.spawn(bluetooth)));
+            Snapshot {
+                playing: playing.join().ok().flatten(),
+                notices: notices.join().ok().flatten(),
+                controls: controls.map(|(v, w, b)| Controls {
+                    volume: v.join().ok().flatten(),
+                    wifi: w.join().ok().flatten(),
+                    bluetooth: b.join().ok().flatten(),
+                }),
+            }
+        })
+    }
+}
 
 /// Wait for `child`, killing it once `limit` has passed.
 fn wait_within(mut child: Child, limit: Duration) -> Option<(ExitStatus, Child)> {
@@ -69,6 +148,9 @@ pub struct NowPlaying {
 }
 
 pub fn now_playing() -> Option<NowPlaying> {
+    if let Some(answer) = crate::dbus::now_playing() {
+        return answer;
+    }
     let status = run("playerctl", &["status"])?;
     let meta = run(
         "playerctl",
@@ -95,10 +177,16 @@ fn parse_now_playing(status: &str, meta: &str) -> Option<NowPlaying> {
 }
 
 pub fn play_pause() {
+    if crate::dbus::player_call("PlayPause").is_some() {
+        return;
+    }
     fire("playerctl", &["play-pause"]);
 }
 
 pub fn next_track() {
+    if crate::dbus::player_call("Next").is_some() {
+        return;
+    }
     fire("playerctl", &["next"]);
 }
 
@@ -133,14 +221,20 @@ pub fn toggle_mute() {
 
 /// None when NetworkManager isn't there.
 pub fn wifi() -> Option<bool> {
-    run("nmcli", &["radio", "wifi"]).map(|s| s == "enabled")
+    crate::dbus::wifi().or_else(|| run("nmcli", &["radio", "wifi"]).map(|s| s == "enabled"))
 }
 
 pub fn set_wifi(on: bool) {
+    if crate::dbus::set_wifi(on).is_some() {
+        return;
+    }
     fire("nmcli", &["radio", "wifi", if on { "on" } else { "off" }]);
 }
 
 pub fn bluetooth() -> Option<bool> {
+    if let Some(answer) = crate::dbus::bluetooth() {
+        return answer;
+    }
     // No adapter (most VMs): don't even ask.
     let adapters = std::fs::read_dir("/sys/class/bluetooth").ok()?;
     adapters.flatten().next()?;
@@ -154,6 +248,9 @@ fn parse_bluetooth(show: &str) -> Option<bool> {
 }
 
 pub fn set_bluetooth(on: bool) {
+    if crate::dbus::set_bluetooth(on).is_some() {
+        return;
+    }
     fire("bluetoothctl", &["power", if on { "on" } else { "off" }]);
 }
 
@@ -298,6 +395,17 @@ mod tests {
             parse_now_playing("Playing", "").unwrap().title,
             "Unknown track"
         );
+    }
+
+    #[test]
+    fn reads_fold_together() {
+        let mut r = Reads::default();
+        assert!(r.start());
+        assert!(!r.start());
+        assert!(!r.start());
+        assert!(r.done(), "one more read for the asks that came meanwhile");
+        assert!(r.start());
+        assert!(!r.done());
     }
 
     #[test]

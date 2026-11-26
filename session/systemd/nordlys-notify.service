@@ -1,0 +1,16 @@
+# The notification daemon. Only one can own the name, so the usual
+# alternatives are stopped while Nordlys runs. Not Type=dbus: dunst and
+# swaync units already claim the bus name, and systemd allows one claim.
+[Unit]
+Description=Nordlys notifications
+Documentation=https://github.com/nordlys-de/nordlys
+PartOf=nordlys-session.target
+After=graphical-session.target
+Conflicts=dunst.service mako.service swaync.service
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+ExecStart=@BINDIR@/nordlys-shell notify
+Restart=on-failure
+RestartSec=1

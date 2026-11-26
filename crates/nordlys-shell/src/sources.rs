@@ -61,23 +61,51 @@ impl Compositor {
         }
     }
 
-    pub fn desk(&self) -> Desk {
+    /// Workspaces and the stage, as `screen` sees them (its own active
+    /// workspace), or as the focused screen does.
+    pub fn desk(&self, screen: Option<&str>) -> Desk {
         match self {
             Compositor::Nordlys(p) => nordlys_desk(p).unwrap_or_else(demo_desk),
-            Compositor::Hyprland(p) => hypr_desk(p).unwrap_or_default(),
+            Compositor::Hyprland(p) => hypr_desk(p, screen).unwrap_or_default(),
             Compositor::Demo => demo_desk(),
         }
     }
 
+    /// The screens' names, e.g. ["DP-1", "eDP-1"]. Hyprland only.
+    pub fn screens(&self) -> Option<Vec<String>> {
+        let Compositor::Hyprland(p) = self else {
+            return None;
+        };
+        let monitors: Value = serde_json::from_str(&hypr_request(p, "j/monitors")?).ok()?;
+        Some(screen_names(&monitors))
+    }
+
     pub fn switch_to(&self, ws: &Workspace) {
-        if let Compositor::Hyprland(p) = self {
-            hypr_dispatch(
+        match self {
+            Compositor::Hyprland(p) => hypr_dispatch(
                 p,
                 &format!("hl.dsp.focus({{ workspace = {} }})", ws.id),
                 &format!("workspace {}", ws.id),
+            ),
+            Compositor::Nordlys(p) => {
+                if let Ok(n) = u32::try_from(ws.id) {
+                    nordlys_send(p, &nordlys_ipc::Request::Workspace { n });
+                }
+            }
+            Compositor::Demo => {}
+        }
+    }
+
+    /// Go to the first empty workspace (Hyprland only; nordlys-comp places
+    /// app groups itself).
+    pub fn go_to_empty_workspace(&self) {
+        if let Compositor::Hyprland(p) = self {
+            hypr_dispatch(
+                p,
+                "hl.dsp.focus({ workspace = \"empty\" })",
+                "workspace empty",
             );
         }
-        // nordlys-comp has one headless stage for now: no workspaces yet.
     }
 
     /// Windows waiting on this workspace's shelf, most recent first.
@@ -85,7 +113,7 @@ impl Compositor {
     /// On nordlys-comp this is the real shelf. On Hyprland it's the
     /// closest match: this workspace's windows in focus order, minus the
     /// focused one.
-    pub fn shelf(&self) -> Vec<ShelfWindow> {
+    pub fn shelf(&self, screen: Option<&str>) -> Vec<ShelfWindow> {
         match self {
             Compositor::Nordlys(p) => nordlys_state(p)
                 .map(|s| {
@@ -94,39 +122,46 @@ impl Compositor {
                         .map(|id| ShelfWindow {
                             app: pretty_app(&id),
                             title: id.clone(),
+                            preview: Some(nordlys_ipc::preview_path(
+                                &nordlys_ipc::preview_dir(p),
+                                &id,
+                            )),
                             id,
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
-            Compositor::Hyprland(p) => hypr_shelf(p).unwrap_or_default(),
+            Compositor::Hyprland(p) => hypr_shelf(p, screen).unwrap_or_default(),
             Compositor::Demo => demo_shelf(),
         }
     }
 
-    /// The focused window and the pointer, both relative to the window's
-    /// screen. None on a fullscreen or empty screen, or off Hyprland.
-    pub fn active_frame(&self) -> Option<(Frame, (i32, i32))> {
+    /// The focused window, measured on its own screen. None on a
+    /// fullscreen or empty screen, or off Hyprland.
+    pub fn active_window(&self) -> Option<Active> {
         let Compositor::Hyprland(p) = self else {
             return None;
         };
         let json =
             |cmd: &str| -> Option<Value> { serde_json::from_str(&hypr_request(p, cmd)?).ok() };
-        parse_frame(
-            &json("j/activewindow")?,
-            &json("j/monitors")?,
-            &json("j/cursorpos")?,
-        )
+        parse_active(&json("j/activewindow")?, &json("j/monitors")?)
+    }
+
+    /// The pointer, in global coordinates. Hyprland only.
+    pub fn pointer(&self) -> Option<(i32, i32)> {
+        let Compositor::Hyprland(p) = self else {
+            return None;
+        };
+        let cursor: Value = serde_json::from_str(&hypr_request(p, "j/cursorpos")?).ok()?;
+        let int = |k| cursor.get(k).and_then(Value::as_i64).map(|n| n as i32);
+        Some((int("x")?, int("y")?))
     }
 
     /// Ask a window to close.
     pub fn close(&self, id: &str) {
         match self {
             Compositor::Nordlys(p) => {
-                let req = nordlys_ipc::Request::Close { id: id.to_owned() };
-                if let Ok(mut s) = UnixStream::connect(p) {
-                    let _ = s.write_all(nordlys_ipc::to_line(&req).as_bytes());
-                }
+                nordlys_send(p, &nordlys_ipc::Request::Close { id: id.to_owned() })
             }
             Compositor::Hyprland(p) => hypr_dispatch(
                 p,
@@ -141,10 +176,7 @@ impl Compositor {
     pub fn bring(&self, w: &ShelfWindow) {
         match self {
             Compositor::Nordlys(p) => {
-                let req = nordlys_ipc::Request::Bring { id: w.id.clone() };
-                if let Ok(mut s) = UnixStream::connect(p) {
-                    let _ = s.write_all(nordlys_ipc::to_line(&req).as_bytes());
-                }
+                nordlys_send(p, &nordlys_ipc::Request::Bring { id: w.id.clone() })
             }
             Compositor::Hyprland(p) => {
                 hypr_dispatch(
@@ -168,7 +200,27 @@ pub struct Frame {
     pub height: i32,
 }
 
-fn parse_frame(window: &Value, monitors: &Value, cursor: &Value) -> Option<(Frame, (i32, i32))> {
+/// The focused window and where its screen starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Active {
+    /// Relative to its screen.
+    pub frame: Frame,
+    /// The screen's top-left corner, in global coordinates.
+    pub origin: (i32, i32),
+    /// Floating windows move without telling anyone, so they're re-read.
+    pub floating: bool,
+    /// The screen's name, e.g. "DP-1".
+    pub screen: String,
+}
+
+impl Active {
+    /// A global pointer position, relative to this window's screen.
+    pub fn local(&self, (x, y): (i32, i32)) -> (i32, i32) {
+        (x - self.origin.0, y - self.origin.1)
+    }
+}
+
+fn parse_active(window: &Value, monitors: &Value) -> Option<Active> {
     let int = |v: Option<&Value>| v.and_then(Value::as_i64).map(|n| n as i32);
     // `fullscreen` is a number (0 = no) or, on older Hyprland, a bool.
     let fullscreen = window.get("fullscreen");
@@ -181,15 +233,22 @@ fn parse_frame(window: &Value, monitors: &Value, cursor: &Value) -> Option<(Fram
         .iter()
         .find(|m| m.get("id").and_then(Value::as_i64) == Some(monitor))?;
     let (sx, sy) = (int(screen.get("x"))?, int(screen.get("y"))?);
-    let frame = Frame {
-        id: window.get("address")?.as_str()?.to_owned(),
-        x: int(window.pointer("/at/0"))? - sx,
-        y: int(window.pointer("/at/1"))? - sy,
-        width: int(window.pointer("/size/0"))?,
-        height: int(window.pointer("/size/1"))?,
-    };
-    let pointer = (int(cursor.get("x"))? - sx, int(cursor.get("y"))? - sy);
-    Some((frame, pointer))
+    Some(Active {
+        frame: Frame {
+            id: window.get("address")?.as_str()?.to_owned(),
+            x: int(window.pointer("/at/0"))? - sx,
+            y: int(window.pointer("/at/1"))? - sy,
+            width: int(window.pointer("/size/0"))?,
+            height: int(window.pointer("/size/1"))?,
+        },
+        origin: (sx, sy),
+        floating: window.get("floating").and_then(Value::as_bool) == Some(true),
+        screen: screen
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +257,9 @@ pub struct ShelfWindow {
     pub id: String,
     pub app: String,
     pub title: String,
+    /// Where nordlys-comp keeps its live picture (see
+    /// [`nordlys_ipc::preview_path`]); none elsewhere.
+    pub preview: Option<PathBuf>,
 }
 
 fn demo_shelf() -> Vec<ShelfWindow> {
@@ -205,6 +267,7 @@ fn demo_shelf() -> Vec<ShelfWindow> {
         id: id.into(),
         app: app.into(),
         title: title.into(),
+        preview: None,
     };
     vec![
         w("term", "Terminal", "zsh · ~/code/nordlys"),
@@ -213,13 +276,45 @@ fn demo_shelf() -> Vec<ShelfWindow> {
     ]
 }
 
-fn hypr_shelf(sock: &Path) -> Option<Vec<ShelfWindow>> {
+fn hypr_shelf(sock: &Path, screen: Option<&str>) -> Option<Vec<ShelfWindow>> {
     let clients: Value = serde_json::from_str(&hypr_request(sock, "j/clients")?).ok()?;
-    let active: Value = serde_json::from_str(&hypr_request(sock, "j/activeworkspace")?).ok()?;
     Some(parse_hypr_shelf(
         &clients,
-        active.get("id").and_then(Value::as_i64)?,
+        hypr_active_workspace(sock, screen)?,
     ))
+}
+
+/// The workspace on show: on `screen`, or on the focused screen.
+fn hypr_active_workspace(sock: &Path, screen: Option<&str>) -> Option<i64> {
+    match screen {
+        Some(name) => {
+            let monitors: Value = serde_json::from_str(&hypr_request(sock, "j/monitors")?).ok()?;
+            workspace_on(&monitors, name)
+        }
+        None => {
+            let active: Value =
+                serde_json::from_str(&hypr_request(sock, "j/activeworkspace")?).ok()?;
+            active.get("id").and_then(Value::as_i64)
+        }
+    }
+}
+
+fn workspace_on(monitors: &Value, screen: &str) -> Option<i64> {
+    monitors
+        .as_array()?
+        .iter()
+        .find(|m| m.get("name").and_then(Value::as_str) == Some(screen))?
+        .pointer("/activeWorkspace/id")?
+        .as_i64()
+}
+
+fn screen_names(monitors: &Value) -> Vec<String> {
+    monitors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("name")?.as_str().map(str::to_owned))
+        .collect()
 }
 
 fn parse_hypr_shelf(clients: &Value, workspace: i64) -> Vec<ShelfWindow> {
@@ -250,6 +345,7 @@ fn parse_hypr_shelf(clients: &Value, workspace: i64) -> Vec<ShelfWindow> {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    preview: None,
                 },
             ))
         })
@@ -264,14 +360,12 @@ fn nordlys_state(sock: &Path) -> Option<nordlys_ipc::StageState> {
     s.set_read_timeout(Some(Duration::from_millis(300))).ok()?;
     s.write_all(nordlys_ipc::to_line(&Request::State).as_bytes())
         .ok()?;
-    let mut buf = String::new();
-    let mut byte = [0u8; 1];
-    while s.read(&mut byte).ok()? == 1 && byte[0] != b'\n' {
-        buf.push(byte[0] as char);
-    }
-    match nordlys_ipc::from_line(&buf).ok()? {
+    // Read just the one line: window names can be any UTF-8.
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).ok()?;
+    match nordlys_ipc::from_line(&line).ok()? {
         Response::Ok { state } => Some(state),
-        Response::Error { .. } => None,
+        _ => None,
     }
 }
 
@@ -293,13 +387,43 @@ fn demo_desk() -> Desk {
 }
 
 fn nordlys_desk(sock: &Path) -> Option<Desk> {
-    let state = nordlys_state(sock)?;
-    let mut d = demo_desk();
-    d.stage = match (state.main, state.side) {
-        (Some(m), Some(s)) => Some(format!("{m} + {s}")),
-        (m, _) => m,
-    };
-    Some(d)
+    Some(desk_from_stage(nordlys_state(sock)?))
+}
+
+fn desk_from_stage(state: nordlys_ipc::StageState) -> Desk {
+    let mut workspaces: Vec<Workspace> = state
+        .workspaces
+        .iter()
+        .map(|w| Workspace {
+            id: w.n.into(),
+            name: w.n.to_string(),
+            active: w.n == state.workspace,
+            windows: w.windows,
+        })
+        .collect();
+    // An older nordlys-comp doesn't list workspaces.
+    if workspaces.is_empty() {
+        workspaces.push(Workspace {
+            id: state.workspace.into(),
+            name: state.workspace.to_string(),
+            active: true,
+            windows: u32::from(state.main.is_some()) + state.shelf.len() as u32,
+        });
+    }
+    Desk {
+        workspaces,
+        stage: match (state.main, state.side) {
+            (Some(m), Some(s)) => Some(format!("{} + {}", pretty_app(&m), pretty_app(&s))),
+            (m, _) => m.as_deref().map(pretty_app),
+        },
+    }
+}
+
+/// Send one request to nordlys-comp and forget the answer.
+fn nordlys_send(sock: &Path, req: &nordlys_ipc::Request) {
+    if let Ok(mut s) = UnixStream::connect(sock) {
+        let _ = s.write_all(nordlys_ipc::to_line(req).as_bytes());
+    }
 }
 
 /// One request on Hyprland's request socket. It answers and hangs up.
@@ -322,17 +446,16 @@ fn hypr_dispatch(sock: &Path, lua: &str, classic: &str) {
     }
 }
 
-fn hypr_desk(sock: &Path) -> Option<Desk> {
+fn hypr_desk(sock: &Path, screen: Option<&str>) -> Option<Desk> {
     let workspaces: Value = serde_json::from_str(&hypr_request(sock, "j/workspaces")?).ok()?;
-    let active: Value = serde_json::from_str(&hypr_request(sock, "j/activeworkspace")?).ok()?;
+    let active = hypr_active_workspace(sock, screen);
     let window: Value = hypr_request(sock, "j/activewindow")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(Value::Null);
-    Some(parse_hypr(&workspaces, &active, &window))
+    Some(parse_hypr(&workspaces, active, &window))
 }
 
-fn parse_hypr(workspaces: &Value, active: &Value, window: &Value) -> Desk {
-    let active_id = active.get("id").and_then(Value::as_i64);
+fn parse_hypr(workspaces: &Value, active_id: Option<i64>, window: &Value) -> Desk {
     let mut list: Vec<Workspace> = workspaces
         .as_array()
         .into_iter()
@@ -368,6 +491,8 @@ fn parse_hypr(workspaces: &Value, active: &Value, window: &Value) -> Desk {
 
 /// "org.gnome.Nautilus" → "Nautilus", "firefox" → "Firefox".
 fn pretty_app(class: &str) -> String {
+    // nordlys-comp numbers a second window of an app: "foot#2".
+    let class = class.split('#').next().unwrap_or(class);
     let last = class.rsplit('.').next().unwrap_or(class);
     let mut c = last.chars();
     match c.next() {
@@ -422,15 +547,16 @@ mod tests {
         let window = json!({"address": "0xab", "monitor": 1, "fullscreen": 0,
                             "at": [2020, 62], "size": [800, 600]});
         let monitors = json!([{"id": 0, "x": 0, "y": 0}, {"id": 1, "x": 1920, "y": 0}]);
-        let cursor = json!({"x": 2700, "y": 80});
-        let (f, pointer) = parse_frame(&window, &monitors, &cursor).unwrap();
+        let a = parse_active(&window, &monitors).unwrap();
+        let f = &a.frame;
         assert_eq!((f.x, f.y, f.width, f.height), (100, 62, 800, 600));
-        assert_eq!(pointer, (780, 80));
+        assert_eq!(a.local((2700, 80)), (780, 80));
+        assert!(!a.floating);
         // Nothing focused, or fullscreen: no button.
-        assert!(parse_frame(&json!({}), &monitors, &cursor).is_none());
+        assert!(parse_active(&json!({}), &monitors).is_none());
         let full = json!({"address": "0xab", "monitor": 1, "fullscreen": 2,
                           "at": [1920, 0], "size": [800, 600]});
-        assert!(parse_frame(&full, &monitors, &cursor).is_none());
+        assert!(parse_active(&full, &monitors).is_none());
     }
 
     #[test]
@@ -440,11 +566,7 @@ mod tests {
             {"id": 1, "name": "1", "windows": 4},
             {"id": -98, "name": "special:scratch", "windows": 2}
         ]);
-        let d = parse_hypr(
-            &ws,
-            &json!({"id": 1}),
-            &json!({"class": "org.gnome.Nautilus"}),
-        );
+        let d = parse_hypr(&ws, Some(1), &json!({"class": "org.gnome.Nautilus"}));
         assert_eq!(
             d.workspaces.iter().map(|w| w.id).collect::<Vec<_>>(),
             [1, 3]
@@ -454,8 +576,37 @@ mod tests {
     }
 
     #[test]
+    fn nordlys_state_becomes_workspaces() {
+        use nordlys_ipc::{StageState, WorkspaceState};
+        let d = desk_from_stage(StageState {
+            main: Some("helix".into()),
+            side: Some("foot#2".into()),
+            shelf: vec![],
+            workspace: 2,
+            workspaces: vec![
+                WorkspaceState { n: 1, windows: 3 },
+                WorkspaceState { n: 2, windows: 2 },
+            ],
+        });
+        assert_eq!(d.workspaces.len(), 2);
+        assert!(d.workspaces[1].active && !d.workspaces[0].active);
+        assert_eq!(d.stage.as_deref(), Some("Helix + Foot"));
+    }
+
+    #[test]
+    fn each_screen_has_its_own_workspace() {
+        let monitors = json!([
+            {"id": 0, "name": "eDP-1", "activeWorkspace": {"id": 1, "name": "1"}},
+            {"id": 1, "name": "DP-2", "activeWorkspace": {"id": 4, "name": "4"}}
+        ]);
+        assert_eq!(screen_names(&monitors), ["eDP-1", "DP-2"]);
+        assert_eq!(workspace_on(&monitors, "DP-2"), Some(4));
+        assert_eq!(workspace_on(&monitors, "HDMI-A-1"), None);
+    }
+
+    #[test]
     fn empty_desktop_has_no_stage_title() {
-        let d = parse_hypr(&json!([]), &json!({"id": 1}), &json!({}));
+        let d = parse_hypr(&json!([]), Some(1), &json!({}));
         assert_eq!(d.stage, None);
     }
 

@@ -5,10 +5,12 @@
 //! of the shelf. Ambient windows (chat, music) live on their own rail, so
 //! they leave the stage without joining the shelf.
 //!
+//! A [`Desk`] holds one stage per workspace.
+//!
 //! This crate is pure logic with no Wayland types, so the compositor, the
 //! headless test server and the unit tests all share exactly one copy of it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::Hash;
 
 /// Where a window waits while it is off the stage.
@@ -197,6 +199,137 @@ impl<W: Clone + Eq + Hash> Stage<W> {
     }
 }
 
+/// One stage per workspace, numbered from 1. A window lives on exactly one
+/// workspace; the stage commands act on the active one.
+#[derive(Debug, Clone)]
+pub struct Desk<W> {
+    stages: BTreeMap<u32, Stage<W>>,
+    active: u32,
+    places: HashMap<W, u32>,
+}
+
+impl<W: Clone + Eq + Hash> Default for Desk<W> {
+    fn default() -> Self {
+        Self {
+            stages: BTreeMap::from([(1, Stage::default())]),
+            active: 1,
+            places: HashMap::new(),
+        }
+    }
+}
+
+impl<W: Clone + Eq + Hash> Desk<W> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn active(&self) -> u32 {
+        self.active
+    }
+
+    /// The active workspace's stage.
+    pub fn stage(&self) -> &Stage<W> {
+        &self.stages[&self.active]
+    }
+
+    pub fn stage_mut(&mut self) -> &mut Stage<W> {
+        self.stages.entry(self.active).or_default()
+    }
+
+    /// Workspaces with windows, plus the active one, in order.
+    pub fn workspaces(&self) -> impl Iterator<Item = (u32, &Stage<W>)> {
+        self.stages.iter().map(|(n, s)| (*n, s))
+    }
+
+    pub fn contains(&self, w: &W) -> bool {
+        self.places.contains_key(w)
+    }
+
+    pub fn workspace_of(&self, w: &W) -> Option<u32> {
+        self.places.get(w).copied()
+    }
+
+    /// Go to workspace `n`. False for 0.
+    pub fn switch(&mut self, n: u32) -> bool {
+        if n == 0 {
+            return false;
+        }
+        self.active = n;
+        self.stages.entry(n).or_default();
+        self.tidy();
+        true
+    }
+
+    /// A window was mapped on the active workspace.
+    pub fn open(&mut self, w: W, home: Home) {
+        if let Some(old) = self.places.get(&w).copied()
+            && old != self.active
+            && let Some(s) = self.stages.get_mut(&old)
+        {
+            s.close(&w);
+        }
+        self.places.insert(w.clone(), self.active);
+        self.stage_mut().open(w, home);
+        self.tidy();
+    }
+
+    /// A window went away, from whichever workspace it was on.
+    pub fn close(&mut self, w: &W) -> bool {
+        let Some(n) = self.places.remove(w) else {
+            return false;
+        };
+        let closed = self.stages.get_mut(&n).is_some_and(|s| s.close(w));
+        self.tidy();
+        closed
+    }
+
+    /// Put `w` on stage, switching to its workspace first.
+    pub fn bring(&mut self, w: &W) -> bool {
+        match self.places.get(w).copied() {
+            Some(n) => {
+                self.switch(n);
+                self.stage_mut().bring(w)
+            }
+            None => false,
+        }
+    }
+
+    /// Send `w` to workspace `n`, where it takes the stage. The active
+    /// workspace stays where it is.
+    pub fn move_to(&mut self, w: &W, n: u32) -> bool {
+        let Some(from) = self.places.get(w).copied() else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+        if from == n {
+            return true;
+        }
+        let home = self
+            .stages
+            .get(&from)
+            .and_then(|s| s.home(w))
+            .unwrap_or(Home::Shelf);
+        if let Some(s) = self.stages.get_mut(&from) {
+            s.close(w);
+        }
+        self.stages.entry(n).or_default().open(w.clone(), home);
+        self.places.insert(w.clone(), n);
+        self.tidy();
+        true
+    }
+
+    /// Forget empty workspaces other than the active one. A workspace
+    /// whose only window is an ambient one off the stage isn't empty: it
+    /// keeps that window, so it can be brought back.
+    fn tidy(&mut self) {
+        let active = self.active;
+        self.stages
+            .retain(|n, s| *n == active || !s.homes.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +445,70 @@ mod tests {
         assert_eq!(s.main(), Some(&"term"));
         assert!(!s.close(&"helix"));
         assert!(!s.bring(&"helix"));
+    }
+
+    #[test]
+    fn each_workspace_has_its_own_stage() {
+        let mut d = Desk::new();
+        d.open("helix", Home::Shelf);
+        d.open("foot", Home::Shelf);
+        assert!(d.switch(2));
+        assert_eq!(d.stage().main(), None);
+        d.open("firefox", Home::Shelf);
+        assert_eq!(d.stage().main(), Some(&"firefox"));
+        assert_eq!(d.workspace_of(&"helix"), Some(1));
+        let seen: Vec<u32> = d.workspaces().map(|(n, _)| n).collect();
+        assert_eq!(seen, [1, 2]);
+    }
+
+    #[test]
+    fn bring_follows_the_window_to_its_workspace() {
+        let mut d = Desk::new();
+        d.open("helix", Home::Shelf);
+        d.open("foot", Home::Shelf);
+        d.switch(3);
+        assert!(d.bring(&"helix"));
+        assert_eq!(d.active(), 1);
+        assert_eq!(d.stage().main(), Some(&"helix"));
+        // Workspace 3 was empty and is gone again.
+        assert!(d.workspaces().all(|(n, _)| n != 3));
+    }
+
+    #[test]
+    fn move_to_takes_the_stage_there_and_closing_finds_it() {
+        let mut d = Desk::new();
+        d.open("helix", Home::Shelf);
+        d.open("foot", Home::Shelf);
+        assert!(d.move_to(&"foot", 2));
+        assert_eq!(d.active(), 1);
+        assert_eq!(d.stage().main(), Some(&"helix"));
+        assert_eq!(d.workspace_of(&"foot"), Some(2));
+        assert!(d.close(&"foot"));
+        assert!(!d.contains(&"foot"));
+        assert!(d.workspaces().all(|(n, _)| n != 2));
+        assert!(!d.switch(0));
+        assert!(!d.move_to(&"helix", 0));
+    }
+
+    #[test]
+    fn reopening_a_window_elsewhere_moves_it() {
+        let mut d = Desk::new();
+        d.open("helix", Home::Shelf);
+        d.switch(2);
+        d.open("helix", Home::Shelf);
+        assert_eq!(d.workspace_of(&"helix"), Some(2));
+        assert!(d.workspaces().all(|(n, _)| n != 1));
+    }
+
+    #[test]
+    fn an_offstage_ambient_window_keeps_its_workspace() {
+        let mut d = Desk::new();
+        d.open("chat", Home::Ambient);
+        d.open("term", Home::Shelf); // chat leaves the stage, not to the shelf
+        d.close(&"term");
+        assert_eq!(d.stage().main(), None);
+        d.switch(2);
+        assert!(d.bring(&"chat"), "chat was lost with its workspace");
+        assert_eq!((d.active(), d.stage().main()), (1, Some(&"chat")));
     }
 }

@@ -1,0 +1,39 @@
+#!/bin/sh
+# What a nordlys-comp session starts once the compositor is up (what
+# hyprland.lua's startup does on the Hyprland session). nordlys-comp runs
+# it with WAYLAND_DISPLAY, DISPLAY (X11 apps) and NORDLYS_SOCKET set.
+
+# The user services (shell, notifications, wallpaper, idle) need the
+# session's environment, so import it before starting them.
+vars="WAYLAND_DISPLAY DISPLAY NORDLYS_SOCKET XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP"
+vars="$vars NORDLYS_DATA NORDLYS_IDLE PATH XDG_CONFIG_DIRS QT_QPA_PLATFORMTHEME SSH_AUTH_SOCK"
+if command -v systemctl >/dev/null && systemctl --user cat nordlys-session.target >/dev/null 2>&1; then
+    dbus-update-activation-environment --systemd $vars 2>/dev/null \
+        || systemctl --user import-environment $vars
+    systemctl --user --no-block start nordlys-session.target
+else
+    # No systemd user session: start the pieces by hand (no restarts).
+    for piece in notify bar shelf ambient close-button; do
+        nordlys-shell "$piece" &
+    done
+    command -v swaybg >/dev/null && swaybg -m fill -i "${NORDLYS_DATA:-/usr/share/nordlys}/wallpaper.jpg" &
+    command -v hypridle >/dev/null && hypridle -c "${NORDLYS_IDLE:-${NORDLYS_DATA:-/usr/share/nordlys}/hypridle.conf}" &
+fi
+
+# Palette into the apps' config, and the usual home folders.
+nordlys-theme --quiet &
+command -v xdg-user-dirs-update >/dev/null && xdg-user-dirs-update &
+
+# Something to answer "enter your password" prompts from apps.
+if ! systemctl --user start hyprpolkitagent 2>/dev/null; then
+    for agent in /usr/lib/hyprpolkitagent/hyprpolkitagent /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1; do
+        [ -x "$agent" ] && { "$agent" & break; }
+    done
+fi
+
+# A guest in the test VM follows the host's window size.
+command -v nordlys-vm-agent >/dev/null && nordlys-vm-agent &
+
+# Hello, the first time.
+(sleep 2; exec nordlys-shell welcome --first-run) &
+wait

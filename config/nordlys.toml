@@ -1,21 +1,27 @@
 # Nordlys configuration. Copy to ~/.config/nordlys/nordlys.toml.
 # Every key is optional; anything left out uses the default shown here.
-# Changes apply live: nordlysctl reload (the compositor will also watch this file).
+# Changes apply live: the shell and nordlys-comp re-read this file when it's
+# saved. Keys marked (nordlys-comp) only take effect under the Nordlys
+# compositor; on Hyprland the session's hyprland.lua decides those.
 
 [theme]
 mode = "dark"            # "dark" or "light"
 # accent = "#8AB4FF"     # unset = the mode's own accent
-blur = 24                # px, 0 turns blur off
-reduce_transparency = false
-reduce_motion = false
+blur = 24                # px, 0 turns blur off (nordlys-comp)
+reduce_transparency = false  # solid surfaces instead of glass (nordlys-comp)
+reduce_motion = false    # no shake on a wrong password; fewer animations later
 
 [stage]
-layout = "auto"          # "auto", "ultrawide", "rails" or "peek"
-split = 0.6              # main pane's share in two-up
-shelf_fps = 10           # redraw rate for windows waiting on the shelf
+layout = "auto"          # "auto", "ultrawide", "rails" or "peek" (shown on the bar)
+split = 0.6              # main pane's share in two-up (nordlys-comp)
+shelf_fps = 10           # redraw rate for shelf thumbnails (nordlys-comp)
 
 # App groups: Super G, then the key. The first app takes the stage,
 # the rest wait on the shelf in order.
+#   open_in   "new-workspace" (an empty one) or "current"
+#   dir       working folder for the apps; ~ is your home
+#   reuse_running  bring an app that's already open instead of a second
+#                  copy (nordlys-comp; on Hyprland every launch is new)
 [[group]]
 name = "Nordlys dev"
 key = "d"

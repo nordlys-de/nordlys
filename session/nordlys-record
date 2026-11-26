@@ -1,0 +1,124 @@
+#!/bin/sh
+# Record the screen to ~/Videos/Recordings.
+#
+#   nordlys-record region [--audio]   pick a region, then record it
+#   nordlys-record screen [--audio]   record the screen with the pointer
+#   nordlys-record stop               stop and save
+#
+# region and screen stop a recording that's already running, so one key
+# starts and stops. --audio records what the computer plays. The bar shows
+# a red dot and the time while it runs; a click on it stops too.
+#
+# Uses wf-recorder, else gpu-screen-recorder.
+set -u
+
+run_dir=${XDG_RUNTIME_DIR:-/tmp}
+pid_file="$run_dir/nordlys-record.pid"
+out_file="$run_dir/nordlys-record.file"
+
+say() { command -v notify-send >/dev/null && notify-send -a "Screen recording" "$@"; }
+
+running() {
+    [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null
+}
+
+stop() {
+    pid=$(cat "$pid_file" 2>/dev/null) || return 1
+    file=$(cat "$out_file" 2>/dev/null)
+    # Gone first, so the watcher below knows we stopped it on purpose.
+    rm -f "$pid_file" "$out_file"
+    # SIGINT lets the recorder finish the file properly.
+    kill -INT "$pid" 2>/dev/null || return 1
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ $i -lt 50 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    [ -n "$file" ] && [ -s "$file" ] && say -i video-x-generic "Recording saved" "$file"
+    return 0
+}
+
+what=${1:-region}
+audio=
+[ "${2:-}" = --audio ] && audio=1
+
+if [ "$what" = stop ]; then
+    running && stop
+    exit 0
+fi
+case $what in
+    region|screen) ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "nordlys-record: region, screen or stop" >&2; exit 2 ;;
+esac
+# The same key again stops it.
+if running; then
+    stop
+    exit 0
+fi
+
+if command -v wf-recorder >/dev/null; then
+    recorder=wf-recorder
+elif command -v gpu-screen-recorder >/dev/null; then
+    recorder=gsr
+else
+    say -u critical "Can't record the screen" "Install wf-recorder (pacman -S wf-recorder)."
+    exit 1
+fi
+
+geometry=
+if [ "$what" = region ]; then
+    command -v slurp >/dev/null || { say -u critical "Can't pick a region" "Install slurp."; exit 1; }
+    # Esc in slurp: nothing to record.
+    geometry=$(slurp -d) || exit 0
+fi
+
+# The screen with the pointer: Hyprland's focused monitor.
+output=
+if command -v hyprctl >/dev/null; then
+    output=$(hyprctl activeworkspace -j 2>/dev/null | sed -n 's/^ *"monitor": *"\([^"]*\)".*/\1/p')
+fi
+
+dir="$(xdg-user-dir VIDEOS 2>/dev/null || echo "$HOME/Videos")/Recordings"
+mkdir -p "$dir"
+file="$dir/$(date +%Y-%m-%d_%H-%M-%S).mp4"
+
+if [ $recorder = wf-recorder ]; then
+    set -- wf-recorder -f "$file"
+    if [ -n "$geometry" ]; then
+        set -- "$@" -g "$geometry"
+    elif [ -n "$output" ]; then
+        set -- "$@" -o "$output"
+    fi
+    [ -n "$audio" ] && set -- "$@" --audio
+else
+    set -- gpu-screen-recorder -f 60 -o "$file"
+    if [ -n "$geometry" ]; then
+        # slurp says "X,Y WxH"; gpu-screen-recorder wants "WxH+X+Y".
+        region=$(echo "$geometry" | awk '{split($1, p, ","); print $2 "+" p[1] "+" p[2]}')
+        set -- "$@" -w region -region "$region"
+    else
+        set -- "$@" -w "${output:-screen}"
+    fi
+    [ -n "$audio" ] && set -- "$@" -a default_output
+fi
+
+printf '%s\n' "$file" >"$out_file"
+# Detached, so the key's shell can exit. The pid file goes when it ends,
+# however it ends.
+(
+    "$@" >"$run_dir/nordlys-record.log" 2>&1 &
+    echo $! >"$pid_file"
+    wait $!
+    status=$?
+    if [ -e "$pid_file" ]; then
+        # Not stopped by us: it failed or the screen went away.
+        rm -f "$pid_file" "$out_file"
+        if [ -s "$file" ]; then
+            say -i video-x-generic "Recording saved" "$file"
+        else
+            say -u critical "Recording stopped" "$(tail -n 3 "$run_dir/nordlys-record.log" 2>/dev/null) (exit $status)"
+        fi
+    fi
+) &
+exit 0

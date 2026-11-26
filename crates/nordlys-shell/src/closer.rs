@@ -2,9 +2,15 @@
 //! titlebar, so this is a small layer surface that appears inside the
 //! window's top-right corner when the pointer goes near it, and is a
 //! single clear pixel the rest of the time. Hyprland only.
+//!
+//! The window's place is read when Hyprland reports a change (and every
+//! second for a floating window, which can move silently). Only the pointer
+//! is polled, and only while there is a window to close.
 
+use crate::events;
 use crate::icons::{self, icon};
-use crate::sources::{Compositor, Frame};
+use crate::sources::{Active, Compositor, Frame};
+use crate::system;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{Space, button, container, mouse_area};
 use iced::{Background, Border, Color, Element, Length, Subscription, Task};
@@ -20,13 +26,23 @@ const REACH_Y: i32 = 64;
 
 pub struct Closer {
     compositor: Compositor,
+    /// The screen this button lives on; it shows only for windows there.
+    screen: Option<String>,
+    active: Option<Active>,
     shown: Option<Frame>,
+    window_reads: system::Reads,
+    pointer_reads: system::Reads,
 }
 
 #[to_layer_message]
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Look at the pointer.
     Tick,
+    /// Hyprland reported a change, or a floating window may have moved.
+    Changed,
+    Window(Option<Option<Active>>),
+    Pointer(Option<Option<(i32, i32)>>),
     Close,
 }
 
@@ -43,11 +59,36 @@ fn margins(w: &Frame) -> (i32, i32, i32, i32) {
 }
 
 impl Closer {
-    pub fn new(compositor: Compositor) -> Self {
-        Self {
+    pub fn new(compositor: Compositor, screen: Option<String>) -> (Self, Task<Message>) {
+        let mut me = Self {
             compositor,
+            screen,
+            active: None,
             shown: None,
+            window_reads: system::Reads::default(),
+            pointer_reads: system::Reads::default(),
+        };
+        let first = me.read_window();
+        (me, first)
+    }
+
+    fn read_window(&mut self) -> Task<Message> {
+        if !self.window_reads.start() {
+            return Task::none();
         }
+        let c = self.compositor.clone();
+        Task::perform(
+            system::background(move || c.active_window()),
+            Message::Window,
+        )
+    }
+
+    fn read_pointer(&mut self) -> Task<Message> {
+        if !self.pointer_reads.start() {
+            return Task::none();
+        }
+        let c = self.compositor.clone();
+        Task::perform(system::background(move || c.pointer()), Message::Pointer)
     }
 
     fn show(&mut self, next: Option<Frame>) -> Task<Message> {
@@ -69,13 +110,44 @@ impl Closer {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => {
-                let next = self
-                    .compositor
-                    .active_frame()
-                    .filter(|(w, pointer)| near_corner(w, *pointer))
-                    .map(|(w, _)| w);
-                self.show(next)
+            Message::Tick => self.read_pointer(),
+            Message::Changed => self.read_window(),
+            Message::Window(read) => {
+                let again = self.window_reads.done();
+                if let Some(active) = read {
+                    // A window on another screen is that screen's button's.
+                    self.active =
+                        active.filter(|a| self.screen.as_deref().is_none_or(|s| s == a.screen));
+                }
+                // The window moved or went: hide until the pointer says otherwise.
+                let hide = match (&self.active, &self.shown) {
+                    (Some(a), Some(s)) => a.frame != *s,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                let mut tasks = vec![];
+                if hide {
+                    tasks.push(self.show(None));
+                }
+                if again {
+                    tasks.push(self.read_window());
+                }
+                Task::batch(tasks)
+            }
+            Message::Pointer(read) => {
+                let again = self.pointer_reads.done();
+                let next = match (&self.active, read.flatten()) {
+                    (Some(a), Some(p)) if near_corner(&a.frame, a.local(p)) => {
+                        Some(a.frame.clone())
+                    }
+                    _ => None,
+                };
+                let shown = self.show(next);
+                if again {
+                    Task::batch([shown, self.read_pointer()])
+                } else {
+                    shown
+                }
             }
             Message::Close => {
                 if let Some(w) = &self.shown {
@@ -88,7 +160,14 @@ impl Closer {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(150)).map(|_| Message::Tick)
+        let mut subs = vec![events::changes(&self.compositor).map(|_| Message::Changed)];
+        if let Some(a) = &self.active {
+            subs.push(iced::time::every(Duration::from_millis(150)).map(|_| Message::Tick));
+            if a.floating {
+                subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Changed));
+            }
+        }
+        Subscription::batch(subs)
     }
 
     pub fn view(&self) -> Element<'_, Message> {

@@ -2,6 +2,13 @@
 # Start a Nordlys session: Hyprland with Nordlys's own config, so
 # ~/.config/hypr stays untouched. The display manager runs this through
 # nordlys.desktop; from a TTY, run it directly.
+#
+# `nordlys-session --comp` runs Nordlys's own compositor (nordlys-comp)
+# instead, through nordlys-comp.desktop: the Stage layout natively, its
+# own blur and shelf previews, X11 apps through xwayland-satellite.
+
+compositor=hyprland
+[ "${1:-}" = --comp ] && compositor=comp
 
 here=$(dirname "$(readlink -f "$0")")
 for d in "$NORDLYS_DATA" "$here/../share/nordlys" /usr/local/share/nordlys /usr/share/nordlys; do
@@ -24,12 +31,60 @@ export XDG_CONFIG_DIRS="$NORDLYS_DATA/xdg:${XDG_CONFIG_DIRS:-/etc/xdg}"
 user_idle="${XDG_CONFIG_HOME:-$HOME/.config}/nordlys/hypridle.conf"
 [ -f "$user_idle" ] && export NORDLYS_IDLE="$user_idle"
 
-# Portals and apps know Hyprland; XDG_SESSION_DESKTOP says it's Nordlys.
-export XDG_CURRENT_DESKTOP=Hyprland
+# A nordlys.toml to edit (Super+,) from the first login on.
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/nordlys"
+if [ ! -e "$config_dir/nordlys.toml" ] && [ -f "$NORDLYS_DATA/nordlys.toml.example" ]; then
+    mkdir -p "$config_dir" && cp "$NORDLYS_DATA/nordlys.toml.example" "$config_dir/nordlys.toml"
+fi
+
+# Saved passwords for browsers, VS Code and git (the Secret Service).
+# The display manager's PAM unlocks the keyring with your login password
+# (scripts/setup.sh sets that up); here the daemon is made sure of, and
+# its SSH agent used unless you have one.
+if command -v gnome-keyring-daemon >/dev/null; then
+    if command -v systemctl >/dev/null && systemctl --user cat gnome-keyring-daemon.socket >/dev/null 2>&1; then
+        systemctl --user start gnome-keyring-daemon.socket 2>/dev/null
+    else
+        eval "$(gnome-keyring-daemon --start --components=secrets 2>/dev/null)" && export GNOME_KEYRING_CONTROL
+    fi
+    if [ -z "${SSH_AUTH_SOCK:-}" ] && command -v systemctl >/dev/null \
+        && systemctl --user start gcr-ssh-agent.socket 2>/dev/null; then
+        export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/gcr/ssh"
+    fi
+fi
+
 export XDG_SESSION_DESKTOP=nordlys
 export XDG_SESSION_TYPE=wayland
 
-if command -v start-hyprland >/dev/null; then
-    exec start-hyprland -- -c "$NORDLYS_DATA/hyprland.lua"
+if [ "$compositor" = comp ]; then
+    # Portals read nordlys-portals.conf (GTK's file picker, no screen
+    # sharing yet). Hyprland sets the toolkit variables in hyprland.lua;
+    # here they're set before the compositor starts.
+    export XDG_CURRENT_DESKTOP=Nordlys
+    export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+    export QT_QPA_PLATFORMTHEME=qt6ct
+    export QT_QPA_PLATFORM="wayland;xcb"
+    export GDK_BACKEND="wayland,x11"
+    export MOZ_ENABLE_WAYLAND=1
+    export ELECTRON_OZONE_PLATFORM_HINT=auto
+    nordlys-comp --tty --run "sh '$NORDLYS_DATA/nordlys-autostart'"
+    status=$?
+else
+    # Portals and apps know Hyprland; XDG_SESSION_DESKTOP says it's Nordlys.
+    export XDG_CURRENT_DESKTOP=Hyprland
+    if command -v start-hyprland >/dev/null; then
+        start-hyprland -- -c "$NORDLYS_DATA/hyprland.lua"
+    else
+        Hyprland -c "$NORDLYS_DATA/hyprland.lua"
+    fi
+    status=$?
 fi
-exec Hyprland -c "$NORDLYS_DATA/hyprland.lua"
+
+# The compositor is gone: stop the session's services and forget its display,
+# so nothing tries to draw on it or restarts against it.
+if command -v systemctl >/dev/null; then
+    systemctl --user stop nordlys-session.target 2>/dev/null
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY NORDLYS_SOCKET HYPRLAND_INSTANCE_SIGNATURE \
+        XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP NORDLYS_DATA NORDLYS_IDLE XDG_CONFIG_DIRS QT_QPA_PLATFORMTHEME SSH_AUTH_SOCK 2>/dev/null
+fi
+exit $status

@@ -1,0 +1,15 @@
+# Dim, lock, screen off and suspend. ~/.config/nordlys/hypridle.conf wins
+# over the Nordlys defaults (nordlys-session passes it as NORDLYS_IDLE).
+[Unit]
+Description=Nordlys idle (hypridle)
+Documentation=https://github.com/nordlys-de/nordlys
+PartOf=nordlys-session.target
+After=graphical-session.target
+Conflicts=hypridle.service
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+ExecStart=/bin/sh -c 'exec hypridle -c "${NORDLYS_IDLE:-@DATADIR@/hypridle.conf}"'
+Restart=on-failure
+RestartSec=1

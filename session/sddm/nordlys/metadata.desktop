@@ -1,0 +1,10 @@
+[SddmGreeterTheme]
+Name=Nordlys
+Description=The Nordlys login screen: the aurora wallpaper, a clock and a frosted card
+Author=Nordlys
+Type=sddm-theme
+Version=0.1
+Website=https://github.com/nordlys-de/nordlys
+MainScript=Main.qml
+ConfigFile=theme.conf
+QtVersion=6

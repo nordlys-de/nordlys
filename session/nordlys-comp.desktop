@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Nordlys (own compositor)
+Comment=Nordlys on nordlys-comp: the Stage layout natively, without Hyprland
+Exec=nordlys-session --comp
+TryExec=nordlys-comp
+Type=Application
+DesktopNames=Nordlys
+Keywords=wayland;desktop;

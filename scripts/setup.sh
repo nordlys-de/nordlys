@@ -6,15 +6,25 @@
 #
 # In a QEMU/KVM virtual machine it also installs the guest agent (shared
 # clipboard and window-size resizing). Force with --vm-guest or --no-vm-guest.
+#
+# So saved passwords unlock with your login, it adds gnome-keyring's two
+# optional lines to the login screen's PAM file and to the TTY's (a copy of
+# each file is kept as *.pre-nordlys); --no-keyring skips that. With SDDM it
+# switches on the Nordlys login screen when it installed SDDM itself, or
+# when you pass --sddm-theme.
 # Safe to run again after a `git pull`.
 set -eu
 
 vm_guest=auto
+keyring=yes
+sddm_theme=no
 for arg in "$@"; do
     case $arg in
         --vm-guest) vm_guest=yes ;;
         --no-vm-guest) vm_guest=no ;;
-        -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --no-keyring) keyring=no ;;
+        --sddm-theme) sddm_theme=yes ;;
+        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup.sh: unknown option $arg" >&2; exit 2 ;;
     esac
 done
@@ -33,7 +43,7 @@ if [ "$vm_guest" = auto ]; then
     esac
 fi
 
-packages="base-devel git pkgconf pam libxkbcommon wayland mesa
+packages="base-devel git pkgconf pam libxkbcommon wayland mesa libinput seatd libdrm xwayland-satellite
     hyprland hypridle swaybg hyprpolkitagent xdg-desktop-portal-hyprland
     inter-font ttf-jetbrains-mono noto-fonts pipewire pipewire-pulse wireplumber
     playerctl networkmanager bluez-utils brightnessctl grim slurp wl-clipboard
@@ -42,7 +52,8 @@ packages="base-devel git pkgconf pam libxkbcommon wayland mesa
     adw-gtk-theme adwaita-icon-theme noto-fonts-emoji
     nautilus gvfs ffmpegthumbnailer imv mpv mpv-mpris
     zathura zathura-pdf-mupdf gnome-text-editor helix btop
-    pavucontrol file-roller"
+    pavucontrol file-roller
+    gnome-keyring libsecret seahorse wf-recorder cliphist"
 # A rustup or distro toolchain that's already here is fine.
 command -v cargo >/dev/null || packages="$packages rust"
 [ "$vm_guest" = yes ] && packages="$packages python"
@@ -53,7 +64,7 @@ say "Installing dependencies"
 sudo pacman -Syu --needed $packages
 
 say "Building Nordlys (a few minutes the first time)"
-(cd "$root" && cargo build --release --locked -p nordlys-shell -p nordlysctl -p nordlys-theme)
+(cd "$root" && cargo build --release --locked -p nordlys-comp -p nordlys-shell -p nordlysctl -p nordlys-theme -p nordlys-settings)
 
 say "Installing"
 if [ "$vm_guest" = yes ]; then
@@ -66,6 +77,37 @@ if [ ! -e /etc/systemd/system/display-manager.service ]; then
     say "No display manager is enabled; installing SDDM"
     sudo pacman -S --needed sddm
     sudo systemctl enable sddm
+    sddm_theme=yes
+fi
+dm=$(basename "$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)" .service)
+
+if [ "$sddm_theme" = yes ] && [ "$dm" = sddm ]; then
+    say "Using the Nordlys login screen"
+    sudo install -d /etc/sddm.conf.d
+    printf '[Theme]\nCurrent=nordlys\n' | sudo tee /etc/sddm.conf.d/nordlys.conf >/dev/null
+fi
+
+# Unlock the keyring with the login password. Both lines are optional
+# and skipped when gnome-keyring isn't there, so they can't stop a login.
+keyring_pam() {
+    f=$1
+    [ -f "$f" ] || return 0
+    auth=yes session=yes
+    grep -Eq '^[[:space:]]*-?auth[[:space:]].*pam_gnome_keyring' "$f" && auth=no
+    grep -Eq '^[[:space:]]*-?session[[:space:]].*pam_gnome_keyring' "$f" && session=no
+    [ $auth = no ] && [ $session = no ] && return 0
+    say "Unlocking the keyring at login: adding gnome-keyring to $f"
+    [ -e "$f.pre-nordlys" ] || sudo cp -p "$f" "$f.pre-nordlys"
+    {
+        [ $auth = yes ] && echo "-auth       optional    pam_gnome_keyring.so"
+        [ $session = yes ] && echo "-session    optional    pam_gnome_keyring.so auto_start"
+    } | sudo tee -a "$f" >/dev/null
+}
+if [ "$keyring" = yes ]; then
+    case $dm in
+        sddm|greetd|lightdm|ly) keyring_pam "/etc/pam.d/$dm" ;;
+    esac
+    keyring_pam /etc/pam.d/login
 fi
 
 say "Done."

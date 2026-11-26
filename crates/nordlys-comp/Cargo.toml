@@ -1,6 +1,6 @@
 [package]
 name = "nordlys-comp"
-description = "The Nordlys Wayland compositor (Smithay). Headless IPC mode for now."
+description = "The Nordlys Wayland compositor (Smithay): DRM/KMS on a TTY, nested in a window, or headless."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,9 @@ repository.workspace = true
 nordlys-config.workspace = true
 nordlys-ipc.workspace = true
 nordlys-stage.workspace = true
+png = "0.17"
+xcursor = "0.3"
+smithay = { version = "0.7", default-features = false, features = ["backend_drm", "backend_gbm", "backend_libinput", "backend_session_libseat", "backend_udev", "backend_winit", "desktop", "renderer_gl", "wayland_frontend"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,15 @@
+[Unit]
+Description=Nordlys clipboard history
+Documentation=https://github.com/nordlys-de/nordlys
+PartOf=nordlys-session.target
+After=graphical-session.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+# Everything copied goes to cliphist; Super+V picks from it. Copies a
+# password manager marks as secret are skipped by cliphist. Without
+# cliphist installed this does nothing.
+ExecStart=/bin/sh -c 'command -v cliphist >/dev/null || exit 0; exec wl-paste --watch cliphist store'
+Restart=on-failure
+RestartSec=1
