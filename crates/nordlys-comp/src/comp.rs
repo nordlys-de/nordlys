@@ -163,6 +163,8 @@ pub enum Action {
     Launcher {
         commands: bool,
     },
+    /// The Settings app, else the config file.
+    Settings,
     /// A command, through `sh -c`.
     Spawn(&'static str),
     /// Switch to this virtual terminal (TTY only).
@@ -174,7 +176,6 @@ pub enum Action {
 const EDITOR: &str = "for p in \"$NORDLYS_EDITOR\" gnome-text-editor kate code zeditor mousepad; do command -v \"$p\" >/dev/null && exec \"$p\"; done";
 const FILES: &str = "for p in \"$NORDLYS_FILES\" nautilus thunar nemo dolphin; do command -v \"$p\" >/dev/null && exec \"$p\"; done";
 const BROWSER: &str = "for p in \"$BROWSER\" firefox chromium zen-browser librewolf brave; do command -v \"$p\" >/dev/null && exec \"$p\"; done";
-const SETTINGS: &str = "command -v nordlys-settings >/dev/null && exec nordlys-settings; exec xdg-open \"${XDG_CONFIG_HOME:-$HOME/.config}/nordlys/nordlys.toml\"";
 const LOCK: &str = "exec nordlys-shell lock";
 const SCREENSHOT: &str = "d=\"$(xdg-user-dir PICTURES 2>/dev/null || echo \"$HOME/Pictures\")/Screenshots\"; mkdir -p \"$d\"; exec nordlysctl screenshot \"$d/$(date +%Y-%m-%d_%H-%M-%S).png\"";
 
@@ -206,7 +207,7 @@ fn binding(shift: bool, ctrl: bool, sym: u32) -> Option<Action> {
         (false, keysyms::KEY_e) => Some(Spawn(EDITOR)),
         (false, keysyms::KEY_n) => Some(Spawn(FILES)),
         (false, keysyms::KEY_b) => Some(Spawn(BROWSER)),
-        (false, keysyms::KEY_comma) => Some(Spawn(SETTINGS)),
+        (false, keysyms::KEY_comma) => Some(Settings),
         (false, keysyms::KEY_l | keysyms::KEY_Escape) => Some(Spawn(LOCK)),
         (false, keysyms::KEY_bracketleft) => Some(WorkspaceBy(-1)),
         (false, keysyms::KEY_bracketright) => Some(WorkspaceBy(1)),
@@ -601,13 +602,25 @@ pub fn on_path(cmd: &str) -> bool {
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
 }
 
-/// nordlys-shell: the one built next to this binary, else from PATH.
-fn shell_bin() -> PathBuf {
+/// A Nordlys program: the one built next to this binary, else from PATH.
+fn beside(name: &str) -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|e| Some(e.parent()?.join("nordlys-shell")))
+        .and_then(|e| Some(e.parent()?.join(name)))
         .filter(|p| p.is_file())
-        .unwrap_or_else(|| "nordlys-shell".into())
+        .unwrap_or_else(|| name.into())
+}
+
+/// Opens `settings` (from `beside`), or the config file when it isn't there.
+fn settings_command(settings: &std::path::Path) -> String {
+    let q = format!(
+        "'{}'",
+        settings.display().to_string().replace('\'', r"'\''")
+    );
+    format!(
+        "command -v {q} >/dev/null && exec {q}; \
+         exec xdg-open \"${{XDG_CONFIG_HOME:-$HOME/.config}}/nordlys/nordlys.toml\""
+    )
 }
 
 impl Comp {
@@ -1096,10 +1109,11 @@ impl Comp {
             }
             Action::Terminal => self.spawn(terminal(), None),
             Action::Launcher { commands } => {
-                let bin = shell_bin();
+                let bin = beside("nordlys-shell");
                 let q = if commands { " --query '>'" } else { "" };
                 self.spawn(&format!("'{}' launcher{q}", bin.display()), None);
             }
+            Action::Settings => self.spawn(&settings_command(&beside("nordlys-settings")), None),
             Action::Spawn(cmd) => self.spawn(cmd, None),
             Action::Vt(n) => {
                 if let Backend::Tty(t) = &mut self.backend {
@@ -1939,5 +1953,39 @@ mod tests {
             Some(Action::Spawn(_))
         ));
         assert_eq!(global_binding(keysyms::KEY_a), None);
+    }
+
+    #[test]
+    fn settings_runs_the_copy_it_is_given_else_opens_the_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("nordlys-comp-settings-{}", std::process::id()));
+        let bin = dir.join("it's here");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (name, says) in [("nordlys-settings", "settings"), ("xdg-open", "opened $1")] {
+            let f = bin.join(name);
+            std::fs::write(&f, format!("#!/bin/sh\necho \"{says}\"\n")).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let run = |settings: &std::path::Path| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(settings_command(settings))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("XDG_CONFIG_HOME", "/cfg")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        assert_eq!(run(&bin.join("nordlys-settings")), "settings");
+        assert_eq!(
+            run(&dir.join("missing")),
+            "opened /cfg/nordlys/nordlys.toml"
+        );
+        assert_eq!(
+            binding(false, false, keysyms::KEY_comma),
+            Some(Action::Settings)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

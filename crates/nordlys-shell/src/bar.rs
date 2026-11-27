@@ -452,8 +452,9 @@ impl Bar {
                 }
             }
             Message::Settings(page) => {
-                let cmd = format!(
-                    "command -v nordlys-settings >/dev/null && exec nordlys-settings {page}"
+                let cmd = apps::settings_command(
+                    page,
+                    "echo 'nordlys-shell: nordlys-settings is not installed' >&2; exit 1",
                 );
                 if let Err(e) = apps::spawn_shell(&cmd) {
                     eprintln!("nordlys-shell: can't open Settings: {e}");

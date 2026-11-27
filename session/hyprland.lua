@@ -233,6 +233,28 @@ local super = "SUPER"
 local function key(k) return super .. " + " .. k end
 local function run(cmd) return hl.dsp.exec_cmd(cmd) end
 
+-- Settings: when Hyprland reads this file straight from a checkout, that
+-- checkout's own build comes first (target/ isn't on PATH), then the
+-- installed one. Each path is one word inside first_of's 'sh -c' quotes.
+local function sh_word(s)
+    local w = s:gsub('[\\"$`]', "\\%0")
+    w = w:gsub("'", "'\\''")
+    return '"' .. w .. '"'
+end
+local settings = "nordlys-settings"
+local here = debug and debug.getinfo and debug.getinfo(1, "S")
+local repo = here and here.source:match("^@(.+)/session/[^/]+$")
+if repo then
+    for _, build in ipairs({ "release", "debug" }) do
+        local bin = repo .. "/target/" .. build .. "/nordlys-settings"
+        local f = io.open(bin, "r")
+        if f then
+            f:close()
+            settings = sh_word(bin) .. " " .. settings
+        end
+    end
+end
+
 -- Is nordlys-comp running? (Its socket is there.)
 local function comp_running()
     local sock = io.open((os.getenv("XDG_RUNTIME_DIR") or "/tmp") .. "/nordlys.sock", "r")
@@ -302,7 +324,7 @@ hl.bind(key("E"),             run(editor),                                 { des
 hl.bind(key("N"),             run(files),                                  { desc = "Files" })
 hl.bind(key("B"),             run(browser),                                { desc = "Browser" })
 hl.bind("CTRL + SHIFT + ESCAPE", run(monitor),                             { desc = "System monitor" })
-hl.bind(key("comma"),         run(first_of("nordlys-settings") .. " || xdg-open '" .. conf .. "/nordlys.toml'"), { desc = "Settings" })
+hl.bind(key("comma"),         run(first_of(settings) .. " || xdg-open '" .. conf .. "/nordlys.toml'"), { desc = "Settings" })
 hl.bind(key("SHIFT + S"),     run("sh -c 'grim -g \"$(slurp)\" - | wl-copy'"), { desc = "Screenshot to clipboard" })
 -- Screen recording to ~/Videos/Recordings; the same key stops it.
 hl.bind(key("R"),             run("nordlys-record region"),                { desc = "Record a region" })

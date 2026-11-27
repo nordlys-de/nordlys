@@ -398,6 +398,27 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// A command line that opens Settings with `args`: the copy next to this
+/// binary first (a build in target/ isn't on PATH), then the one on PATH,
+/// and runs `otherwise` when there's neither.
+pub fn settings_command(args: &str, otherwise: &str) -> String {
+    settings_command_beside(std::env::current_exe().ok().as_deref(), args, otherwise)
+}
+
+fn settings_command_beside(exe: Option<&Path>, args: &str, otherwise: &str) -> String {
+    let mut tries = String::new();
+    if let Some(dir) = exe.and_then(Path::parent) {
+        tries.push_str(&shell_quote(
+            &dir.join("nordlys-settings").to_string_lossy(),
+        ));
+        tries.push(' ');
+    }
+    tries.push_str("nordlys-settings");
+    format!(
+        "for p in {tries}; do command -v \"$p\" >/dev/null && exec \"$p\" {args}; done; {otherwise}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +526,40 @@ Exec=firefox --new-window %u
         let n = scope_name("org.gnome.Nautilus");
         assert!(n.starts_with("app-nordlys-org.gnome.Nautilus-") && n.ends_with(".scope"));
         assert!(scope_name("my app/x").starts_with("app-nordlys-my_app_x-"));
+    }
+
+    #[test]
+    fn settings_is_found_beside_this_binary_first() {
+        let dir =
+            std::env::temp_dir().join(format!("nordlys-settings-test-{}", std::process::id()));
+        let bin = dir.join("it's here");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("nordlys-settings");
+        std::fs::write(&fake, "#!/bin/sh\necho \"beside $*\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |cmd: String| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let exe = bin.join("nordlys-shell");
+        assert_eq!(
+            run(settings_command_beside(Some(&exe), "sound", "echo none")),
+            "beside sound"
+        );
+        // Nothing beside it and nothing on PATH: the fallback runs.
+        let elsewhere = dir.join("nordlys-shell");
+        assert_eq!(
+            run(settings_command_beside(Some(&elsewhere), "", "echo none")),
+            "none"
+        );
+        assert_eq!(run(settings_command_beside(None, "", "echo none")), "none");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

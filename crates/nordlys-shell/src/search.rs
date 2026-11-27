@@ -539,9 +539,12 @@ const LOG_OUT: &str = "if [ -n \"$HYPRLAND_INSTANCE_SIGNATURE\" ]; \
 
 /// The Settings app when it's installed, else the config file.
 fn settings_command(config: &std::path::Path) -> String {
-    format!(
-        "command -v nordlys-settings >/dev/null && exec nordlys-settings || exec xdg-open {}",
-        apps::shell_quote(&config.to_string_lossy())
+    apps::settings_command(
+        "",
+        &format!(
+            "exec xdg-open {}",
+            apps::shell_quote(&config.to_string_lossy())
+        ),
     )
 }
 
