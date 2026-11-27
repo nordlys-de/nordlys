@@ -384,7 +384,10 @@ Wi-Fi on and off, nearby networks to join (a new secured one asks for
 its password in Settings), wired and VPN connections; Bluetooth on and
 off and paired devices to connect; the output and input devices, their
 levels and mute, and each sound card's profile. Scroll on the volume to
-change it; click the icon again to close its panel.
+change it; click the icon again to close its panel. Without
+NetworkManager the network icon still shows wired, Wi-Fi or offline,
+read from the kernel. An icon is left out when there's nothing behind
+it: no Bluetooth adapter, or no sound output.
 It redraws when the compositor reports a change (Hyprland's event socket,
 or nordlys-comp's `subscribe`), not on a timer.
 

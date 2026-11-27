@@ -236,9 +236,12 @@ pub enum Link {
     Offline,
 }
 
-/// None when NetworkManager isn't there.
+/// From NetworkManager, or from the kernel's interfaces when it isn't
+/// running. None when there's no network hardware at all.
 pub fn link() -> Option<Link> {
-    let (state, kind) = crate::dbus::network()?;
+    let Some((state, kind)) = crate::dbus::network() else {
+        return sys_link(std::path::Path::new("/sys/class/net"));
+    };
     Some(match state {
         70 => match kind.as_str() {
             "802-11-wireless" => Link::Wifi,
@@ -248,6 +251,34 @@ pub fn link() -> Option<Link> {
         40..=69 => Link::Limited,
         _ => Link::Offline,
     })
+}
+
+/// Without NetworkManager: a physical interface that's up (Wi-Fi first),
+/// else Offline. Loopback and virtual interfaces (bridges, VPN tunnels,
+/// containers) have no `device` link, so they don't count.
+fn sys_link(root: &std::path::Path) -> Option<Link> {
+    let mut found = false;
+    let mut wired = false;
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = entry.path();
+        if !dir.join("device").exists() {
+            continue;
+        }
+        found = true;
+        let up = std::fs::read_to_string(dir.join("operstate")).is_ok_and(|s| s.trim() == "up");
+        if !up {
+            continue;
+        }
+        if dir.join("wireless").exists() || dir.join("phy80211").exists() {
+            return Some(Link::Wifi);
+        }
+        wired = true;
+    }
+    match (found, wired) {
+        (_, true) => Some(Link::Wired),
+        (true, false) => Some(Link::Offline),
+        (false, _) => None,
+    }
 }
 
 /// The bar's indicators: network, Bluetooth and volume.
@@ -414,6 +445,72 @@ pub fn clear_notifications() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (name, physical, operstate, wireless)
+    type Iface<'a> = (&'a str, bool, &'a str, bool);
+
+    /// A fake /sys/class/net.
+    fn net(tag: &str, ifaces: &[Iface]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("nordlys-net-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for &(name, physical, state, wireless) in ifaces {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("operstate"), format!("{state}\n")).unwrap();
+            if physical {
+                std::fs::create_dir(dir.join("device")).unwrap();
+            }
+            if wireless {
+                std::fs::create_dir(dir.join("wireless")).unwrap();
+            }
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn link_without_network_manager() {
+        let cases: [(&str, &[Iface], Option<Link>); 6] = [
+            (
+                "wired",
+                &[
+                    ("lo", false, "unknown", false),
+                    ("enp0s1", true, "up", false),
+                ],
+                Some(Link::Wired),
+            ),
+            (
+                "wifi",
+                &[("enp0s1", true, "up", false), ("wlan0", true, "up", true)],
+                Some(Link::Wifi),
+            ),
+            (
+                "down",
+                &[
+                    ("enp0s1", true, "down", false),
+                    ("wlan0", true, "dormant", true),
+                ],
+                Some(Link::Offline),
+            ),
+            // A VPN tunnel or bridge that's up doesn't make a cable plugged in.
+            (
+                "virtual",
+                &[
+                    ("enp0s1", true, "down", false),
+                    ("tun0", false, "up", false),
+                ],
+                Some(Link::Offline),
+            ),
+            ("none", &[("lo", false, "unknown", false)], None),
+            ("empty", &[], None),
+        ];
+        for (tag, ifaces, want) in cases {
+            let root = net(tag, ifaces);
+            assert_eq!(sys_link(&root), want, "{tag}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        assert_eq!(sys_link(std::path::Path::new("/nonexistent/nordlys")), None);
+    }
 
     #[test]
     fn volume_lines() {
