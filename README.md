@@ -150,6 +150,10 @@ dependencies, builds and installs Nordlys and, in a VM, adds
 resizes the screen to the window. Both work inside the Nordlys session.
 After a `git pull`, run `setup.sh` again.
 
+To try screens on a second GPU with the own-compositor session, add one
+without 3D: `NORDLYS_VM_EXTRA="-device bochs-display" vm/nordlys-vm run`
+(its screen is a second tab in QEMU's View menu).
+
 Ctrl+Alt+G grabs the keyboard so Super reaches the VM; Ctrl+Alt+F is
 fullscreen. `vm/nordlys-vm destroy` deletes the VM.
 
@@ -256,7 +260,16 @@ pointer) to that screen. Super+Ctrl+← → moves the keyboard between
 screens, Super+Ctrl+Shift+← → sends the window to the next screen and
 follows it. A screen unplugged leaves its workspace and windows behind, a
 Super+number away. Every screen gets its own bar, rails and close button,
-and the lock screen covers them all. `nordlysctl focus-screen DP-1` does
+and the lock screen covers them all.
+
+Screens on any GPU work, so an HDMI port wired to a laptop's discrete GPU
+lights up too. One GPU draws everything: the one the firmware booted with,
+or the one in `NORDLYS_GPU` (`NORDLYS_GPU=/dev/dri/card1`). Frames for
+screens on another GPU are copied over, straight from GPU to GPU when that
+GPU can read the main one's buffers, otherwise through memory, which is
+slower. The log says which. A GPU with no screen lit runs no renderer, so
+a discrete GPU can sleep. GPUs plugged in later (a dock, an eGPU) are
+picked up too. `nordlysctl focus-screen DP-1` does
 the same over IPC, and `nordlysctl screenshot` saves the screen with the
 keyboard.
 
@@ -639,7 +652,7 @@ been quiet for a moment, so nothing waits on screen in between. Volume uses
    dmabuf for GPU clients, screenshots over IPC, DRM/KMS and libinput
    through libseat, shelf previews at a low frame rate, dual-kawase blur,
    session lock and idle notification, xwayland-satellite for X11 apps,
-   every connected screen with hotplug. Next: a screencast portal, and
+   every connected screen on every GPU, with hotplug. Next: a screencast portal, and
    screens arranged from Settings.
 3. **Polish.** Adaptive shelves (ultrawide, rails, peek), app groups in
    their own workspaces. Done: the SDDM theme, the Settings app, the tray,

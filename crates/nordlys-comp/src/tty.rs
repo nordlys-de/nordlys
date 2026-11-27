@@ -3,36 +3,53 @@
 //! TTY or a display manager without being root (logind or seatd hand over
 //! the devices).
 //!
-//! One GPU (the primary one) and every screen connected to it, each in its
-//! preferred mode on a CRTC of its own, laid out left to right: a laptop's
-//! own panel first, then the others by connector name. Screens plugged in
-//! or out while it runs are picked up from udev. Each screen's frames are
-//! drawn on demand and paced by its own vblank; switching to another VT
-//! (Ctrl+Alt+F1…) pauses everything and coming back redraws from scratch.
+//! Every GPU with screen connectors, and every screen connected to them,
+//! each in its preferred mode on a CRTC of its own, laid out left to right:
+//! a laptop's own panel first, then the others by connector name. One GPU,
+//! the main one (the one the firmware booted with, or `NORDLYS_GPU`), draws
+//! everything and is the one clients get their buffers from. A screen on
+//! another GPU (on many laptops the HDMI port is wired to the discrete GPU)
+//! gets each frame copied over: the main GPU draws it into a linear buffer
+//! that the screen's GPU reads directly, or, if it can't, through memory.
+//! That GPU starts a renderer only while one of its screens is lit, so it
+//! can sleep otherwise.
+//!
+//! Screens and GPUs plugged in or out while it runs are picked up from
+//! udev. Each screen's frames are drawn on demand and paced by its own
+//! vblank; switching to another VT (Ctrl+Alt+F1…) pauses everything and
+//! coming back redraws from scratch.
 
 use crate::comp::{Backend, Comp, Ready, libc_dev_t};
 use crate::render;
+use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Format, Fourcc};
+use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier, Swapchain};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType};
+use smithay::backend::drm::{
+    DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, DrmNode, NodeType,
+};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::ImportDma;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::texture::TextureRenderElement;
+use smithay::backend::renderer::element::{Id, Kind};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::utils::DamageBag;
+use smithay::backend::renderer::{Bind, ExportMem, ImportDma, ImportMem, Renderer, TextureMapping};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
-use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::utils::{DeviceFd, Transform};
-use std::path::PathBuf;
+use smithay::utils::{Buffer as BufferCoords, DeviceFd, Rectangle, Size, Transform};
+use std::error::Error;
+use std::path::{Path, PathBuf};
 
 type Compositor =
     DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
@@ -40,13 +57,12 @@ type Compositor =
 pub struct Tty {
     session: LibSeatSession,
     libinput: Libinput,
-    drm: DrmDevice,
-    gbm: GbmDevice<DrmDeviceFd>,
+    /// The main GPU's renderer: everything is drawn with it.
     renderer: GlesRenderer,
-    render_node: Option<DrmNode>,
+    /// The GPUs with screen connectors; the main one first.
+    gpus: Vec<Gpu>,
+    /// What the main GPU can import from clients.
     formats: Vec<Format>,
-    /// The GPU's device number, to know its udev events.
-    dev: Option<libc_dev_t>,
     screens: Vec<Screen>,
     /// The session has the devices (not switched away to another VT).
     active: bool,
@@ -54,18 +70,75 @@ pub struct Tty {
     queued: bool,
 }
 
+/// One GPU and the screens it can drive.
+struct Gpu {
+    /// Its device number, to know its udev events and its screens.
+    dev: libc_dev_t,
+    path: PathBuf,
+    drm: DrmDevice,
+    gbm: GbmDevice<DrmDeviceFd>,
+    render_node: Option<DrmNode>,
+    /// On a GPU other than the main one, the renderer that puts the frames
+    /// copied in on its screens; only while it has one.
+    copier: Option<GlesRenderer>,
+    /// Its vblank events, to stop listening when it's unplugged.
+    token: Option<RegistrationToken>,
+}
+
 /// One connected screen and what drives it.
 struct Screen {
     output: Output,
+    /// The GPU it's plugged into.
+    gpu: libc_dev_t,
     connector: connector::Handle,
     crtc: crtc::Handle,
     /// A laptop's own panel: it goes first.
     panel: bool,
     compositor: Compositor,
+    /// On a GPU other than the main one: how its frames get there.
+    copy: Option<Copy>,
     /// A frame is on its way to the screen; the next waits for vblank.
     pending: bool,
     /// Something changed while a frame was pending.
     again: bool,
+}
+
+/// A screen's frames drawn on the main GPU, for another GPU to show.
+struct Copy {
+    /// Linear buffers on the main GPU the frames are drawn into.
+    swapchain: Swapchain<GbmAllocator<DrmDeviceFd>>,
+    damage: OutputDamageTracker,
+    /// What changed from frame to frame, for the screen's own GPU.
+    bag: DamageBag<i32, BufferCoords>,
+    id: Id,
+    /// The screen's GPU couldn't read the main GPU's buffers, so frames go
+    /// through memory (slower, but works between any two GPUs).
+    cpu: bool,
+}
+
+impl Copy {
+    fn new(main: &GbmDevice<DrmDeviceFd>, output: &Output, (w, h): (u16, u16)) -> Self {
+        Self {
+            swapchain: Swapchain::new(
+                GbmAllocator::new(main.clone(), GbmBufferFlags::RENDERING),
+                u32::from(w),
+                u32::from(h),
+                Fourcc::Xrgb8888,
+                vec![Modifier::Linear],
+            ),
+            damage: OutputDamageTracker::from_output(output),
+            bag: DamageBag::new(4),
+            id: Id::new(),
+            cpu: false,
+        }
+    }
+
+    /// Forget every buffer and frame, after the GPUs were away.
+    fn reset(&mut self, output: &Output) {
+        self.swapchain.reset_buffers();
+        self.damage = OutputDamageTracker::from_output(output);
+        self.id = Id::new();
+    }
 }
 
 impl Tty {
@@ -83,25 +156,46 @@ impl Tty {
         self.screens.iter().map(|s| s.output.clone()).collect()
     }
 
-    /// Match the screens to what's connected: drop the ones unplugged,
-    /// drive the ones plugged in, and lay them out again. True if any
-    /// came or went. `probe` asks the connectors afresh (slower; for
-    /// hotplug, when the kernel's idea may be stale).
-    fn scan(&mut self, probe: bool) -> Result<bool, String> {
-        let res = self
+    /// Match the screens to what's connected on every GPU, and lay them
+    /// out again. True if any came or went. `probe` asks the connectors
+    /// afresh (slower; for hotplug, when the kernel's idea may be stale).
+    fn scan(&mut self, probe: bool) -> bool {
+        let mut changed = false;
+        for i in 0..self.gpus.len() {
+            match self.scan_gpu(i, probe) {
+                Ok(c) => changed |= c,
+                Err(e) => eprintln!("nordlys-comp: {e}"),
+            }
+        }
+        // A GPU without lit screens lets its renderer go.
+        for g in self.gpus.iter_mut().skip(1) {
+            if g.copier.is_some() && !self.screens.iter().any(|s| s.gpu == g.dev) {
+                g.copier = None;
+            }
+        }
+        self.screens.sort_by_key(|s| (!s.panel, s.output.name()));
+        self.place();
+        changed
+    }
+
+    /// `scan` for the GPU at `i`.
+    fn scan_gpu(&mut self, i: usize, probe: bool) -> Result<bool, String> {
+        let gpu = &self.gpus[i];
+        let dev = gpu.dev;
+        let res = gpu
             .drm
             .resource_handles()
-            .map_err(|e| format!("cannot read the GPU's screens: {e}"))?;
+            .map_err(|e| format!("cannot read the screens of {}: {e}", gpu.path.display()))?;
         let connected: Vec<connector::Info> = res
             .connectors()
             .iter()
-            .filter_map(|c| self.drm.get_connector(*c, probe).ok())
+            .filter_map(|c| gpu.drm.get_connector(*c, probe).ok())
             .filter(|c| c.state() == connector::State::Connected && !c.modes().is_empty())
             .collect();
 
         let before = self.screens.len();
         self.screens.retain(|s| {
-            let keep = connected.iter().any(|c| c.handle() == s.connector);
+            let keep = s.gpu != dev || connected.iter().any(|c| c.handle() == s.connector);
             if !keep {
                 eprintln!("nordlys-comp: {} unplugged", s.output.name());
             }
@@ -110,14 +204,24 @@ impl Tty {
         let mut changed = self.screens.len() != before;
 
         for conn in &connected {
-            if self.screens.iter().any(|s| s.connector == conn.handle()) {
+            if self
+                .screens
+                .iter()
+                .any(|s| s.gpu == dev && s.connector == conn.handle())
+            {
                 continue;
             }
-            let used: Vec<crtc::Handle> = self.screens.iter().map(|s| s.crtc).collect();
+            let used: Vec<crtc::Handle> = self
+                .screens
+                .iter()
+                .filter(|s| s.gpu == dev)
+                .map(|s| s.crtc)
+                .collect();
+            let drm = &self.gpus[i].drm;
             let crtc = conn
                 .encoders()
                 .iter()
-                .filter_map(|e| self.drm.get_encoder(*e).ok())
+                .filter_map(|e| drm.get_encoder(*e).ok())
                 .flat_map(|e| res.filter_crtcs(e.possible_crtcs()))
                 .find(|c| !used.contains(c));
             let name = connector_name(conn);
@@ -125,7 +229,7 @@ impl Tty {
                 eprintln!("nordlys-comp: no display controller left for {name}; it stays dark");
                 continue;
             };
-            match self.drive(conn, crtc) {
+            match self.drive(i, conn, crtc) {
                 Ok(s) => {
                     self.screens.push(s);
                     changed = true;
@@ -133,9 +237,6 @@ impl Tty {
                 Err(e) => eprintln!("nordlys-comp: cannot drive {name}: {e}"),
             }
         }
-
-        self.screens.sort_by_key(|s| (!s.panel, s.output.name()));
-        self.place();
         Ok(changed)
     }
 
@@ -149,8 +250,14 @@ impl Tty {
         }
     }
 
-    /// A screen on `crtc`, in the connector's preferred mode.
-    fn drive(&mut self, conn: &connector::Info, crtc: crtc::Handle) -> Result<Screen, String> {
+    /// A screen on `crtc` of the GPU at `i`, in the connector's preferred
+    /// mode.
+    fn drive(
+        &mut self,
+        i: usize,
+        conn: &connector::Info,
+        crtc: crtc::Handle,
+    ) -> Result<Screen, String> {
         let drm_mode = conn
             .modes()
             .iter()
@@ -159,10 +266,19 @@ impl Tty {
             .unwrap_or(conn.modes()[0]);
         let name = connector_name(conn);
         let (mm_w, mm_h) = conn.size().unwrap_or((0, 0));
-        let surface = self
+
+        let main = i == 0;
+        if !main && self.gpus[i].copier.is_none() {
+            self.gpus[i].copier = Some(
+                copier(&self.gpus[i].gbm)
+                    .map_err(|e| format!("{} can't draw: {e}", self.gpus[i].path.display()))?,
+            );
+        }
+        let surface = self.gpus[i]
             .drm
             .create_surface(crtc, drm_mode, &[conn.handle()])
             .map_err(|e| e.to_string())?;
+        let gpu = &self.gpus[i];
 
         let (w, h) = drm_mode.size();
         let mode = Mode {
@@ -187,11 +303,21 @@ impl Tty {
         );
         output.set_preferred(mode);
 
+        // What the renderer drawing into this screen's buffers can draw to.
+        let renderer_formats: Vec<Format> = match &gpu.copier {
+            Some(c) => c
+                .egl_context()
+                .dmabuf_render_formats()
+                .iter()
+                .copied()
+                .collect(),
+            None => self.formats.clone(),
+        };
         let allocator = GbmAllocator::new(
-            self.gbm.clone(),
+            gpu.gbm.clone(),
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
         );
-        let exporter = GbmFramebufferExporter::new(self.gbm.clone(), self.render_node);
+        let exporter = GbmFramebufferExporter::new(gpu.gbm.clone(), gpu.render_node);
         let compositor = DrmCompositor::new(
             &output,
             surface,
@@ -199,17 +325,24 @@ impl Tty {
             allocator,
             exporter,
             [Fourcc::Xrgb8888, Fourcc::Argb8888],
-            self.formats.clone(),
-            self.drm.cursor_size(),
-            Some(self.gbm.clone()),
+            renderer_formats,
+            gpu.drm.cursor_size(),
+            Some(gpu.gbm.clone()),
         )
         .map_err(|e| format!("{e:?}"))?;
+        let copy = (!main).then(|| Copy::new(&self.gpus[0].gbm, &output, (w, h)));
         eprintln!(
-            "nordlys-comp: {name} at {w}×{h}@{}Hz, scale {scale}",
+            "nordlys-comp: {name} at {w}×{h}@{}Hz, scale {scale}{}",
             drm_mode.vrefresh(),
+            if main {
+                String::new()
+            } else {
+                format!(", on {}", gpu.path.display())
+            },
         );
         Ok(Screen {
             output,
+            gpu: gpu.dev,
             connector: conn.handle(),
             crtc,
             panel: matches!(
@@ -217,10 +350,75 @@ impl Tty {
                 connector::Interface::EmbeddedDisplayPort | connector::Interface::LVDS
             ),
             compositor,
+            copy,
             pending: false,
             again: false,
         })
     }
+}
+
+/// Open the GPU at `path` and listen to its vblanks. None if it has no
+/// screen connectors (a render-only GPU), so it isn't kept awake.
+fn open_gpu(
+    session: &mut LibSeatSession,
+    handle: &LoopHandle<'static, Comp>,
+    path: &Path,
+) -> Result<Option<Gpu>, Box<dyn Error>> {
+    let fd = session
+        .open(
+            path,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+        )
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+    let (drm, notifier) = DrmDevice::new(fd.clone(), true)?;
+    if drm.resource_handles()?.connectors().is_empty() {
+        return Ok(None);
+    }
+    let gbm = GbmDevice::new(fd.clone())?;
+    let node = DrmNode::from_file(&fd)?;
+    let render_node = node
+        .node_with_type(NodeType::Render)
+        .and_then(Result::ok)
+        .or(Some(node));
+    let mut gpu = Gpu {
+        dev: node.dev_id(),
+        path: path.to_owned(),
+        drm,
+        gbm,
+        render_node,
+        copier: None,
+        token: None,
+    };
+    gpu.token = Some(listen(handle, gpu.dev, notifier)?);
+    Ok(Some(gpu))
+}
+
+fn listen(
+    handle: &LoopHandle<'static, Comp>,
+    dev: libc_dev_t,
+    notifier: DrmDeviceNotifier,
+) -> Result<RegistrationToken, Box<dyn Error>> {
+    let token = handle.insert_source(notifier, move |event, _, comp: &mut Comp| match event {
+        DrmEvent::VBlank(crtc) => vblank(comp, dev, crtc),
+        DrmEvent::Error(e) => eprintln!("nordlys-comp: DRM: {e}"),
+    })?;
+    Ok(token)
+}
+
+/// A renderer on `gbm`'s GPU.
+fn copier(gbm: &GbmDevice<DrmDeviceFd>) -> Result<GlesRenderer, Box<dyn Error>> {
+    // SAFETY: the GBM device lives as long as the display made from it.
+    let egl = unsafe { EGLDisplay::new(gbm.clone())? };
+    let context = EGLContext::new(&egl)?;
+    // SAFETY: the context is current only on this thread.
+    Ok(unsafe { GlesRenderer::new(context)? })
+}
+
+/// The same GPU, however its path is spelled.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    real(a) == real(b)
 }
 
 pub fn init(
@@ -234,32 +432,28 @@ pub fn init(
         )
     })?;
     let seat = session.seat();
+    let handle = event_loop.handle();
 
-    let gpu: PathBuf = primary_gpu(&seat)
-        .ok()
-        .flatten()
-        .or_else(|| all_gpus(&seat).ok()?.into_iter().next())
+    let all = all_gpus(&seat).unwrap_or_default();
+    let main: PathBuf = std::env::var_os("NORDLYS_GPU")
+        .map(PathBuf::from)
+        .or_else(|| primary_gpu(&seat).ok().flatten())
+        .or_else(|| all.first().cloned())
         .ok_or("no GPU found")?;
-    let fd = session
-        .open(
-            &gpu,
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
-        )
-        .map_err(|e| format!("cannot open {}: {e}", gpu.display()))?;
-    let fd = DrmDeviceFd::new(DeviceFd::from(fd));
-    let (drm, drm_notifier) = DrmDevice::new(fd.clone(), true)?;
-    let gbm = GbmDevice::new(fd.clone())?;
-    // SAFETY: the GBM device lives as long as the display made from it.
-    let egl = unsafe { EGLDisplay::new(gbm.clone())? };
-    let context = EGLContext::new(&egl)?;
-    // SAFETY: the context is current only on this thread.
-    let renderer = unsafe { GlesRenderer::new(context)? };
-
-    let node = DrmNode::from_file(&fd).ok();
-    let render_node = node
-        .and_then(|n| n.node_with_type(NodeType::Render)?.ok())
-        .or(node);
+    let main_gpu = open_gpu(&mut session, &handle, &main)?
+        .ok_or_else(|| format!("{} has no screen connectors", main.display()))?;
+    let renderer = copier(&main_gpu.gbm)?;
     let formats: Vec<_> = renderer.dmabuf_formats().into_iter().collect();
+    let device = main_gpu.render_node.map(|n| n.dev_id());
+
+    let mut gpus = vec![main_gpu];
+    for path in all.iter().filter(|p| !same_path(p, &main)) {
+        match open_gpu(&mut session, &handle, path) {
+            Ok(Some(g)) => gpus.push(g),
+            Ok(None) => {}
+            Err(e) => eprintln!("nordlys-comp: leaving {} out: {e}", path.display()),
+        }
+    }
 
     let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
     libinput
@@ -269,28 +463,24 @@ pub fn init(
     let mut tty = Tty {
         session,
         libinput: libinput.clone(),
-        drm,
-        gbm,
         renderer,
-        render_node,
+        gpus,
         formats: formats.clone(),
-        dev: node.map(|n| n.dev_id()),
         screens: Vec::new(),
         active: true,
         queued: false,
     };
-    tty.scan(false)?;
+    tty.scan(false);
     if tty.screens.is_empty() {
         return Err("no connected screen".into());
     }
+    let n = tty.screens.len();
     eprintln!(
-        "nordlys-comp: {} screen{} on {}",
-        tty.screens.len(),
-        if tty.screens.len() == 1 { "" } else { "s" },
-        gpu.display()
+        "nordlys-comp: {n} screen{}, drawn on {}",
+        if n == 1 { "" } else { "s" },
+        main.display()
     );
 
-    let handle = event_loop.handle();
     handle.insert_source(
         LibinputInputBackend::new(libinput),
         |mut event, _, comp: &mut Comp| {
@@ -303,18 +493,10 @@ pub fn init(
     handle.insert_source(notifier, |event, _, comp: &mut Comp| {
         session_event(comp, event)
     })?;
-    handle.insert_source(drm_notifier, |event, _, comp: &mut Comp| match event {
-        DrmEvent::VBlank(crtc) => vblank(comp, crtc),
-        DrmEvent::Error(e) => eprintln!("nordlys-comp: DRM: {e}"),
-    })?;
-    // Screens plugged in or out show up as a change to the GPU.
+    // Screens plugged in or out show up as a change to their GPU.
     match UdevBackend::new(&seat) {
         Ok(udev) => {
-            handle.insert_source(udev, |event, _, comp: &mut Comp| {
-                if let UdevEvent::Changed { device_id } = event {
-                    hotplug(comp, device_id);
-                }
-            })?;
+            handle.insert_source(udev, |event, _, comp: &mut Comp| hotplug(comp, event))?;
         }
         Err(e) => eprintln!("nordlys-comp: no hotplug, udev isn't there: {e}"),
     }
@@ -324,7 +506,7 @@ pub fn init(
         backend: Backend::Tty(Box::new(tty)),
         outputs,
         formats,
-        device: render_node.map(|n| n.dev_id()),
+        device,
     })
 }
 
@@ -396,22 +578,55 @@ fn rescan(comp: &mut Comp, probe: bool) {
     let Backend::Tty(t) = &mut comp.backend else {
         return;
     };
-    match t.scan(probe) {
-        Ok(true) => {
-            let outputs = t.outputs();
-            comp.set_outputs(outputs);
-        }
-        Ok(false) => {}
-        Err(e) => eprintln!("nordlys-comp: {e}"),
+    if t.scan(probe) {
+        let outputs = t.outputs();
+        comp.set_outputs(outputs);
     }
 }
 
-fn hotplug(comp: &mut Comp, device: libc_dev_t) {
-    let Backend::Tty(t) = &comp.backend else {
+fn hotplug(comp: &mut Comp, event: UdevEvent) {
+    let handle = comp.handle.clone();
+    let Backend::Tty(t) = &mut comp.backend else {
         return;
     };
-    if t.active && t.dev == Some(device) {
-        rescan(comp, true);
+    if !t.active {
+        return;
+    }
+    match event {
+        UdevEvent::Changed { device_id } => {
+            if t.gpus.iter().any(|g| g.dev == device_id) {
+                rescan(comp, true);
+            }
+        }
+        // A GPU plugged in (a dock, an external GPU).
+        UdevEvent::Added { device_id, path } => {
+            if t.gpus.iter().any(|g| g.dev == device_id) {
+                return;
+            }
+            match open_gpu(&mut t.session, &handle, &path) {
+                Ok(Some(g)) => {
+                    eprintln!("nordlys-comp: {} plugged in", path.display());
+                    t.gpus.push(g);
+                    rescan(comp, true);
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("nordlys-comp: leaving {} out: {e}", path.display()),
+            }
+        }
+        UdevEvent::Removed { device_id } => {
+            // The main GPU can't go: everything is drawn with it.
+            let Some(i) = t.gpus.iter().skip(1).position(|g| g.dev == device_id) else {
+                return;
+            };
+            let gpu = t.gpus.remove(i + 1);
+            eprintln!("nordlys-comp: {} unplugged", gpu.path.display());
+            t.screens.retain(|s| s.gpu != device_id);
+            if let Some(token) = gpu.token {
+                handle.remove(token);
+            }
+            let outputs = t.outputs();
+            comp.set_outputs(outputs);
+        }
     }
 }
 
@@ -423,7 +638,9 @@ fn session_event(comp: &mut Comp, event: SessionEvent) {
         SessionEvent::PauseSession => {
             t.active = false;
             t.libinput.suspend();
-            t.drm.pause();
+            for g in &mut t.gpus {
+                g.drm.pause();
+            }
             for s in &mut t.screens {
                 s.pending = false;
             }
@@ -432,14 +649,22 @@ fn session_event(comp: &mut Comp, event: SessionEvent) {
             if let Err(()) = t.libinput.resume() {
                 eprintln!("nordlys-comp: libinput didn't come back");
             }
-            if let Err(e) = t.drm.activate(false) {
-                eprintln!("nordlys-comp: the screens didn't come back: {e}");
+            for g in &mut t.gpus {
+                if let Err(e) = g.drm.activate(false) {
+                    eprintln!(
+                        "nordlys-comp: the screens on {} didn't come back: {e}",
+                        g.path.display()
+                    );
+                }
             }
             for s in &mut t.screens {
                 if let Err(e) = s.compositor.reset_state() {
                     eprintln!("nordlys-comp: {} state: {e}", s.output.name());
                 }
                 s.compositor.reset_buffers();
+                if let Some(c) = &mut s.copy {
+                    c.reset(&s.output);
+                }
                 s.pending = false;
             }
             t.active = true;
@@ -450,11 +675,15 @@ fn session_event(comp: &mut Comp, event: SessionEvent) {
     }
 }
 
-fn vblank(comp: &mut Comp, crtc: crtc::Handle) {
+fn vblank(comp: &mut Comp, dev: libc_dev_t, crtc: crtc::Handle) {
     let Backend::Tty(t) = &mut comp.backend else {
         return;
     };
-    let Some(s) = t.screens.iter_mut().find(|s| s.crtc == crtc) else {
+    let Some(s) = t
+        .screens
+        .iter_mut()
+        .find(|s| s.gpu == dev && s.crtc == crtc)
+    else {
         return;
     };
     if let Err(e) = s.compositor.frame_submitted() {
@@ -462,7 +691,7 @@ fn vblank(comp: &mut Comp, crtc: crtc::Handle) {
     }
     s.pending = false;
     if std::mem::take(&mut s.again) {
-        draw(comp, Some(crtc));
+        draw(comp, Some((dev, crtc)));
     }
 }
 
@@ -497,8 +726,9 @@ pub fn render(comp: &mut Comp) {
     draw(comp, None);
 }
 
-/// Draw the screens that can take a frame, or just the one on `only`.
-fn draw(comp: &mut Comp, only: Option<crtc::Handle>) {
+/// Draw the screens that can take a frame, or just the one on `only` (a
+/// GPU and its CRTC).
+fn draw(comp: &mut Comp, only: Option<(libc_dev_t, crtc::Handle)>) {
     let Backend::Tty(mut t) = std::mem::replace(&mut comp.backend, Backend::Taken) else {
         return;
     };
@@ -509,10 +739,13 @@ fn draw(comp: &mut Comp, only: Option<crtc::Handle>) {
     comp.cursor.drawn = true;
     let mut drawn = Vec::new();
     let Tty {
-        screens, renderer, ..
+        screens,
+        renderer,
+        gpus,
+        ..
     } = &mut *t;
     for s in screens.iter_mut() {
-        if only.is_some_and(|c| c != s.crtc) {
+        if only.is_some_and(|k| k != (s.gpu, s.crtc)) {
             continue;
         }
         if s.pending {
@@ -521,22 +754,39 @@ fn draw(comp: &mut Comp, only: Option<crtc::Handle>) {
         }
         let elements = render::elements(comp, renderer, &s.output, true);
         let ground = comp.ground();
-        match s
-            .compositor
-            .render_frame(renderer, &elements, ground, FrameFlags::DEFAULT)
-        {
-            Ok(frame) => {
-                if !frame.is_empty {
-                    match s.compositor.queue_frame(()) {
-                        Ok(()) => s.pending = true,
-                        Err(e) => eprintln!(
-                            "nordlys-comp: cannot show the frame on {}: {e:?}",
-                            s.output.name()
-                        ),
-                    }
-                }
-            }
-            Err(e) => eprintln!("nordlys-comp: render on {} failed: {e:?}", s.output.name()),
+        let shown = match &mut s.copy {
+            None => s
+                .compositor
+                .render_frame(renderer, &elements, ground, FrameFlags::DEFAULT)
+                .map(|frame| !frame.is_empty)
+                .map_err(|e| format!("{e:?}")),
+            Some(copy) => match gpus
+                .iter_mut()
+                .find(|g| g.dev == s.gpu)
+                .and_then(|g| g.copier.as_mut())
+            {
+                Some(copier) => copy_frame(
+                    renderer,
+                    copier,
+                    copy,
+                    &mut s.compositor,
+                    &s.output,
+                    &elements,
+                    ground,
+                ),
+                None => Err("its GPU has no renderer".into()),
+            },
+        };
+        match shown {
+            Ok(true) => match s.compositor.queue_frame(()) {
+                Ok(()) => s.pending = true,
+                Err(e) => eprintln!(
+                    "nordlys-comp: cannot show the frame on {}: {e:?}",
+                    s.output.name()
+                ),
+            },
+            Ok(false) => {}
+            Err(e) => eprintln!("nordlys-comp: render on {} failed: {e}", s.output.name()),
         }
         render::shots(comp, renderer, &s.output, &elements);
         drawn.push(s.output.clone());
@@ -545,4 +795,97 @@ fn draw(comp: &mut Comp, only: Option<crtc::Handle>) {
     for o in &drawn {
         comp.frame_done(o);
     }
+}
+
+/// Draw `elements` with the main GPU into one of `copy`'s buffers, then
+/// put that on the screen with its own GPU's `copier`. True if there's a
+/// new frame to queue.
+fn copy_frame(
+    main: &mut GlesRenderer,
+    copier: &mut GlesRenderer,
+    copy: &mut Copy,
+    compositor: &mut Compositor,
+    output: &Output,
+    elements: &[render::Elem],
+    ground: [f32; 4],
+) -> Result<bool, String> {
+    let slot = copy
+        .swapchain
+        .acquire()
+        .map_err(|e| format!("no buffer on the main GPU: {e}"))?
+        .ok_or("every buffer on the main GPU is in use")?;
+    let dmabuf = match slot.userdata().get::<Dmabuf>() {
+        Some(d) => d.clone(),
+        None => {
+            let d = slot.export().map_err(|e| e.to_string())?;
+            slot.userdata().insert_if_missing_threadsafe(|| d.clone());
+            d
+        }
+    };
+    let size = dmabuf.size();
+    let mut bound = dmabuf.clone();
+    let mut target = main.bind(&mut bound).map_err(|e| e.to_string())?;
+    let result = copy
+        .damage
+        .render_output(main, &mut target, usize::from(slot.age()), elements, ground)
+        .map_err(|e| format!("{e:?}"))?;
+    let Some(damage) = result.damage.filter(|d| !d.is_empty()).cloned() else {
+        return Ok(false);
+    };
+    let sync = result.sync;
+    main.wait(&sync).map_err(|e| e.to_string())?;
+
+    let mut texture = None;
+    if !copy.cpu {
+        match copier.import_dmabuf(&dmabuf, None) {
+            Ok(t) => texture = Some(t),
+            Err(e) => {
+                eprintln!(
+                    "nordlys-comp: {} can't read the main GPU's buffers ({e}); copying through memory",
+                    output.name()
+                );
+                copy.cpu = true;
+            }
+        }
+    }
+    let texture: GlesTexture = match texture {
+        Some(t) => t,
+        None => {
+            let mapping = main
+                .copy_framebuffer(&target, Rectangle::from_size(size), Fourcc::Abgr8888)
+                .map_err(|e| e.to_string())?;
+            let pixels = main.map_texture(&mapping).map_err(|e| e.to_string())?;
+            copier
+                .import_memory(pixels, Fourcc::Abgr8888, size, mapping.flipped())
+                .map_err(|e| e.to_string())?
+        }
+    };
+    drop(target);
+    copy.swapchain.submitted(&slot);
+
+    copy.bag.add(damage.iter().map(|r| {
+        Rectangle::<i32, BufferCoords>::new(
+            (r.loc.x, r.loc.y).into(),
+            Size::from((r.size.w, r.size.h)),
+        )
+    }));
+    let element = TextureRenderElement::from_texture_with_damage(
+        copy.id.clone(),
+        copier.context_id(),
+        (0.0, 0.0),
+        texture,
+        output.current_scale().integer_scale(),
+        Transform::Normal,
+        None,
+        None,
+        None,
+        Some(vec![Rectangle::from_size(size)]),
+        copy.bag.snapshot(),
+        Kind::Unspecified,
+    );
+    let elements = [element];
+    let frame = compositor
+        .render_frame(copier, &elements, ground, FrameFlags::DEFAULT)
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(!frame.is_empty)
 }
