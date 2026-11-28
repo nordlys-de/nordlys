@@ -649,21 +649,23 @@ mod tests {
 
     #[test]
     fn unread_counts_what_is_newer_than_seen() {
-        let mut n = Notices::default();
-        n.recent = vec![
-            Entry {
-                id: 5,
-                ..Entry::default()
-            },
-            Entry {
-                id: 4,
-                ..Entry::default()
-            },
-            Entry {
-                id: 2,
-                ..Entry::default()
-            },
-        ];
+        let n = Notices {
+            recent: vec![
+                Entry {
+                    id: 5,
+                    ..Entry::default()
+                },
+                Entry {
+                    id: 4,
+                    ..Entry::default()
+                },
+                Entry {
+                    id: 2,
+                    ..Entry::default()
+                },
+            ],
+            ..Notices::default()
+        };
         assert_eq!(unread(&n, 3), 2);
     }
 }
