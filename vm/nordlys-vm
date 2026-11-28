@@ -76,7 +76,7 @@ boot() { # boot disk|iso ISO
     [[ $first == iso ]] && disk_index=2 iso_index=1
     # Where the screen goes: a GTK window (default), or SPICE on localhost for
     # remote-viewer, which captures the keyboard and mouse better.
-    local spice= vdagent=()
+    local spice='' vdagent=()
     local display=(-display "${NORDLYS_VM_DISPLAY:-gtk,gl=on,zoom-to-fit=on}")
     if [[ ${NORDLYS_VM_DISPLAY:-} == spice ]]; then
         spice=${NORDLYS_VM_SPICE_PORT:-5930}
@@ -88,8 +88,8 @@ boot() { # boot disk|iso ISO
             -spice "port=$spice,addr=127.0.0.1,disable-ticketing=on")
         # The guest's spice-vdagent: resizes the guest to the viewer, and
         # shares the clipboard. Added after the serial bus below.
-        vdagent=(-chardev spicevmc,id=vdagent,name=vdagent
-            -device virtserialport,chardev=vdagent,name=com.redhat.spice.0)
+        vdagent=(-chardev 'spicevmc,id=vdagent,name=vdagent'
+            -device 'virtserialport,chardev=vdagent,name=com.redhat.spice.0')
         command -v remote-viewer >/dev/null \
             || say "remote-viewer not found: install virt-viewer, or connect with any SPICE client to 127.0.0.1:$spice"
     fi
@@ -105,7 +105,7 @@ boot() { # boot disk|iso ISO
         ${display[@]+"${display[@]}"}
         -device virtio-tablet-pci -device virtio-keyboard-pci
         -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${NORDLYS_VM_SSH_PORT:-2222}-:22"
-        -audiodev "${NORDLYS_VM_AUDIO:-pa},id=snd" -device intel-hda -device hda-output,audiodev=snd
+        -audiodev "${NORDLYS_VM_AUDIO:-pa},id=snd" -device intel-hda -device 'hda-output,audiodev=snd'
         # The clipboard channel: /dev/virtio-ports/org.nordlys.clipboard inside.
         -device virtio-serial-pci
         -chardev "socket,id=clip,path=$sock,server=on,wait=off"
@@ -115,7 +115,7 @@ boot() { # boot disk|iso ISO
     )
     if [[ -n $iso ]]; then
         qemu+=(-drive "if=none,id=cd,format=raw,media=cdrom,readonly=on,file=$iso"
-            -device ide-cd,drive=cd,bootindex=$iso_index)
+            -device "ide-cd,drive=cd,bootindex=$iso_index")
     fi
 
     # Extra QEMU options, split on spaces.
