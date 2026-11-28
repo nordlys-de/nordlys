@@ -280,7 +280,33 @@ screen under the pointer has the keyboard, new windows open there, and
 going to a workspace another screen shows moves the keyboard (and the
 pointer) to that screen. Super+Ctrl+← → moves the keyboard between
 screens, Super+Ctrl+Shift+← → sends the window to the next screen and
-follows it. A screen unplugged leaves its workspace and windows behind, a
+follows it. Super+Shift+F makes a window fullscreen, and so do apps that
+ask (a video player, a browser on F11): it fills its screen over the bar
+and shelf, while notifications and the launcher still show on top. A
+window another app activates (a link opened from chat, say) comes to the
+stage, from its workspace if need be, but only when the app asking had
+the keyboard at the time, so nothing pulls itself in front later. Clipboard history (cliphist,
+Super+V), screenshots and screen recording work as on Hyprland: the
+compositor speaks wlr-data-control and wlr-screencopy (shared-memory
+buffers), so wl-paste --watch, grim, slurp and wf-recorder see it, and
+Super+Shift+S, Super+R, Super+Shift+R and Super+F1 do what they do
+there. Super+F (float) and Super+- (scratchpad) aren't there yet.
+
+Games and 3D apps can lock or confine the pointer and read raw mouse
+motion (pointer-constraints, relative-pointer); a lock only takes hold
+once the pointer is over the app and the app has the keyboard. Input
+methods such as fcitx5 and ibus work in apps' text fields (text-input v3,
+input-method v2). A virtual machine or remote desktop can ask for the
+keyboard shortcuts while it has the keyboard; then the Nordlys key goes to
+it, the media keys and Ctrl+Alt+F1-F12 still work, and Super+Escape gives
+the shortcuts back.
+
+Touchpad swipes and pinches reach apps (pointer-gestures), so browsers
+pinch to zoom. Other taskbars and window switchers can see the open
+windows (ext-foreign-toplevel-list), on-screen keyboards and wtype can
+type (virtual-keyboard), and portal file pickers sit on the app that asked
+(xdg-foreign).
+A screen unplugged leaves its workspace and windows behind, a
 Super+number away. Every screen gets its own bar, shelf and close button,
 and the lock screen covers them all.
 
@@ -295,13 +321,17 @@ picked up too. `nordlysctl focus-screen DP-1` does
 the same over IPC, and `nordlysctl screenshot` saves the screen with the
 keyboard.
 
-What it doesn't do yet: arranging screens yourself (Settings' Screens page
-writes Hyprland's config, which nordlys-comp doesn't read), mirroring, a
-mode other than the preferred one, screen sharing (no
-portal knows nordlys-comp), fractional scaling (it picks 1 or 2 from the
-screen's density; `NORDLYS_SCALE` overrides it for all of them), and
-hardware cursor planes
-are left to Smithay to choose.
+Screens can be arranged with wlr-randr, kanshi, wdisplays or nwg-displays
+(wlr-output-management): another mode, another place, a scale of 1 to 4
+(`wlr-randr --output DP-1 --mode 2560x1440@144 --pos 1920,0 --scale 2`).
+Each starts in its preferred mode at a scale picked from its density
+(`NORDLYS_SCALE` overrides that), left to right; the changes last until
+the session ends, so put them in kanshi's config to keep them.
+
+What it doesn't do yet: turning a screen off, rotating it, fractional
+scales, mirroring, Settings' Screens page (it writes Hyprland's config,
+which nordlys-comp doesn't read), and screen sharing (no portal knows
+nordlys-comp). Hardware cursor planes are left to Smithay to choose.
 
 ## Settings
 

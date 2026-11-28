@@ -58,7 +58,29 @@ fn place(outputs: &[Output], window: Size<i32, Physical>) {
         };
         o.change_current_state(Some(mode), None, None, Some((w * i, 0).into()));
         o.set_preferred(mode);
+        // Its size follows the window: no other mode is real.
+        for m in o.modes().into_iter().filter(|m| *m != mode) {
+            o.delete_mode(m);
+        }
     }
+}
+
+/// The nested screens are slices of the window: only their scale can
+/// change.
+pub fn configure(changes: &[crate::outputs::Change]) -> Result<(), String> {
+    for c in changes {
+        if Some(c.mode) != c.output.current_mode() {
+            return Err("a nested screen's size follows the window".into());
+        }
+        if c.position != c.output.current_location() {
+            return Err("nested screens can't be moved".into());
+        }
+    }
+    for c in changes {
+        c.output
+            .change_current_state(None, None, Some(crate::outputs::scale_of(c)), None);
+    }
+    Ok(())
 }
 
 impl Winit {
@@ -206,9 +228,11 @@ pub fn render(comp: &mut Comp) {
         }
         for (out, screen) in &per_screen {
             render::shots(comp, w.renderer(), out, screen);
+            crate::screencopy::serve(comp, w.renderer(), out, screen, false);
         }
     }
-    w.request_redraw();
+    // No redraw asked for here: the next comes when something changes
+    // (a commit, a resize, a screenshot), so an idle nested desktop sleeps.
     comp.backend = Backend::Winit(w);
     for out in &outputs {
         comp.frame_done(out);

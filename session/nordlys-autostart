@@ -13,6 +13,7 @@ if command -v systemctl >/dev/null && systemctl --user cat nordlys-session.targe
     systemctl --user --no-block start nordlys-session.target
 else
     # No systemd user session: start the pieces by hand (no restarts).
+    command -v cliphist >/dev/null && wl-paste --watch cliphist store &
     for piece in notify bar shelf close-button; do
         nordlys-shell "$piece" &
     done

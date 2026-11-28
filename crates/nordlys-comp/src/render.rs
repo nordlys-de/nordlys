@@ -125,8 +125,16 @@ pub fn elements(
 
     // The glass on top, each with its blur behind it.
     let map = layer_map_for_output(output);
-    let glass: Vec<_> = [Layer::Overlay, Layer::Top]
-        .into_iter()
+    // A fullscreen window hides the bar and shelf; notifications, the
+    // launcher and the OSD (the overlay layer) still show over it.
+    let layers: &[Layer] = if comp.covered(output) {
+        &[Layer::Overlay]
+    } else {
+        &[Layer::Overlay, Layer::Top]
+    };
+    let glass: Vec<_> = layers
+        .iter()
+        .copied()
         .flat_map(|l| map.layers_on(l).rev().cloned().collect::<Vec<_>>())
         .filter_map(|l| Some((map.layer_geometry(&l)?, l)))
         .collect();
