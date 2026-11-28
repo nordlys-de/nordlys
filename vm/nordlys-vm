@@ -13,12 +13,18 @@
 # In the window: Ctrl+Alt+G grabs the keyboard, so Super reaches the VM and
 # not your window manager (press again to release). Ctrl+Alt+F: fullscreen.
 #
+# NORDLYS_VM_DISPLAY=spice shows the VM through SPICE instead, in remote-viewer
+# (virt-viewer). Your window manager then sees a separate window, and keys
+# and the mouse go to the VM once it has focus. Closing the viewer leaves the
+# VM running; reopen it with: remote-viewer spice://127.0.0.1:5930
+#
 # After installing the OS, set up Nordlys inside the VM:
 #   sudo pacman -S git github-cli && gh auth login
 #   gh repo clone nordlys-de/nordlys && nordlys/scripts/setup.sh
 #
 # Environment: NORDLYS_VM_MEM (6G), NORDLYS_VM_CPUS (4), NORDLYS_VM_DISK (40G),
-# NORDLYS_VM_DISPLAY (gtk,gl=on,zoom-to-fit=on), NORDLYS_VM_SSH_PORT (2222),
+# NORDLYS_VM_DISPLAY (gtk,gl=on,zoom-to-fit=on, or spice), NORDLYS_VM_SPICE_PORT
+# (5930), NORDLYS_VM_SSH_PORT (2222),
 # NORDLYS_VM_AUDIO (pa), NORDLYS_VM_EXTRA (more QEMU options).
 set -euo pipefail
 
@@ -68,6 +74,26 @@ boot() { # boot disk|iso ISO
     # UEFI tries the lower bootindex first and falls through an empty disk.
     local disk_index=1 iso_index=2
     [[ $first == iso ]] && disk_index=2 iso_index=1
+    # Where the screen goes: a GTK window (default), or SPICE on localhost for
+    # remote-viewer, which captures the keyboard and mouse better.
+    local spice= vdagent=()
+    local display=(-display "${NORDLYS_VM_DISPLAY:-gtk,gl=on,zoom-to-fit=on}")
+    if [[ ${NORDLYS_VM_DISPLAY:-} == spice ]]; then
+        spice=${NORDLYS_VM_SPICE_PORT:-5930}
+        local render
+        render=$(ls /dev/dri/renderD* 2>/dev/null | head -1 || true)
+        [[ -n $render ]] || die "no render node in /dev/dri for 3D acceleration"
+        # egl-headless renders the 3D offscreen; SPICE sends the frames.
+        display=(-display "egl-headless,rendernode=$render"
+            -spice "port=$spice,addr=127.0.0.1,disable-ticketing=on")
+        # The guest's spice-vdagent: resizes the guest to the viewer, and
+        # shares the clipboard. Added after the serial bus below.
+        vdagent=(-chardev spicevmc,id=vdagent,name=vdagent
+            -device virtserialport,chardev=vdagent,name=com.redhat.spice.0)
+        command -v remote-viewer >/dev/null \
+            || say "remote-viewer not found: install virt-viewer, or connect with any SPICE client to 127.0.0.1:$spice"
+    fi
+
     local qemu=(
         qemu-system-x86_64 -name Nordlys -enable-kvm -machine q35 -cpu host
         -smp "${NORDLYS_VM_CPUS:-4}" -m "${NORDLYS_VM_MEM:-6G}"
@@ -76,7 +102,7 @@ boot() { # boot disk|iso ISO
         -drive "if=none,id=hd,format=qcow2,discard=unmap,file=$disk"
         -device "virtio-blk-pci,drive=hd,bootindex=$disk_index"
         -device virtio-vga-gl
-        -display "${NORDLYS_VM_DISPLAY:-gtk,gl=on,zoom-to-fit=on}"
+        ${display[@]+"${display[@]}"}
         -device virtio-tablet-pci -device virtio-keyboard-pci
         -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${NORDLYS_VM_SSH_PORT:-2222}-:22"
         -audiodev "${NORDLYS_VM_AUDIO:-pa},id=snd" -device intel-hda -device hda-output,audiodev=snd
@@ -84,6 +110,7 @@ boot() { # boot disk|iso ISO
         -device virtio-serial-pci
         -chardev "socket,id=clip,path=$sock,server=on,wait=off"
         -device "virtserialport,chardev=clip,name=org.nordlys.clipboard"
+        ${vdagent[@]+"${vdagent[@]}"}
         -pidfile "$pidfile"
     )
     if [[ -n $iso ]]; then
@@ -97,10 +124,22 @@ boot() { # boot disk|iso ISO
     qemu+=(${extra[@]+"${extra[@]}"})
 
     [[ -n $fresh ]] && say "New VM: the installer from $(basename "$iso") will start. Pick UEFI defaults and the whole disk."
-    say "Ctrl+Alt+G grabs the keyboard (Super goes to the VM); Ctrl+Alt+F is fullscreen"
+    if [[ -n $spice ]]; then
+        say "Screen over SPICE on 127.0.0.1:$spice; the viewer opens when the VM is up"
+    else
+        say "Ctrl+Alt+G grabs the keyboard (Super goes to the VM); Ctrl+Alt+F is fullscreen"
+    fi
     "${qemu[@]}" &
     local qpid=$!
     for _ in $(seq 50); do [[ -S $sock ]] && break; sleep 0.1; done
+    if [[ -n $spice ]] && command -v remote-viewer >/dev/null; then
+        # Wait for SPICE to listen before the viewer connects.
+        for _ in $(seq 100); do
+            (exec 3<>"/dev/tcp/127.0.0.1/$spice") 2>/dev/null && break
+            sleep 0.1
+        done
+        remote-viewer "spice://127.0.0.1:$spice" >/dev/null 2>&1 &
+    fi
     local cpid=
     if [[ -S $sock ]]; then
         python3 "$here/clipboard.py" "$sock" &

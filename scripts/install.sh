@@ -40,13 +40,46 @@ units="$destdir$prefix/lib/systemd/user"
 bins="nordlys-comp nordlys-shell nordlysctl nordlys-theme nordlys-settings"
 apps="$destdir$prefix/share/applications"
 portals="$destdir$prefix/share/xdg-desktop-portal"
+entries="nordlys.desktop nordlys-comp.desktop"
+
+# SDDM can be told to read Wayland sessions from other folders
+# ([Wayland] SessionDir, comma-separated), such as one of hand-picked links.
+# When none of them is $sessions, prints the first, where links to the
+# entries go. Later files win, as in SDDM: its defaults, then
+# /etc/sddm.conf.d, then /etc/sddm.conf.
+sddm_session_dir() {
+    confs=
+    for f in "$destdir"/usr/lib/sddm/sddm.conf.d/* "$destdir"/etc/sddm.conf.d/* "$destdir/etc/sddm.conf"; do
+        [ -f "$f" ] && confs="$confs $f"
+    done
+    [ -n "$confs" ] || return 0
+    # shellcheck disable=SC2086
+    dirs=$(cat $confs | awk '
+        /^[[:space:]]*\[/ { wayland = ($0 ~ /^[[:space:]]*\[Wayland\]/) }
+        wayland && /^[[:space:]]*SessionDir[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); dir = $0 }
+        END { print dir }')
+    [ -n "$dirs" ] || return 0
+    first=
+    for d in $(echo "$dirs" | tr ',' ' '); do
+        d=${d%/}
+        [ "$destdir$d" = "$sessions" ] && return 0
+        [ -n "$first" ] || first=$d
+    done
+    echo "$first"
+}
 
 if [ -n "$uninstall" ]; then
     for b in $bins nordlys-session nordlys-record nordlys-vm-agent; do rm -fv "$bin/$b"; done
     rm -rfv "$destdir/usr/share/sddm/themes/nordlys"
     rm -fv "$destdir/etc/udev/rules.d/70-nordlys-vm.rules"
     rm -rfv "$data"
-    rm -fv "$sessions/nordlys.desktop" "$sessions/nordlys-comp.desktop" "$apps/nordlys-settings.desktop"
+    linked=$(sddm_session_dir)
+    for e in $entries; do
+        l="$destdir$linked/$e"
+        [ -n "$linked" ] && [ -L "$l" ] && [ "$(readlink "$l")" = "/usr/share/wayland-sessions/$e" ] && rm -fv "$l"
+        rm -fv "$sessions/$e"
+    done
+    rm -fv "$apps/nordlys-settings.desktop"
     rm -fv "$portals/nordlys-portals.conf"
     for u in "$root"/session/systemd/*; do rm -fv "$units/$(basename "$u")"; done
     # The PAM file only includes `login`; it's left in place on purpose
@@ -91,6 +124,14 @@ done
 if [ "$prefix" != /usr ]; then
     sed -i "s#^Exec=nordlys-session#Exec=$prefix/bin/nordlys-session#; s#^TryExec=nordlys-#TryExec=$prefix/bin/nordlys-#" \
         "$sessions/nordlys.desktop" "$sessions/nordlys-comp.desktop"
+fi
+# SDDM set to read sessions elsewhere wouldn't list Nordlys; link it in.
+linked=$(sddm_session_dir)
+if [ -n "$linked" ] && [ -d "$destdir$linked" ]; then
+    for e in $entries; do ln -sfn "/usr/share/wayland-sessions/$e" "$destdir$linked/$e"; done
+    echo "Linked the Nordlys sessions into $linked, where SDDM looks for them."
+elif [ -n "$linked" ]; then
+    echo "install.sh: SDDM reads sessions from $linked, which doesn't exist; Nordlys won't be listed there" >&2
 fi
 [ -e "$pam/nordlys" ] || install -m644 "$root/config/pam.d/nordlys" "$pam/nordlys"
 # The login screen theme for SDDM, with the wallpaper beside it.

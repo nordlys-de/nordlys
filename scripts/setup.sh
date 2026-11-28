@@ -56,7 +56,7 @@ packages="base-devel git pkgconf pam libxkbcommon wayland mesa libinput seatd li
     gnome-keyring libsecret seahorse wf-recorder cliphist"
 # A rustup or distro toolchain that's already here is fine.
 command -v cargo >/dev/null || packages="$packages rust"
-[ "$vm_guest" = yes ] && packages="$packages python"
+[ "$vm_guest" = yes ] && packages="$packages python spice-vdagent"
 
 say "Installing dependencies"
 # -Syu: installing against a stale package list would half-upgrade the system.

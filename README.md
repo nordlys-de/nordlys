@@ -51,6 +51,9 @@ Or build a package: `cd packaging/arch && makepkg -si`.
 Log out, pick **Nordlys** in your display manager (SDDM, GDM, greetd…) and
 log in. From a TTY, run `nordlys-session`. In a VM, give it 3D
 acceleration (virtio-gpu with OpenGL, or VMware's 3D); Hyprland needs it.
+If SDDM is set to read sessions from a folder of its own (`SessionDir` under
+`[Wayland]`), the install links the Nordlys entries into it, so they're
+listed beside the sessions you picked.
 
 What you get:
 
@@ -161,6 +164,20 @@ without 3D: `NORDLYS_VM_EXTRA="-device bochs-display" vm/nordlys-vm run`
 
 Ctrl+Alt+G grabs the keyboard so Super reaches the VM; Ctrl+Alt+F is
 fullscreen. `vm/nordlys-vm destroy` deletes the VM.
+
+If Super keys or the mouse don't reach the VM's window (your window
+manager takes them first), show the VM through SPICE in `remote-viewer`
+(from virt-viewer) instead:
+
+```sh
+NORDLYS_VM_DISPLAY=spice vm/nordlys-vm run
+```
+
+Inside the VM, install `spice-vdagent` (`setup.sh` does this with
+`--vm-guest`) and start its daemon, so the window and clipboard follow
+the host: `sudo systemctl enable --now spice-vdagentd`. Closing the
+viewer leaves the VM running; reopen it with
+`remote-viewer spice://127.0.0.1:5930`.
 
 ## Try it
 
