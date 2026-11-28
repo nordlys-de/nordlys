@@ -37,8 +37,31 @@ pub struct Target {
 pub struct Ctx<'a> {
     /// Where the files land; qt6ct wants an absolute path to its scheme.
     pub out: &'a Path,
-    /// GTK 3 theme to name in settings.ini (adw-gtk3 when installed).
-    pub gtk3_theme: &'a str,
+    /// The palette of the other mode (same accent), so GTK 4 apps can
+    /// switch between dark and light without a restart.
+    pub other: &'a Palette,
+    /// Where the Nordlys GTK 3 themes go (~/.local/share/themes).
+    pub themes: &'a Path,
+    /// The themes folder holding adw-gtk3, which they build on; stock
+    /// Adwaita when it isn't installed.
+    pub adw_gtk3: Option<&'a Path>,
+}
+
+/// The GTK 3 theme for a mode. Its folder holds the palette, because GTK 3
+/// reads ~/.config/gtk-3.0/gtk.css only when an app starts but reloads the
+/// theme whenever its name changes.
+pub fn gtk3_name(dark: bool) -> &'static str {
+    if dark { "Nordlys-dark" } else { "Nordlys" }
+}
+
+/// The theme a Nordlys theme builds on.
+pub fn gtk3_base(dark: bool, adw_gtk3: bool) -> &'static str {
+    match (adw_gtk3, dark) {
+        (true, true) => "adw-gtk3-dark",
+        (true, false) => "adw-gtk3",
+        (false, true) => "Adwaita-dark",
+        (false, false) => "Adwaita",
+    }
 }
 
 /// The starting dotfiles, embedded so the binary is self-contained.
@@ -94,10 +117,15 @@ pub fn all(p: &Palette, ctx: &Ctx) -> Vec<Target> {
         kind: Kind::Marked,
         hook: None,
     };
+    let (dark, light) = if p.dark {
+        (p, ctx.other)
+    } else {
+        (ctx.other, p)
+    };
     let mut v = vec![
-        marked("gtk-4.0/gtk.css", gtk4_css(p)),
-        marked("gtk-3.0/gtk.css", gtk3_css(p)),
-        marked("gtk-3.0/settings.ini", gtk3_settings(p, ctx.gtk3_theme)),
+        marked("gtk-4.0/gtk.css", gtk4_css(p, dark, light)),
+        marked("gtk-3.0/gtk.css", gtk3_user_css()),
+        marked("gtk-3.0/settings.ini", gtk3_settings(p, gtk3_name(p.dark))),
         owned("qt6ct/colors/nordlys.conf", qt_scheme(p)),
         marked("qt6ct/qt6ct.conf", qt6ct_conf(ctx.out)),
         owned("foot/nordlys.ini", foot(p)),
@@ -107,6 +135,10 @@ pub fn all(p: &Palette, ctx: &Ctx) -> Vec<Target> {
         owned("mpv/nordlys.conf", fill(MPV, p)),
         marked("imv/config", fill(IMV, p)),
     ];
+    for pal in [dark, light] {
+        let path = ctx.themes.join(gtk3_name(pal.dark)).join("gtk-3.0/gtk.css");
+        v.push(owned(&path.to_string_lossy(), gtk3_css(pal, ctx.adw_gtk3)));
+    }
     v.extend(SEEDS.iter().map(|&(path, body, hook)| Target {
         path: path.into(),
         body: body.into(),
@@ -214,24 +246,54 @@ fn css_header() -> String {
     )
 }
 
-fn gtk4_css(p: &Palette) -> String {
+/// Named colours for the current mode (libadwaita before 1.6), then the
+/// CSS variables for both modes: GTK 4.16+ picks the block that matches
+/// the dark/light setting, and follows it when it changes.
+fn gtk4_css(p: &Palette, dark: &Palette, light: &Palette) -> String {
     let mut s = css_header();
     for (name, c) in adw_colors(p) {
         let _ = writeln!(s, "@define-color {name} {};", c.hex());
     }
-    s.push_str("\n:root {\n");
-    for (name, c) in adw_colors(p) {
-        let _ = writeln!(s, "  --{}: {};", name.replace('_', "-"), c.hex());
+    for (scheme, pal) in [("dark", dark), ("light", light)] {
+        let _ = writeln!(
+            s,
+            "\n@media (prefers-color-scheme: {scheme}) {{\n  :root {{"
+        );
+        for (name, c) in adw_colors(pal) {
+            let _ = writeln!(s, "    --{}: {};", name.replace('_', "-"), c.hex());
+        }
+        s.push_str("  }\n}\n");
     }
-    s.push_str("}\n");
     s
 }
 
-/// GTK 3 has no CSS variables. The theme_* names are what GTK 3 apps and
-/// adw-gtk3 look up; stock Adwaita compiles its colours in, so GTK 3 apps
-/// follow the palette with adw-gtk3 (`adw-gtk-theme` on Arch).
-fn gtk3_css(p: &Palette) -> String {
+/// The palette lives in the Nordlys themes; a colour here would outlast a
+/// change of mode in apps that are already open.
+fn gtk3_user_css() -> String {
     let mut s = css_header();
+    s.push_str("/* The colours are in the Nordlys GTK theme (~/.local/share/themes). */\n");
+    s
+}
+
+/// A GTK 3 theme: adw-gtk3 (or Adwaita) with the palette on top. GTK 3 has
+/// no CSS variables; the theme_* names are what GTK 3 apps and adw-gtk3
+/// look up. Stock Adwaita compiles most of its colours in, so GTK 3 apps
+/// follow the palette fully with adw-gtk3 (`adw-gtk-theme` on Arch).
+fn gtk3_css(p: &Palette, adw_gtk3: Option<&Path>) -> String {
+    let mut s = format!("/* {MARK} from nordlys.toml; rewritten on every run. */\n");
+    let base = match adw_gtk3 {
+        Some(dir) => format!(
+            "file://{}",
+            dir.join(gtk3_base(p.dark, true))
+                .join("gtk-3.0/gtk.css")
+                .display()
+        ),
+        None => format!(
+            "resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained{}.css",
+            if p.dark { "-dark" } else { "" }
+        ),
+    };
+    let _ = writeln!(s, "@import url(\"{base}\");\n");
     let gtk3: [(&str, Rgb); 14] = [
         ("theme_bg_color", p.ground),
         ("theme_fg_color", p.text),
@@ -375,7 +437,9 @@ mod tests {
     fn ctx() -> Ctx<'static> {
         Ctx {
             out: Path::new("/home/me/.config"),
-            gtk3_theme: "adw-gtk3-dark",
+            other: Box::leak(Box::new(Palette::light())),
+            themes: Path::new("/home/me/.local/share/themes"),
+            adw_gtk3: None,
         }
     }
 
@@ -390,10 +454,11 @@ mod tests {
 
     #[test]
     fn gtk_uses_the_accent() {
-        let css = gtk4_css(&Palette::light());
+        let (dark, light) = (Palette::dark(), Palette::light());
+        let css = gtk4_css(&light, &dark, &light);
         assert!(css.contains("@define-color accent_bg_color #2F5BD8;"));
         assert!(css.contains("--accent-bg-color: #2F5BD8;"));
-        assert!(!gtk3_css(&Palette::light()).contains(":root"));
+        assert!(!gtk3_css(&light, None).contains(":root"));
     }
 
     #[test]

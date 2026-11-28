@@ -21,7 +21,7 @@ else
 fi
 
 # Palette into the apps' config, and the usual home folders.
-nordlys-theme --quiet &
+nordlys-theme --quiet --watch &
 command -v xdg-user-dirs-update >/dev/null && xdg-user-dirs-update &
 
 # Something to answer "enter your password" prompts from apps.

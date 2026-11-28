@@ -78,8 +78,9 @@ hl.on("hyprland.start", function()
 
     -- Theme GTK, Qt and the default apps from nordlys.toml, and write the
     -- starting dotfiles that are missing. Files you've made your own are
-    -- left alone (see nordlys-theme --dry-run).
-    hl.exec_cmd("nordlys-theme --quiet")
+    -- left alone (see nordlys-theme --dry-run). It stays running and does
+    -- it again when the mode or accent changes, so open GTK apps follow.
+    hl.exec_cmd("nordlys-theme --quiet --watch")
     -- ~/Pictures, ~/Downloads… for the file manager's sidebar and Print.
     hl.exec_cmd("sh -c 'command -v xdg-user-dirs-update >/dev/null && xdg-user-dirs-update'")
 

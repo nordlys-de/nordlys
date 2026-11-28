@@ -77,13 +77,18 @@ What you get:
 - At every login, `nordlys-theme` themes GTK, Qt and the default apps
   from `nordlys.toml` and writes any of their starting dotfiles that are
   missing (see [The apps](#the-apps)). Files you've made your own are left
-  alone.
+  alone. It keeps running, and themes them again when you change the mode
+  or the accent.
 - Nordlys's default apps open your files (see below), behind any choice
   you make yourself with "Open With" or `xdg-mime default`.
 
 To change things, put Lua in `~/.config/nordlys/hyprland.lua`; it runs
 after the Nordlys config and can override any of it. Your own idle
-settings go in `~/.config/nordlys/hypridle.conf`.
+settings go in `~/.config/nordlys/hypridle.conf`. Variables the
+compositor needs before it starts, such as `AQ_DRM_DEVICES` to choose the
+GPU on a laptop with two, go in `~/.config/nordlys/env`: a shell file the
+session reads at login, where every variable set is exported. An existing
+uwsm env file can be reused with one line, `. ~/.config/uwsm/env-hyprland`.
 
 ### Keys
 
@@ -339,6 +344,8 @@ overwrites your own work:
   `foot/nordlys.ini`, `mpv/nordlys.conf`, `zathura/nordlys`,
   `helix/themes/nordlys.toml`, `btop/themes/nordlys.theme` and
   `qt6ct/colors/nordlys.conf`. Each app's own config includes or names them.
+  The GTK 3 themes `Nordlys` and `Nordlys-dark` go into
+  `~/.local/share/themes`.
 - **Generated configs** that have to carry the app's own name:
   `gtk-4.0/gtk.css`, `gtk-3.0/gtk.css`, `gtk-3.0/settings.ini`,
   `qt6ct/qt6ct.conf` and `imv/config`. They're rewritten while their first
@@ -355,9 +362,16 @@ overwrites your own work:
 libadwaita apps (Nautilus, Text Editor, Loupe) take dark or light from
 the desktop settings, so `nordlys-theme` also sets `color-scheme` and the
 GTK 3 theme to match `nordlys.toml`, and sets Inter and JetBrains Mono as
-the interface fonts if you haven't chosen fonts yourself. GTK 3 apps
-follow the palette with adw-gtk3 (`adw-gtk-theme`); without it they fall
-back to plain Adwaita in the right mode.
+the interface fonts if you haven't chosen fonts yourself. GTK 3 apps,
+the keyring's password prompt among them, use the Nordlys theme: adw-gtk3
+(`adw-gtk-theme`) with the palette on top, or plain Adwaita without it.
+
+When you change the mode or the accent, open apps follow as far as their
+toolkit lets them. GTK 3 apps take the new theme straight away.
+libadwaita and GTK 4 apps switch between dark and light straight away,
+and take a new accent when they next start, because GTK reads
+`gtk-4.0/gtk.css` only once. Qt, foot, Helix, btop and the rest read
+their files when they start.
 
 After changing `mode` or `accent`, run `nordlys-theme` (or log in again).
 Open apps pick the new colours up when restarted. To see what it would
