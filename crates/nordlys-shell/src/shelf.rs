@@ -316,7 +316,11 @@ fn slot(i: usize, w: &ShelfWindow, hovered: bool, r: Rail) -> Element<'static, M
         .unwrap_or_default();
     let face: Element<'static, Message> = match &art {
         Some(path) => ui::app_art(path, TILE * 0.8),
-        None => text(initial).font(INTER_SEMIBOLD).size(20).color(r.text).into(),
+        None => text(initial)
+            .font(INTER_SEMIBOLD)
+            .size(20)
+            .color(r.text)
+            .into(),
     };
     let tile = container(face)
         .width(TILE)

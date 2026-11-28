@@ -118,7 +118,12 @@ fn main() -> ExitCode {
 
     // The pieces that stay running. The lock screen is left as it was: it
     // must not depend on one driver.
-    if !window && matches!(piece, None | Some("bar" | "shelf" | "close-button" | "notify")) {
+    if !window
+        && matches!(
+            piece,
+            None | Some("bar" | "shelf" | "close-button" | "notify")
+        )
+    {
         // SAFETY: nothing has started a thread yet.
         unsafe { gpu::prefer_intel() };
     }
