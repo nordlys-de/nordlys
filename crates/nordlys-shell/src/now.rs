@@ -214,11 +214,7 @@ pub fn notes_panel(
     let unread = unread(n, seen);
     let head = row![
         icons::symbol(
-            if n.dnd {
-                Symbol::BellOff
-            } else {
-                Symbol::Bell
-            },
+            if n.dnd { Symbol::BellOff } else { Symbol::Bell },
             16.0,
             r.muted,
         ),
@@ -432,12 +428,7 @@ fn card(e: &Entry, view: &NotesView, r: Rail) -> Element<'static, Action> {
             actions = actions.push(Space::new().width(Length::Fill));
             actions = actions.push(icon_button(Symbol::X, Action::Menu(e.id), true, r));
         } else {
-            for (key, label) in e
-                .actions
-                .iter()
-                .filter(|(k, _)| k != "default")
-                .take(3)
-            {
+            for (key, label) in e.actions.iter().filter(|(k, _)| k != "default").take(3) {
                 actions = actions.push(text_action(label, Action::Invoke(e.id, key.clone()), r));
             }
             actions = actions.push(Space::new().width(Length::Fill));
@@ -497,9 +488,16 @@ fn avatar(app: &str, r: Rail) -> Element<'static, Action> {
 fn expander(app: &str, count: usize, open: bool, r: Rail) -> Element<'static, Action> {
     button(
         row![
-            text(count.to_string()).font(INTER_SEMIBOLD).size(10).color(r.text),
+            text(count.to_string())
+                .font(INTER_SEMIBOLD)
+                .size(10)
+                .color(r.text),
             icons::symbol(
-                if open { Symbol::ChevronUp } else { Symbol::ChevronDown },
+                if open {
+                    Symbol::ChevronUp
+                } else {
+                    Symbol::ChevronDown
+                },
                 12.0,
                 r.text,
             ),
@@ -558,23 +556,28 @@ fn icon_button(symbol: Symbol, action: Action, enabled: bool, r: Rail) -> Elemen
 
 /// A flat text button, like a phone's notification actions.
 fn text_action(label: &str, action: Action, r: Rail) -> Element<'static, Action> {
-    button(text(label.to_owned()).font(INTER_SEMIBOLD).size(11).color(r.text))
-        .padding([4, 8])
-        .on_press(action)
-        .style(move |_, status| button::Style {
-            background: Some(Background::Color(if status == button::Status::Hovered {
-                r.chip_border
-            } else {
-                Color::TRANSPARENT
-            })),
-            text_color: r.text,
-            border: Border {
-                radius: 8.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        })
-        .into()
+    button(
+        text(label.to_owned())
+            .font(INTER_SEMIBOLD)
+            .size(11)
+            .color(r.text),
+    )
+    .padding([4, 8])
+    .on_press(action)
+    .style(move |_, status| button::Style {
+        background: Some(Background::Color(if status == button::Status::Hovered {
+            r.chip_border
+        } else {
+            Color::TRANSPARENT
+        })),
+        text_color: r.text,
+        border: Border {
+            radius: 8.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    })
+    .into()
 }
 
 /// How long ago, short: "now", "5m", "3h", "2d".
@@ -632,7 +635,11 @@ mod tests {
         v.hover(Hot::Note(2), true);
         v.hover(Hot::Note(1), false);
         assert_eq!(v.hover_note, Some(2));
-        assert_eq!(v.menu, Some(1), "only leaving the note itself closes its menu");
+        assert_eq!(
+            v.menu,
+            Some(1),
+            "only leaving the note itself closes its menu"
+        );
         v.hover(Hot::Note(2), false);
         assert_eq!(v.hover_note, None);
         v.hover(Hot::App("Mail".into()), true);
@@ -644,9 +651,18 @@ mod tests {
     fn unread_counts_what_is_newer_than_seen() {
         let mut n = Notices::default();
         n.recent = vec![
-            Entry { id: 5, ..Entry::default() },
-            Entry { id: 4, ..Entry::default() },
-            Entry { id: 2, ..Entry::default() },
+            Entry {
+                id: 5,
+                ..Entry::default()
+            },
+            Entry {
+                id: 4,
+                ..Entry::default()
+            },
+            Entry {
+                id: 2,
+                ..Entry::default()
+            },
         ];
         assert_eq!(unread(&n, 3), 2);
     }

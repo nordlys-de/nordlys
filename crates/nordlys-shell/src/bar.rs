@@ -215,8 +215,12 @@ impl Bar {
                 });
                 let mut tasks = vec![Task::done(Message::Pop(Pop::Notices))];
                 if let Some((app, id)) = hover {
-                    tasks.push(Task::done(Message::Now(now::Action::Hover(now::Hot::App(app)))));
-                    tasks.push(Task::done(Message::Now(now::Action::Hover(now::Hot::Note(id)))));
+                    tasks.push(Task::done(Message::Now(now::Action::Hover(now::Hot::App(
+                        app,
+                    )))));
+                    tasks.push(Task::done(Message::Now(now::Action::Hover(
+                        now::Hot::Note(id),
+                    ))));
                 }
                 Task::batch(tasks)
             }
@@ -617,9 +621,7 @@ impl Bar {
                         self.notes_view.menu = None;
                         Box::new(move || system::snooze_notification(id, minutes))
                     }
-                    NowAction::Mute(app, on) => {
-                        Box::new(move || system::set_app_muted(&app, on))
-                    }
+                    NowAction::Mute(app, on) => Box::new(move || system::set_app_muted(&app, on)),
                     NowAction::ClearApp(app) => {
                         Box::new(move || system::clear_app_notifications(&app))
                     }
@@ -688,10 +690,8 @@ impl Bar {
         let ground = color(p.ground);
         let body = match pop {
             Pop::Media => now::media_panel(self.media.as_ref(), p).map(Message::Now),
-            Pop::Notices => {
-                now::notes_panel(self.notices.as_ref(), self.seen, &self.notes_view, p)
-                    .map(Message::Now)
-            }
+            Pop::Notices => now::notes_panel(self.notices.as_ref(), self.seen, &self.notes_view, p)
+                .map(Message::Now),
         };
         let boxed = container(body)
             .width(now::WIDTH)
@@ -1669,18 +1669,17 @@ fn bell_chip<'a>(
     dnd: bool,
     open: bool,
 ) -> Element<'a, Message> {
-    let mut content: iced::widget::Row<'a, Message> =
-        row![icons::symbol(
-            if dnd {
-                icons::Symbol::BellOff
-            } else {
-                icons::Symbol::Bell
-            },
-            13.0,
-            color(p.muted),
-        ),]
-            .spacing(6)
-            .align_y(Alignment::Center);
+    let mut content: iced::widget::Row<'a, Message> = row![icons::symbol(
+        if dnd {
+            icons::Symbol::BellOff
+        } else {
+            icons::Symbol::Bell
+        },
+        13.0,
+        color(p.muted),
+    ),]
+    .spacing(6)
+    .align_y(Alignment::Center);
     if unread > 0 {
         let accent = color(p.accent);
         content = content.push(
