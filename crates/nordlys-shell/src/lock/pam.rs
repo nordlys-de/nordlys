@@ -49,7 +49,6 @@ unsafe extern "C" {
         pamh: *mut *mut c_void,
     ) -> c_int;
     fn pam_authenticate(pamh: *mut c_void, flags: c_int) -> c_int;
-    fn pam_acct_mgmt(pamh: *mut c_void, flags: c_int) -> c_int;
     fn pam_end(pamh: *mut c_void, status: c_int) -> c_int;
 }
 
@@ -148,10 +147,11 @@ pub fn authenticate(user: &str, password: Secret) -> Result<(), String> {
         if started != PAM_SUCCESS || handle.is_null() {
             Err(format!("PAM could not start ({started})"))
         } else {
-            let mut status = pam_authenticate(handle, 0);
-            if status == PAM_SUCCESS {
-                status = pam_acct_mgmt(handle, 0);
-            }
+            // Only the password is checked, as swaylock and hyprlock do: you
+            // are already logged in. pam_acct_mgmt would also read the
+            // service's "account" lines, and config/pam.d/nordlys has none,
+            // so PAM falls back to "other", which is pam_deny on Arch.
+            let status = pam_authenticate(handle, 0);
             pam_end(handle, status);
             if status == PAM_SUCCESS {
                 Ok(())
