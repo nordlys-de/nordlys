@@ -196,6 +196,10 @@ pub fn decode_preview(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 #[cfg(test)]
+#[path = "lib_tests.rs"]
+mod lib_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

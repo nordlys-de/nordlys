@@ -329,6 +329,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 #[cfg(test)]
+#[path = "lib_tests.rs"]
+mod lib_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

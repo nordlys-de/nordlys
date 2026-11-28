@@ -222,6 +222,10 @@ fn show(line: &str, json: bool) -> ExitCode {
 }
 
 #[cfg(test)]
+#[path = "main_tests.rs"]
+mod main_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

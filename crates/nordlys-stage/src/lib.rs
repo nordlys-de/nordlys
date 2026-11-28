@@ -434,6 +434,10 @@ impl<W: Clone + Eq + Hash> Desk<W> {
 }
 
 #[cfg(test)]
+#[path = "lib_tests.rs"]
+mod lib_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -430,6 +430,10 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
 }
 
 #[cfg(test)]
+#[path = "targets_tests.rs"]
+mod targets_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
