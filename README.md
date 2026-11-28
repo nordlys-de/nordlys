@@ -398,6 +398,11 @@ runs just one.
 The Nordlys session starts it and has Hyprland blur it (layer namespace
 `nordlys-bar`).
 
+Where there's an Intel GPU, the bar, shelf, close button and
+notifications load only its Vulkan driver, which saves memory on laptops
+that also have an NVIDIA one. Apps they start don't inherit this. Set
+`NORDLYS_SHELL_GPU=auto` to turn it off.
+
 ### The tray
 
 Apps that put an icon in the tray (Discord, Steam, Nextcloud, VPN clients,

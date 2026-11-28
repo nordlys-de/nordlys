@@ -408,6 +408,7 @@ fn spawn(cmdline: &str, dir: Option<&Path>, id: Option<&str>) -> std::io::Result
     if let Some(d) = dir.filter(|d| d.is_dir()) {
         cmd.current_dir(d);
     }
+    crate::gpu::restore(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
