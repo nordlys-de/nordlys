@@ -18,13 +18,7 @@ fn every_command_parses() {
         (&["send-to-shelf"], Request::SendToShelf),
         (&["slot", "4"], Request::Slot { n: 4 }),
         (&["move-to", "5"], Request::MoveTo { n: 5, id: None }),
-        (
-            &["open", "a"],
-            Request::Open {
-                id: id(),
-                ambient: false,
-            },
-        ),
+        (&["open", "a"], Request::Open { id: id() }),
         (&["close", "a"], Request::Close { id: id() }),
         (&["reload"], Request::Reload),
         (&["version"], Request::Version),

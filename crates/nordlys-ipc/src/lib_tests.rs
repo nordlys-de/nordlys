@@ -56,13 +56,7 @@ fn every_request_keeps_its_wire_form() {
         (Request::State, r#"{"cmd":"state"}"#),
         (Request::Version, r#"{"cmd":"version"}"#),
         (Request::Subscribe, r#"{"cmd":"subscribe"}"#),
-        (
-            Request::Open {
-                id: id(),
-                ambient: false,
-            },
-            r#"{"cmd":"open","id":"a","ambient":false}"#,
-        ),
+        (Request::Open { id: id() }, r#"{"cmd":"open","id":"a"}"#),
         (Request::Close { id: id() }, r#"{"cmd":"close","id":"a"}"#),
         (Request::Bring { id: id() }, r#"{"cmd":"bring","id":"a"}"#),
         (Request::Previous, r#"{"cmd":"previous"}"#),

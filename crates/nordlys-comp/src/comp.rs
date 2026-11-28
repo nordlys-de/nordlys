@@ -26,7 +26,6 @@ use crate::render;
 use crate::{Effect, Shared, State, blur, cursor, lock, preview, xwayland};
 use nordlys_config::{Config, Rgb};
 use nordlys_ipc::{Request, Response};
-use nordlys_stage::Home;
 use smithay::backend::allocator::Format;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::input::{
@@ -996,7 +995,7 @@ impl Comp {
             let app = app_id(&t);
             let id = self.shared.change(|s| {
                 let id = s.fresh_id(&app);
-                s.desk.open(id.clone(), Home::Shelf);
+                s.desk.open(id.clone());
                 id
             });
             self.focus = Some(id.clone());

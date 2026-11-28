@@ -69,7 +69,7 @@ What you get:
   (`systemctl --user status 'nordlys-*'` shows them, `journalctl --user
   -u nordlys-shell@bar` their logs). Without the units they're started
   directly, without the safety net.
-- The bar, rails and close button appear on every screen, and follow
+- The bar, shelf and close button appear on every screen, and follow
   screens as you plug them in and out.
 - On first login it copies the example `nordlys.toml` to
   `~/.config/nordlys/`. Saving that file recolours the shell live.
@@ -216,7 +216,7 @@ Wayland display of its own, and apps started in it are laid out by the
 real Stage model: the newest window takes the stage, the one it replaces
 waits, unmapped, on the shelf, two-up splits the stage with an accent ring
 around the window that has the keys, and every workspace keeps a stage of
-its own. Dialogs float over their parent. The bar, rails, launcher and
+its own. Dialogs float over their parent. The bar, shelf, launcher and
 toasts run inside as layer-shell surfaces, and the space the bar reserves
 comes off the stage.
 
@@ -246,7 +246,7 @@ nordlysctl screenshot stage.png   # what the compositor shows, as a PNG
 `nordlysctl close` asks the app to close its window, and `nordlysctl group`
 starts the group's apps (on an empty workspace, if the group says so).
 
-Glass shell surfaces (bar, launcher, rails, toasts, OSD, welcome) get a
+Glass shell surfaces (bar, launcher, shelf, toasts, OSD, welcome) get a
 dual-kawase blur of what's under them, `theme.blur` strong; reduce
 transparency or `theme.blur = 0` turns it off. Shelved windows keep
 drawing at `stage.shelf_fps`, small, into a `.previews` folder beside the
@@ -281,7 +281,7 @@ going to a workspace another screen shows moves the keyboard (and the
 pointer) to that screen. Super+Ctrl+← → moves the keyboard between
 screens, Super+Ctrl+Shift+← → sends the window to the next screen and
 follows it. A screen unplugged leaves its workspace and windows behind, a
-Super+number away. Every screen gets its own bar, rails and close button,
+Super+number away. Every screen gets its own bar, shelf and close button,
 and the lock screen covers them all.
 
 Screens on any GPU work, so an HDMI port wired to a laptop's discrete GPU

@@ -2,8 +2,7 @@
 //!
 //! The stage holds one window, or two side by side ("two-up"). The newest
 //! window always takes the centre; the window it replaces goes to the front
-//! of the shelf. Ambient windows (chat, music) live on their own rail, so
-//! they leave the stage without joining the shelf.
+//! of the shelf.
 //!
 //! A [`Desk`] holds one stage per workspace. With more than one screen,
 //! each screen shows a workspace of its own and the focused screen's is
@@ -12,24 +11,16 @@
 //! This crate is pure logic with no Wayland types, so the compositor, the
 //! headless test server and the unit tests all share exactly one copy of it.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
-
-/// Where a window waits while it is off the stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Home {
-    /// The workspace's own shelf (left side on large screens).
-    Shelf,
-    /// The ambient rail, shared by every workspace (right side).
-    Ambient,
-}
 
 #[derive(Debug, Clone)]
 pub struct Stage<W> {
     main: Option<W>,
     side: Option<W>,
     shelf: VecDeque<W>,
-    homes: HashMap<W, Home>,
+    /// Every window on this stage: main, side or on the shelf.
+    windows: HashSet<W>,
 }
 
 impl<W: Clone + Eq + Hash> Default for Stage<W> {
@@ -38,7 +29,7 @@ impl<W: Clone + Eq + Hash> Default for Stage<W> {
             main: None,
             side: None,
             shelf: VecDeque::new(),
-            homes: HashMap::new(),
+            windows: HashSet::new(),
         }
     }
 }
@@ -68,23 +59,19 @@ impl<W: Clone + Eq + Hash> Stage<W> {
     }
 
     pub fn contains(&self, w: &W) -> bool {
-        self.homes.contains_key(w)
-    }
-
-    pub fn home(&self, w: &W) -> Option<Home> {
-        self.homes.get(w).copied()
+        self.windows.contains(w)
     }
 
     /// A window was mapped. Like any newest window, it takes the stage.
-    pub fn open(&mut self, w: W, home: Home) {
-        self.homes.insert(w.clone(), home);
+    pub fn open(&mut self, w: W) {
+        self.windows.insert(w.clone());
         self.bring(&w);
     }
 
     /// A window was closed or unmapped. If it was the main window, the side
     /// pane takes over, or else the most recent shelf window comes back.
     pub fn close(&mut self, w: &W) -> bool {
-        if self.homes.remove(w).is_none() {
+        if !self.windows.remove(w) {
             return false;
         }
         if self.main.as_ref() == Some(w) {
@@ -105,7 +92,7 @@ impl<W: Clone + Eq + Hash> Stage<W> {
     ///   side and the old side goes to the shelf; in single mode the old
     ///   main goes to the shelf.
     pub fn bring(&mut self, w: &W) -> bool {
-        if !self.homes.contains_key(w) {
+        if !self.windows.contains(w) {
             return false;
         }
         if self.main.as_ref() == Some(w) {
@@ -195,9 +182,7 @@ impl<W: Clone + Eq + Hash> Stage<W> {
     }
 
     fn park(&mut self, w: W) {
-        if self.homes.get(&w) == Some(&Home::Shelf) {
-            self.shelf.push_front(w);
-        }
+        self.shelf.push_front(w);
     }
 }
 
@@ -363,7 +348,7 @@ impl<W: Clone + Eq + Hash> Desk<W> {
     }
 
     /// A window was mapped on the active workspace.
-    pub fn open(&mut self, w: W, home: Home) {
+    pub fn open(&mut self, w: W) {
         if let Some(old) = self.places.get(&w).copied()
             && old != self.active
             && let Some(s) = self.stages.get_mut(&old)
@@ -371,7 +356,7 @@ impl<W: Clone + Eq + Hash> Desk<W> {
             s.close(&w);
         }
         self.places.insert(w.clone(), self.active);
-        self.stage_mut().open(w, home);
+        self.stage_mut().open(w);
         self.tidy();
     }
 
@@ -408,28 +393,22 @@ impl<W: Clone + Eq + Hash> Desk<W> {
         if from == n {
             return true;
         }
-        let home = self
-            .stages
-            .get(&from)
-            .and_then(|s| s.home(w))
-            .unwrap_or(Home::Shelf);
         if let Some(s) = self.stages.get_mut(&from) {
             s.close(w);
         }
-        self.stages.entry(n).or_default().open(w.clone(), home);
+        self.stages.entry(n).or_default().open(w.clone());
         self.places.insert(w.clone(), n);
         self.tidy();
         true
     }
 
     /// Forget empty workspaces other than the active one and those on a
-    /// screen. A workspace whose only window is an ambient one off the
-    /// stage isn't empty: it keeps that window, so it can be brought back.
+    /// screen.
     fn tidy(&mut self) {
         let active = self.active;
         let shown: Vec<u32> = self.screens.iter().map(|(_, n)| *n).collect();
         self.stages
-            .retain(|n, s| *n == active || shown.contains(n) || !s.homes.is_empty());
+            .retain(|n, s| *n == active || shown.contains(n) || !s.windows.is_empty());
     }
 }
 
@@ -449,9 +428,8 @@ mod tests {
     fn desk() -> Stage<&'static str> {
         let mut s = Stage::new();
         for w in ["files", "docs", "term", "helix"] {
-            s.open(w, Home::Shelf);
+            s.open(w);
         }
-        s.open("chat", Home::Ambient);
         s.bring(&"helix");
         s
     }
@@ -465,18 +443,6 @@ mod tests {
         s.bring(&"docs");
         assert_eq!(s.main(), Some(&"docs"));
         assert_eq!(shelf(&s), ["helix", "term", "files"]);
-    }
-
-    #[test]
-    fn ambient_windows_never_join_the_shelf() {
-        let mut s = desk();
-        s.bring(&"chat");
-        assert_eq!(s.main(), Some(&"chat"));
-        assert_eq!(shelf(&s), ["helix", "term", "docs", "files"]);
-
-        s.bring(&"term");
-        assert_eq!(s.main(), Some(&"term"));
-        assert!(!shelf(&s).contains(&"chat"));
     }
 
     #[test]
@@ -557,11 +523,11 @@ mod tests {
     #[test]
     fn each_workspace_has_its_own_stage() {
         let mut d = Desk::new();
-        d.open("helix", Home::Shelf);
-        d.open("foot", Home::Shelf);
+        d.open("helix");
+        d.open("foot");
         assert!(d.switch(2));
         assert_eq!(d.stage().main(), None);
-        d.open("firefox", Home::Shelf);
+        d.open("firefox");
         assert_eq!(d.stage().main(), Some(&"firefox"));
         assert_eq!(d.workspace_of(&"helix"), Some(1));
         let seen: Vec<u32> = d.workspaces().map(|(n, _)| n).collect();
@@ -571,8 +537,8 @@ mod tests {
     #[test]
     fn bring_follows_the_window_to_its_workspace() {
         let mut d = Desk::new();
-        d.open("helix", Home::Shelf);
-        d.open("foot", Home::Shelf);
+        d.open("helix");
+        d.open("foot");
         d.switch(3);
         assert!(d.bring(&"helix"));
         assert_eq!(d.active(), 1);
@@ -584,8 +550,8 @@ mod tests {
     #[test]
     fn move_to_takes_the_stage_there_and_closing_finds_it() {
         let mut d = Desk::new();
-        d.open("helix", Home::Shelf);
-        d.open("foot", Home::Shelf);
+        d.open("helix");
+        d.open("foot");
         assert!(d.move_to(&"foot", 2));
         assert_eq!(d.active(), 1);
         assert_eq!(d.stage().main(), Some(&"helix"));
@@ -600,23 +566,11 @@ mod tests {
     #[test]
     fn reopening_a_window_elsewhere_moves_it() {
         let mut d = Desk::new();
-        d.open("helix", Home::Shelf);
+        d.open("helix");
         d.switch(2);
-        d.open("helix", Home::Shelf);
+        d.open("helix");
         assert_eq!(d.workspace_of(&"helix"), Some(2));
         assert!(d.workspaces().all(|(n, _)| n != 1));
-    }
-
-    #[test]
-    fn an_offstage_ambient_window_keeps_its_workspace() {
-        let mut d = Desk::new();
-        d.open("chat", Home::Ambient);
-        d.open("term", Home::Shelf); // chat leaves the stage, not to the shelf
-        d.close(&"term");
-        assert_eq!(d.stage().main(), None);
-        d.switch(2);
-        assert!(d.bring(&"chat"), "chat was lost with its workspace");
-        assert_eq!((d.active(), d.stage().main()), (1, Some(&"chat")));
     }
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -626,14 +580,14 @@ mod tests {
     #[test]
     fn each_screen_shows_a_workspace_of_its_own() {
         let mut d: Desk<&str> = Desk::new();
-        d.open("helix", Home::Shelf);
+        d.open("helix");
         d.set_screens(&names(&["eDP-1", "DP-1"]));
         assert_eq!(d.screens().collect::<Vec<_>>(), [("eDP-1", 1), ("DP-1", 2)]);
         assert_eq!((d.focused_screen(), d.active()), (Some("eDP-1"), 1));
 
         // The other screen gets the keyboard, and new windows open there.
         assert!(d.focus_screen("DP-1"));
-        d.open("firefox", Home::Shelf);
+        d.open("firefox");
         assert_eq!(d.workspace_of(&"firefox"), Some(2));
         assert_eq!(d.workspace(1).and_then(Stage::main), Some(&"helix"));
         assert!(!d.focus_screen("HDMI-A-1"));
@@ -656,7 +610,7 @@ mod tests {
     fn an_empty_workspace_on_screen_is_kept() {
         let mut d: Desk<&str> = Desk::new();
         d.set_screens(&names(&["eDP-1", "DP-1"]));
-        d.open("helix", Home::Shelf);
+        d.open("helix");
         d.close(&"helix");
         assert!(d.workspace(2).is_some(), "DP-1's workspace was dropped");
     }
@@ -666,7 +620,7 @@ mod tests {
         let mut d: Desk<&str> = Desk::new();
         d.set_screens(&names(&["eDP-1", "DP-1"]));
         d.focus_screen("DP-1");
-        d.open("firefox", Home::Shelf);
+        d.open("firefox");
         d.set_screens(&names(&["eDP-1"]));
         assert_eq!((d.focused_screen(), d.active()), (Some("eDP-1"), 1));
         assert_eq!(d.workspace_of(&"firefox"), Some(2));

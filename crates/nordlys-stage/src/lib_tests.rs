@@ -20,7 +20,7 @@ fn an_empty_stage_refuses_every_command() {
 #[test]
 fn two_up_needs_a_second_window() {
     let mut s = Stage::new();
-    s.open(1, Home::Shelf);
+    s.open(1);
     assert!(!s.toggle_two_up());
     assert!(!s.is_two_up());
     assert!(!s.swap());
@@ -29,8 +29,8 @@ fn two_up_needs_a_second_window() {
 #[test]
 fn bringing_the_main_window_changes_nothing() {
     let mut s = Stage::new();
-    s.open(1, Home::Shelf);
-    s.open(2, Home::Shelf);
+    s.open(1);
+    s.open(2);
     assert!(s.bring(&2));
     assert_eq!(s.main(), Some(&2));
     assert_eq!(s.shelf().copied().collect::<Vec<_>>(), [1]);
@@ -39,8 +39,8 @@ fn bringing_the_main_window_changes_nothing() {
 #[test]
 fn swap_trades_the_panes() {
     let mut s = Stage::new();
-    s.open(1, Home::Shelf);
-    s.open(2, Home::Shelf);
+    s.open(1);
+    s.open(2);
     s.toggle_two_up();
     assert!(s.swap());
     assert_eq!((s.main(), s.side()), (Some(&1), Some(&2)));
@@ -50,7 +50,7 @@ fn swap_trades_the_panes() {
 fn closing_the_side_pane_or_a_shelf_window_leaves_the_rest() {
     let mut s = Stage::new();
     for w in 1..=4 {
-        s.open(w, Home::Shelf);
+        s.open(w);
     }
     s.toggle_two_up();
     assert_eq!((s.main(), s.side()), (Some(&4), Some(&3)));
@@ -64,27 +64,11 @@ fn closing_the_side_pane_or_a_shelf_window_leaves_the_rest() {
 fn closing_main_in_two_up_promotes_the_side_pane() {
     let mut s = Stage::new();
     for w in 1..=3 {
-        s.open(w, Home::Shelf);
+        s.open(w);
     }
     s.toggle_two_up();
     s.close(&3);
     assert_eq!((s.main(), s.side()), (Some(&2), None));
-}
-
-#[test]
-fn an_ambient_side_pane_leaves_without_joining_the_shelf() {
-    let mut s = Stage::new();
-    s.open(1, Home::Shelf);
-    s.open(9, Home::Ambient);
-    s.toggle_two_up();
-    assert_eq!((s.main(), s.side()), (Some(&9), Some(&1)));
-    s.swap();
-    assert!(s.toggle_two_up());
-    assert_eq!((s.main(), s.side(), s.shelf().count()), (Some(&1), None, 0));
-    assert!(s.contains(&9));
-    assert_eq!(s.home(&9), Some(Home::Ambient));
-    assert_eq!(s.home(&1), Some(Home::Shelf));
-    assert_eq!(s.home(&5), None);
 }
 
 #[test]
@@ -102,31 +86,9 @@ fn a_desk_refuses_unknown_windows() {
 #[test]
 fn moving_a_window_to_its_own_workspace_changes_nothing() {
     let mut d = Desk::new();
-    d.open(1, Home::Shelf);
+    d.open(1);
     assert!(d.move_to(&1, 1));
     assert_eq!(d.stage().main(), Some(&1));
-}
-
-#[test]
-fn an_ambient_window_keeps_its_home_when_moved() {
-    let mut d = Desk::new();
-    d.open(9, Home::Ambient);
-    assert!(d.move_to(&9, 2));
-    d.switch(2);
-    assert_eq!(d.stage().home(&9), Some(Home::Ambient));
-}
-
-/// A workspace whose only remaining window waits off the stage on the
-/// ambient rail must not be forgotten: the window is still there.
-#[test]
-fn an_ambient_window_survives_its_workspace_emptying() {
-    let mut d = Desk::new();
-    d.open(9, Home::Ambient); // a chat window ...
-    d.open(1, Home::Shelf); // ... replaced by another window
-    d.switch(2);
-    assert!(d.close(&1));
-    assert!(d.contains(&9));
-    assert!(d.bring(&9), "the chat window can't be reached any more");
 }
 
 fn names(list: &[&str]) -> Vec<String> {
@@ -183,7 +145,7 @@ fn when_the_focused_screen_goes_the_first_one_takes_over() {
     let mut d: Desk<Win> = Desk::new();
     d.set_screens(&names(&["A", "B"]));
     d.focus_screen("B");
-    d.open(1, Home::Shelf);
+    d.open(1);
     d.set_screens(&names(&["A"]));
     assert_eq!((d.focused_screen(), d.active()), (Some("A"), 1));
     assert_eq!(d.workspace_of(&1), Some(2), "its window waits on 2");
@@ -210,9 +172,9 @@ fn switching_to_a_workspace_on_another_screen_moves_the_keyboard() {
 #[test]
 fn reopening_a_known_window_moves_it_to_the_active_workspace() {
     let mut d: Desk<Win> = Desk::new();
-    d.open(1, Home::Shelf);
+    d.open(1);
     d.switch(2);
-    d.open(1, Home::Shelf);
+    d.open(1);
     assert_eq!(d.workspace_of(&1), Some(2));
     d.switch(1);
     assert_eq!(d.stage().main(), None);
@@ -248,13 +210,8 @@ fn check_stage(s: &Stage<Win>, step: &str) {
     for w in &placed {
         assert!(s.contains(w), "{w} is placed but unknown: {step}");
     }
-    for w in s.shelf() {
-        assert_eq!(s.home(w), Some(Home::Shelf), "{w} on the shelf: {step}");
-    }
-    for (w, home) in &s.homes {
-        if *home == Home::Shelf {
-            assert!(unique.contains(w), "{w} got lost: {step}");
-        }
+    for w in &s.windows {
+        assert!(unique.contains(w), "{w} got lost: {step}");
     }
 }
 
@@ -265,10 +222,9 @@ fn any_sequence_of_stage_commands_keeps_the_stage_consistent() {
         let mut s: Stage<Win> = Stage::new();
         for turn in 0..200 {
             let w = dice.roll(6) as Win;
-            let home = if w >= 4 { Home::Ambient } else { Home::Shelf };
             let command = dice.roll(9);
             match command {
-                0 => s.open(w, home),
+                0 => s.open(w),
                 1 => {
                     let known = s.contains(&w);
                     assert_eq!(s.close(&w), known);
@@ -303,7 +259,7 @@ fn any_sequence_of_stage_commands_keeps_the_stage_consistent() {
     }
 }
 
-/// Windows of both kinds, with screens coming, going and taking focus.
+/// Windows, with screens coming, going and taking focus.
 #[test]
 fn any_sequence_of_desk_commands_keeps_the_desk_consistent() {
     let mut dice = Dice(0x2545_F491_4F6C_DD1D);
@@ -312,11 +268,10 @@ fn any_sequence_of_desk_commands_keeps_the_desk_consistent() {
         let mut d: Desk<Win> = Desk::new();
         for turn in 0..200 {
             let w = dice.roll(6) as Win;
-            let home = if w >= 4 { Home::Ambient } else { Home::Shelf };
             let n = dice.roll(4) as u32;
             let command = dice.roll(9);
             match command {
-                0 => d.open(w, home),
+                0 => d.open(w),
                 1 => {
                     let known = d.contains(&w);
                     assert_eq!(d.close(&w), known);
@@ -359,10 +314,10 @@ fn any_sequence_of_desk_commands_keeps_the_desk_consistent() {
             for (n, s) in d.workspaces() {
                 check_stage(s, &step);
                 assert!(
-                    n == d.active() || on_screen.contains(&n) || !s.homes.is_empty(),
+                    n == d.active() || on_screen.contains(&n) || !s.windows.is_empty(),
                     "an empty workspace lingers: {step}"
                 );
-                for w in s.homes.keys() {
+                for w in &s.windows {
                     assert!(seen.insert(*w), "{w} is on two workspaces: {step}");
                     assert_eq!(d.workspace_of(w), Some(n), "{step}");
                 }
