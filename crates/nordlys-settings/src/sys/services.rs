@@ -50,7 +50,6 @@ pub fn purpose(name: &str) -> &'static str {
     match name {
         "nordlys-shell@bar.service" => "Top bar with workspaces, clock and battery",
         "nordlys-shell@shelf.service" => "Left rail with the windows waiting on the shelf",
-        "nordlys-shell@ambient.service" => "Right rail with media and quick settings",
         "nordlys-shell@close-button.service" => "The × that closes the window under the pointer",
         "nordlys-notify.service" => "Notification daemon and toasts",
         "nordlys-idle.service" => "Dims, locks and suspends when you're away",

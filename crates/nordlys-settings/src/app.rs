@@ -148,10 +148,10 @@ impl Page {
     fn keywords(self) -> &'static str {
         match self {
             Page::Appearance => {
-                "theme dark light mode accent colour color blur glass transparency motion wallpaper background gtk qt"
+                "theme dark light mode accent colour color blur glass transparency motion wallpaper background gtk qt roundness corners top bar topbar gap gaps screen edge shelf sides hide widgets clock tray battery bluetooth network sound"
             }
             Page::Windows => {
-                "stage shelf layout two-up tiled monocle split gaps border rounding corners animations shadow dim opacity ultrawide rails peek"
+                "stage shelf hide show layout two-up tiled monocle split gaps border rounding corners animations shadow dim opacity ultrawide rails peek"
             }
             Page::Groups => "groups apps workspace super g launch",
             Page::Notifications => "do not disturb dnd toasts history clear dunst",
@@ -178,7 +178,7 @@ impl Page {
             Page::DateTime => "time zone timezone clock ntp locale language region",
             Page::DefaultApps => "browser email files mime open with default",
             Page::Startup => "autostart login startup",
-            Page::Services => "systemd units restart logs journal failed bar shelf ambient",
+            Page::Services => "systemd units restart logs journal failed bar shelf",
             Page::Advanced => "config files reset reload hyprland lua toml edit",
             Page::About => "system info cpu memory gpu disk kernel version hostname",
         }

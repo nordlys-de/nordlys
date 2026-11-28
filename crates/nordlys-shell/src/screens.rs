@@ -1,4 +1,4 @@
-//! One bar, shelf, ambient rail and close button on every screen.
+//! One bar, shelf and close button on every screen.
 //!
 //! A layer surface belongs to one output, so `nordlys-shell bar` (without
 //! `--output`) on Hyprland or nordlys-comp runs as a small supervisor: it starts

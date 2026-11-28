@@ -2,6 +2,7 @@ use super::{PageState, hypr_set, toml_set};
 use crate::app::Ctx;
 use crate::icons::Icon;
 use crate::store::{V, nordlys::tidy};
+use crate::sys::{self, job};
 use crate::ui::{self, El};
 use iced::Task;
 use iced::widget::column;
@@ -21,10 +22,13 @@ pub enum Msg {
     Release,
     Toggle(&'static str, bool),
     FollowFocus(bool),
+    /// Show or hide the shelf rail, and start or stop its unit to match.
+    Shelf(bool),
+    ShelfDone(bool, Result<(), String>),
 }
 
 /// Hyprland options shown as whole-number sliders: key, title, detail, range.
-const SIZES: [(&str, &str, &str, f32, f32); 4] = [
+const SIZES: [(&str, &str, &str, f32, f32); 3] = [
     (
         "general:gaps_in",
         "Gap between windows",
@@ -45,13 +49,6 @@ const SIZES: [(&str, &str, &str, f32, f32); 4] = [
         "Width of the line around each window",
         0.0,
         6.0,
-    ),
-    (
-        "decoration:rounding",
-        "Corner rounding",
-        "How round window corners are",
-        0.0,
-        28.0,
     ),
 ];
 
@@ -91,6 +88,13 @@ impl PageState for State {
             Msg::Toggle(k, on) => hypr_set(ctx, k, V::Bool(on)),
             Msg::FollowFocus(on) => {
                 hypr_set(ctx, "input:follow_mouse", V::Int(if on { 1 } else { 2 }))
+            }
+            Msg::Shelf(on) => {
+                toml_set(ctx, "stage", "shelf", on);
+                return job(move || shelf_unit(on), move |r| Msg::ShelfDone(on, r));
+            }
+            Msg::ShelfDone(on, r) => {
+                ctx.report(&r, if on { "Shelf shown" } else { "Shelf hidden" })
             }
         }
         Task::none()
@@ -157,6 +161,13 @@ impl PageState for State {
             c,
             "Stage",
             vec![
+                ui::toggle_row(
+                    c,
+                    "Show the shelf",
+                    "The rail on the left with the windows waiting. Off hides it; Super J still cycles through them.",
+                    stage.shelf,
+                    Msg::Shelf,
+                ),
                 ui::setting(
                     c,
                     "Starting view",
@@ -273,4 +284,16 @@ impl PageState for State {
         ))
         .into()
     }
+}
+
+/// Start or stop the shelf's session unit, so the change shows now. The
+/// shelf also checks nordlys.toml when it starts, so a later login agrees.
+fn shelf_unit(on: bool) -> Result<(), String> {
+    let verb = if on { "start" } else { "stop" };
+    sys::run(
+        "systemctl",
+        &["--user", verb, "nordlys-shell@shelf.service"],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Saved, but couldn't {verb} the shelf now: {e}"))
 }

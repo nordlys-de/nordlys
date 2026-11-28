@@ -58,7 +58,7 @@ What you get:
   Code and git keep their passwords (see [Saved passwords](#saved-passwords)),
   then starts Hyprland with Nordlys's own config
   (`share/nordlys/hyprland.lua`), so your `~/.config/hypr` is left alone.
-- It starts the bar, shelf, ambient rail, notification daemon, hypridle
+- It starts the bar, shelf, notification daemon, hypridle
   (dim at 4 min, lock at 5, screen off at 6, suspend at 30), the polkit
   agent and the aurora wallpaper, and blurs every shell surface.
 - Those run as systemd user services under `nordlys-session.target`, so
@@ -320,7 +320,7 @@ installs them; with the package they're optional dependencies.
 | Files | Nautilus (with gvfs and video thumbnails) | Super+N, folders |
 | Text | GNOME Text Editor; Helix in the terminal | Super+E, text and code, `nordlys.toml` |
 | Images | imv (Loupe if that's what you have) | images |
-| Video and music | mpv, with mpv-mpris for the ambient rail | video, audio, streams |
+| Video and music | mpv, with mpv-mpris for the bar's now-playing chip | video, audio, streams |
 | PDF and EPUB | zathura with the mupdf plugin | documents |
 | System monitor | btop in foot | Ctrl+Shift+Esc |
 | Volume per app | pavucontrol | from the launcher |
@@ -462,18 +462,15 @@ of closing, and app groups fall back to starting their apps in order.
 In the Nordlys session it opens with Super+Space, or Super+Shift+Space for
 commands.
 
-## The shelf and the ambient rail
+## The shelf and the top bar's right side
 
 <p>
   <img src="docs/shelf-preview.png" width="49%" alt="The shelf rail with a hover card">
-  <img src="docs/ambient-preview.png" width="49%" alt="The ambient rail with its panel open">
 </p>
 
 ```sh
 cargo run -p nordlys-shell -- shelf             # left rail, layer-shell on Wayland
-cargo run -p nordlys-shell -- ambient           # right rail
-cargo run -p nordlys-shell -- shelf --window    # preview windows
-cargo run -p nordlys-shell -- ambient --window
+cargo run -p nordlys-shell -- shelf --window    # preview window
 ```
 
 **The shelf** (left) holds the windows waiting on this workspace, most
@@ -483,20 +480,17 @@ Hyprland's client list, or from a demo set. On nordlys-comp the flyout
 also shows a live picture of the window, which the compositor keeps
 drawing while it waits; elsewhere each tile shows the app's initial.
 
-**The ambient rail** (right) carries what matters on every workspace: now
-playing, quick settings and notifications. Any tile opens the panel, which
-has play/pause and next, Wi-Fi, Bluetooth and Do not disturb toggles, a
-volume slider (click the percentage to mute) and the notification count.
-Media (MPRIS), Wi-Fi (NetworkManager) and Bluetooth (BlueZ) go straight
-over D-Bus. Volume uses `wpctl`, and anything D-Bus can't reach falls back
-to `playerctl`, `nmcli`, `bluetoothctl` or `dunstctl`. Everything is read
-at once and off the UI thread, so a slow service never freezes the rail.
-A toggle with nothing to talk to shows "Unavailable".
+**The top bar's right side** carries what matters on every workspace. While
+something plays, a chip shows its track; click it for the panel with
+play/pause and next. A bell shows the notification count; click it for the
+panel with **Show last**, **Clear**, a Do not disturb switch and the three
+most recent notifications. Network, Bluetooth and sound stay as indicators
+with their own panels. Media (MPRIS) goes straight over D-Bus. Anything
+D-Bus can't reach falls back to `playerctl` or `dunstctl`. Everything is
+read off the UI thread, so a slow service never freezes the bar.
 
-Each rail reserves 88 px on its edge, so windows sit between them. The
-surface widens while a hover card or the panel is open.
-
-The Nordlys session starts both.
+The shelf reserves 88 px on its edge, so windows sit clear of it. The
+Nordlys session starts it.
 
 ## Notifications
 
@@ -519,9 +513,9 @@ right, newest on top, at most four at a time:
 - With Do not disturb on, toasts wait quietly in history (critical ones
   still show) and appear when it's switched off.
 
-The ambient rail reads from it: the bell's badge counts what arrived since
-you last opened the panel, and the panel lists the three most recent with
-**Show last** and **Clear**. Without the daemon the rail falls back to dunst.
+The bar's bell reads from it: its badge counts what arrived since you last
+opened the panel, and the panel lists the three most recent with **Show
+last** and **Clear**. Without the daemon the bell falls back to dunst.
 
 Only one notification daemon can run. If dunst (or mako) is running, stop
 it first; `notify` says so and exits otherwise. The Nordlys session starts

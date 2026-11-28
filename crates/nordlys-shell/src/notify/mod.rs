@@ -1,8 +1,8 @@
 //! The notification daemon and its toasts. Notifications pop in at the top
-//! right, under the bar and beside the ambient rail, as glass cards.
+//! right, under the bar, as glass cards.
 //! Hovering one holds it; clicking it runs its default action or dismisses
-//! it. Everything that leaves the screen goes to history, which the ambient
-//! rail shows.
+//! it. Everything that leaves the screen goes to history, which the bar's
+//! bell shows.
 
 mod server;
 pub mod store;

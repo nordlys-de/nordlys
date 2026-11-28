@@ -10,6 +10,6 @@ After=graphical-session-pre.target
 Wants=nordlys-notify.service nordlys-wallpaper.service nordlys-idle.service
 Wants=nordlys-clipboard.service
 Wants=nordlys-shell@bar.service nordlys-shell@shelf.service
-Wants=nordlys-shell@ambient.service nordlys-shell@close-button.service
+Wants=nordlys-shell@close-button.service
 # Apps that start when you log in (~/.config/autostart, set in Settings).
 Wants=xdg-desktop-autostart.target

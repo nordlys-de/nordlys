@@ -1,6 +1,6 @@
 //! Media, Wi-Fi and Bluetooth straight over D-Bus: MPRIS players on the
 //! session bus, NetworkManager and BlueZ on the system bus. No processes
-//! are started, so the ambient rail can read them as often as it likes.
+//! are started, so the bar can read them as often as it likes.
 //!
 //! Every function returns None when the service can't be reached, so
 //! `system` falls back to the command-line tools.
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 use zbus::blocking::Connection;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 /// No call may take longer than this; a stuck service is treated as gone.
 const PATIENCE: Duration = Duration::from_millis(800);
@@ -49,18 +49,6 @@ fn get(bus: &Connection, dest: &str, path: &str, iface: &str, prop: &str) -> Opt
         .body()
         .deserialize::<OwnedValue>()
         .ok()
-}
-
-fn set(bus: &Connection, dest: &str, path: &str, iface: &str, prop: &str, on: bool) -> Option<()> {
-    bus.call_method(
-        Some(dest),
-        path,
-        Some(PROPS),
-        "Set",
-        &(iface, prop, Value::from(on)),
-    )
-    .ok()
-    .map(|_| ())
 }
 
 /// Names with an owner right now. Activatable-only names are left out, so
@@ -172,14 +160,6 @@ pub fn player_call(method: &str) -> Option<()> {
 
 // ---- Wi-Fi (NetworkManager) ----
 
-pub fn wifi() -> Option<bool> {
-    bool::try_from(get(system()?, NM, NM_PATH, NM, "WirelessEnabled")?).ok()
-}
-
-pub fn set_wifi(on: bool) -> Option<()> {
-    set(system()?, NM, NM_PATH, NM, "WirelessEnabled", on)
-}
-
 /// NetworkManager's overall state (70 is fully connected) and the kind of
 /// its main connection ("802-11-wireless", "802-3-ethernet"…).
 pub fn network() -> Option<(u32, String)> {
@@ -228,12 +208,6 @@ pub fn bluetooth() -> Option<Option<bool>> {
     Some(bool::try_from(get(bus, BLUEZ, &path, ADAPTER, "Powered")?).ok())
 }
 
-pub fn set_bluetooth(on: bool) -> Option<()> {
-    let bus = system()?;
-    let path = adapter(bus)?;
-    set(bus, BLUEZ, &path, ADAPTER, "Powered", on)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,7 +253,6 @@ mod live {
     #[test]
     #[ignore = "talks to the session and system buses"]
     fn reads_this_machine() {
-        eprintln!("wifi: {:?}", super::wifi());
         eprintln!("bluetooth: {:?}", super::bluetooth());
         eprintln!("now playing: {:?}", super::now_playing());
     }

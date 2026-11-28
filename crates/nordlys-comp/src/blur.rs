@@ -34,11 +34,10 @@ use std::collections::HashMap;
 
 /// Shell surfaces that are glass, by layer-shell namespace (the same
 /// list the Hyprland session blurs).
-const GLASS: [&str; 7] = [
+const GLASS: [&str; 6] = [
     "nordlys-bar",
     "nordlys-launcher",
     "nordlys-shelf",
-    "nordlys-ambient",
     "nordlys-notify",
     "nordlys-osd",
     "nordlys-welcome",

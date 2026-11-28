@@ -1,10 +1,10 @@
-//! nordlys-shell: the Nordlys top bar, launcher, shelf, ambient rail,
-//! notifications and lock screen.
+//! nordlys-shell: the Nordlys top bar (with now playing and notifications
+//! on its right), launcher, shelf, notifications and lock screen.
 //!
 //! Usage:
 //!   nordlys-shell [bar] [--window] [--output NAME]
 //!   nordlys-shell launcher [--window] [--query TEXT]
-//!   nordlys-shell shelf|ambient [--window] [--output NAME]
+//!   nordlys-shell shelf [--window] [--output NAME]
 //!   nordlys-shell notify [--window]
 //!   nordlys-shell lock [--window | --check]
 //!   nordlys-shell osd volume|brightness up|down|show
@@ -15,7 +15,6 @@
 //! today and on nordlys-comp later. Elsewhere, or with `--window`, it opens
 //! as an ordinary preview window.
 
-mod ambient;
 mod apps;
 mod bar;
 mod calendar;
@@ -24,10 +23,12 @@ mod controls;
 mod dbus;
 mod events;
 mod files;
+mod gpu;
 mod icons;
 mod launcher;
 mod lock;
 mod notify;
+mod now;
 mod osd;
 mod screens;
 mod search;
@@ -38,8 +39,7 @@ mod tray;
 mod ui;
 mod welcome;
 
-use ambient::Ambient;
-use bar::{BAR_GAP, BAR_HEIGHT, Bar};
+use bar::Bar;
 use launcher::Launcher;
 use lock::Lock;
 use nordlys_config::Config;
@@ -50,7 +50,7 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage: nordlys-shell [bar] [--window] [--output NAME]
        nordlys-shell launcher [--window] [--query TEXT]
-       nordlys-shell shelf|ambient [--window] [--output NAME]
+       nordlys-shell shelf [--window] [--output NAME]
        nordlys-shell notify [--window]
        nordlys-shell close-button [--output NAME]
        nordlys-shell lock [--window | --check]
@@ -58,7 +58,7 @@ usage: nordlys-shell [bar] [--window] [--output NAME]
        nordlys-shell tray                 (print the tray's icons and menus)
        nordlys-shell welcome [--first-run] [--window]
 
-On Hyprland, bar, shelf, ambient and close-button without --output run
+On Hyprland, bar, shelf and close-button without --output run
 one copy per screen, following screens as they come and go.";
 
 fn main() -> ExitCode {
@@ -97,15 +97,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A hidden shelf starts nothing. It exits cleanly, so systemd doesn't restart it.
+    if piece == Some("shelf") && !config.stage.shelf {
+        return ExitCode::SUCCESS;
+    }
     if window && !wayland {
         eprintln!("nordlys-shell: not on Wayland, opening a preview window");
     }
 
     // One per screen: this process only watches the screens.
-    let per_screen = matches!(
-        piece,
-        None | Some("bar" | "shelf" | "ambient" | "close-button")
-    );
+    let per_screen = matches!(piece, None | Some("bar" | "shelf" | "close-button"));
     if per_screen && !window && output.is_none() {
         let name = piece.unwrap_or("bar");
         match screens::supervise(&sources::Compositor::detect(), name) {
@@ -122,8 +123,6 @@ fn main() -> ExitCode {
         (Some("launcher"), true) => launcher_window(config, query),
         (Some("shelf"), false) => shelf_layer(config, output),
         (Some("shelf"), true) => shelf_window(config),
-        (Some("ambient"), false) => ambient_layer(config, output),
-        (Some("ambient"), true) => ambient_window(config),
         (Some("close-button"), false) => close_button_layer(output),
         (Some("close-button"), true) => Err("the close button needs Hyprland".into()),
         (Some("notify"), false) => notify_layer(config),
@@ -157,7 +156,8 @@ fn bar_layer(config: Config, output: Option<String>) -> Result<(), String> {
     use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
     use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 
-    let height = bar::SURFACE;
+    let (top, below) = (config.gaps.topbar as u32, config.bar.gap as u32);
+    let height = bar::surface(top, below);
     let screen = output.clone();
     iced_layershell::application(
         move || Bar::new(&config, false, screen.clone()),
@@ -174,9 +174,9 @@ fn bar_layer(config: Config, output: Option<String>) -> Result<(), String> {
             anchor: Anchor::Top | Anchor::Left | Anchor::Right,
             layer: Layer::Top,
             size: Some((0, height)),
-            // Reserve the bar and the gap above it; the gap below
-            // belongs to the stage's own margin.
-            exclusive_zone: (BAR_HEIGHT + BAR_GAP) as i32,
+            // Reserve the top gap and the bar; the gap below belongs to
+            // whatever sits under the bar (windows, the shelf).
+            exclusive_zone: bar::reserved(top) as i32,
             keyboard_interactivity: KeyboardInteractivity::None,
             start_mode: output
                 .map(StartMode::TargetScreen)
@@ -404,6 +404,8 @@ fn launcher_window(config: Config, query: String) -> Result<(), String> {
 fn rail_settings(
     edge: iced_layershell::reexport::Anchor,
     output: Option<String>,
+    margin: (i32, i32, i32, i32),
+    exclusive: i32,
 ) -> iced_layershell::settings::Settings {
     use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
     use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
@@ -415,7 +417,8 @@ fn rail_settings(
             anchor: edge | Anchor::Top | Anchor::Bottom,
             layer: Layer::Top,
             size: Some((ZONE, 0)),
-            exclusive_zone: ZONE as i32,
+            margin,
+            exclusive_zone: exclusive,
             keyboard_interactivity: KeyboardInteractivity::None,
             start_mode: output
                 .map(StartMode::TargetScreen)
@@ -428,6 +431,7 @@ fn rail_settings(
 
 fn shelf_layer(config: Config, output: Option<String>) -> Result<(), String> {
     use iced_layershell::reexport::Anchor;
+    let (margin, exclusive) = shelf::placement(&config.bar, &config.gaps);
     let screen = output.clone();
     iced_layershell::application(
         move || Shelf::new(&config, false, screen.clone()),
@@ -437,7 +441,7 @@ fn shelf_layer(config: Config, output: Option<String>) -> Result<(), String> {
     )
     .style(Shelf::style)
     .subscription(Shelf::subscription)
-    .settings(rail_settings(Anchor::Left, output))
+    .settings(rail_settings(Anchor::Left, output, margin, exclusive))
     .run()
     .map_err(|e| e.to_string())
 }
@@ -451,38 +455,6 @@ fn shelf_window(config: Config) -> Result<(), String> {
     .title("Nordlys shelf · preview")
     .style(Shelf::style)
     .subscription(Shelf::subscription)
-    .default_font(bar::INTER)
-    .font(icons::FONT_BYTES)
-    .window_size((520.0, 720.0))
-    .resizable(false)
-    .run()
-    .map_err(|e| e.to_string())
-}
-
-fn ambient_layer(config: Config, output: Option<String>) -> Result<(), String> {
-    use iced_layershell::reexport::Anchor;
-    iced_layershell::application(
-        move || Ambient::new(&config, false, false),
-        || "nordlys-ambient".to_owned(),
-        Ambient::update,
-        Ambient::view,
-    )
-    .style(Ambient::style)
-    .subscription(Ambient::subscription)
-    .settings(rail_settings(Anchor::Right, output))
-    .run()
-    .map_err(|e| e.to_string())
-}
-
-fn ambient_window(config: Config) -> Result<(), String> {
-    iced::application(
-        move || Ambient::new(&config, true, true),
-        Ambient::update,
-        Ambient::view,
-    )
-    .title("Nordlys ambient · preview")
-    .style(Ambient::style)
-    .subscription(Ambient::subscription)
     .default_font(bar::INTER)
     .font(icons::FONT_BYTES)
     .window_size((520.0, 720.0))
@@ -507,7 +479,7 @@ fn notify_layer(config: Config) -> Result<(), String> {
         default_font: bar::INTER,
         fonts: vec![icons::FONT_BYTES.into()],
         layer_settings: LayerShellSettings {
-            // Top right, inside the bar's and the ambient rail's zones. The
+            // Top right, under the bar. The
             // surface is resized to fit the toasts and shrinks to a pixel
             // when there are none.
             anchor: Anchor::Top | Anchor::Right,

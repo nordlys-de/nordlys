@@ -62,7 +62,6 @@ local by_hand = table.concat({
     "nordlys-shell notify &",
     "nordlys-shell &",
     "nordlys-shell shelf &",
-    "nordlys-shell ambient &",
     "nordlys-shell close-button &",
     "swaybg -m " .. wallpaper_mode .. " -i '" .. wallpaper .. "' &",
     "hypridle -c '" .. idle .. "' &",
@@ -197,7 +196,7 @@ hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
 -- blur to the painted parts, not the clear margins around them.
 hl.layer_rule({
     name  = "nordlys-glass",
-    match = { namespace = "^nordlys-(bar|launcher|shelf|ambient|notify|osd|welcome)$" },
+    match = { namespace = "^nordlys-(bar|launcher|shelf|notify|osd|welcome)$" },
     blur  = true,
     ignore_alpha = 0.3,
 })

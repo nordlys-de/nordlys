@@ -13,7 +13,7 @@ if command -v systemctl >/dev/null && systemctl --user cat nordlys-session.targe
     systemctl --user --no-block start nordlys-session.target
 else
     # No systemd user session: start the pieces by hand (no restarts).
-    for piece in notify bar shelf ambient close-button; do
+    for piece in notify bar shelf close-button; do
         nordlys-shell "$piece" &
     done
     command -v swaybg >/dev/null && swaybg -m fill -i "${NORDLYS_DATA:-/usr/share/nordlys}/wallpaper.jpg" &

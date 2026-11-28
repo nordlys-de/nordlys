@@ -17,13 +17,21 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{Space, button, column, container, image, mouse_area, row, stack, text};
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Subscription, Task};
 use iced_layershell::to_layer_message;
-use nordlys_config::{Config, Palette};
+use nordlys_config::{BarConfig, Config, Gaps, Palette};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 pub const RAIL: f32 = 76.0;
 /// Space the rail reserves at the screen edge: rail plus its margin.
 pub const ZONE: u32 = 88;
+
+/// Where the rail sits, as layer margins (top, right, bottom, left) and the
+/// space it reserves. It starts `bar.gap` below the top bar and is indented
+/// `gaps.shelf` from the screen's left edge.
+pub fn placement(bar: &BarConfig, gaps: &Gaps) -> ((i32, i32, i32, i32), i32) {
+    let (below, side) = (bar.gap as i32, gaps.shelf as i32);
+    ((below, 0, 0, side), ZONE as i32 + side)
+}
 const TILE: f32 = 56.0;
 const GAP: f32 = 10.0;
 const FLYOUT: f32 = 300.0;
@@ -31,6 +39,8 @@ const MAX_SLOTS: usize = 8;
 
 pub struct Shelf {
     palette: Palette,
+    bar: BarConfig,
+    gaps: Gaps,
     compositor: Compositor,
     windows: Vec<ShelfWindow>,
     hover: Option<usize>,
@@ -73,6 +83,8 @@ impl Shelf {
         let windows = compositor.shelf(screen.as_deref());
         Self {
             palette: config.palette(),
+            bar: config.bar.clone(),
+            gaps: config.gaps.clone(),
             compositor,
             // The preview window opens with slot 1's flyout showing.
             hover: (preview && !windows.is_empty()).then_some(0),
@@ -131,7 +143,18 @@ impl Shelf {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Changed => return self.refresh(),
-            Message::Config(c) => self.palette = c.palette(),
+            Message::Config(c) => {
+                self.palette = c.palette();
+                self.bar = c.bar.clone();
+                self.gaps = c.gaps.clone();
+                if !self.preview {
+                    let (margin, exclusive) = placement(&self.bar, &self.gaps);
+                    return Task::batch([
+                        Task::done(Message::MarginChange(margin)),
+                        Task::done(Message::ExclusiveZoneChange(exclusive)),
+                    ]);
+                }
+            }
             Message::Windows(windows) => {
                 let again = self.reads.done();
                 if let Some(w) = windows {
@@ -221,7 +244,7 @@ impl Shelf {
                 container(Space::new().width(TILE - 4.0).height(TILE - 4.0)).style(move |_| {
                     container::Style {
                         border: Border {
-                            radius: 14.0.into(),
+                            radius: r.corner(14.0).into(),
                             width: 1.5,
                             color: r.chip_border,
                         },
@@ -317,7 +340,7 @@ fn slot(i: usize, w: &ShelfWindow, hovered: bool, r: Rail) -> Element<'static, M
         .style(move |_| container::Style {
             background: Some(Background::Color(r.badge)),
             border: Border {
-                radius: 9.0.into(),
+                radius: r.corner(9.0).into(),
                 width: 1.0,
                 color: r.chip_border,
             },
@@ -366,7 +389,7 @@ fn close_badge(i: usize, r: Rail) -> Element<'static, Message> {
         })),
         text_color: r.text,
         border: Border {
-            radius: 10.0.into(),
+            radius: r.corner(10.0).into(),
             width: 1.0,
             color: r.chip_border,
         },
@@ -402,7 +425,7 @@ fn flyout(
                     move |_| container::Style {
                         background: Some(Background::Color(t)),
                         border: Border {
-                            radius: 4.0.into(),
+                            radius: r.corner(4.0).into(),
                             ..Border::default()
                         },
                         ..container::Style::default()

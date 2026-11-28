@@ -35,8 +35,14 @@ pub struct Rail {
 }
 
 impl Rail {
+    /// A corner radius: `base` px at the default roundness, scaled to the setting.
+    pub fn corner(&self, base: f32) -> f32 {
+        base * self.scale
+    }
+
     pub fn of(p: &Palette) -> Self {
         let base = Rail {
+            scale: p.corner(1.0),
             rail: Color::from_rgba8(18, 22, 30, 0.50),
             rail_border: Color::from_rgba8(255, 255, 255, 0.09),
             panel: Color::from_rgba8(24, 28, 38, 0.82),

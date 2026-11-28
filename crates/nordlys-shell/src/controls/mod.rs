@@ -241,6 +241,8 @@ fn paired(b: &bluetooth::Bluetooth) -> Vec<&bluetooth::Device> {
 /// Colours on the panel's dark or light glass.
 #[derive(Clone, Copy)]
 struct Look {
+    /// Multiplies corner radii drawn at the default roundness.
+    scale: f32,
     ink: Color,
     muted: Color,
     dim: Color,
@@ -251,6 +253,10 @@ struct Look {
 }
 
 impl Look {
+    fn corner(&self, base: f32) -> f32 {
+        base * self.scale
+    }
+
     fn of(p: &Palette) -> Self {
         let (hover, line) = if p.dark {
             (
@@ -264,6 +270,7 @@ impl Look {
             )
         };
         Look {
+            scale: p.corner(1.0),
             ink: color(p.text),
             muted: color(p.muted),
             dim: color(p.dim),
@@ -373,7 +380,7 @@ fn item<'a>(
             background: (status == button::Status::Hovered).then_some(Background::Color(g.hover)),
             text_color: g.ink,
             border: Border {
-                radius: 8.0.into(),
+                radius: g.corner(8.0).into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -388,7 +395,7 @@ fn link<'a>(label: &'a str, on: Msg, g: Look) -> El<'a> {
         .style(move |_, status| button::Style {
             background: (status == button::Status::Hovered).then_some(Background::Color(g.hover)),
             border: Border {
-                radius: 7.0.into(),
+                radius: g.corner(7.0).into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -643,7 +650,7 @@ fn level<'a>(node: &'a audio::Node, sliding: Option<(u32, f32)>, input: bool, g:
                     backgrounds: (Background::Color(g.accent), Background::Color(g.hover)),
                     width: 4.0,
                     border: Border {
-                        radius: 2.0.into(),
+                        radius: g.corner(2.0).into(),
                         ..Border::default()
                     },
                 },

@@ -46,47 +46,25 @@ impl Reads {
         self.busy = false;
         std::mem::take(&mut self.again)
     }
-
-    /// Ask for a fresh read after the current one, if one is running.
-    pub fn invalidate(&mut self) {
-        self.again |= self.busy;
-    }
 }
 
-/// Everything the ambient rail shows, read in one go.
+/// What the bar's now-playing chip and bell show, read in one go.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub playing: Option<NowPlaying>,
     pub notices: Option<Notices>,
-    /// Only read while the panel is open.
-    pub controls: Option<Controls>,
-}
-
-/// The quick settings in the ambient panel.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Controls {
-    pub volume: Option<Volume>,
-    pub wifi: Option<bool>,
-    pub bluetooth: Option<bool>,
 }
 
 impl Snapshot {
-    /// Ask every tool at once, so the whole read takes as long as the
-    /// slowest tool rather than the sum of them. Blocking: call it through
-    /// [`background`].
-    pub fn read(controls: bool) -> Self {
+    /// Ask both tools at once, so the read takes as long as the slower one
+    /// rather than the sum. Blocking: call it through [`background`].
+    pub fn read() -> Self {
         std::thread::scope(|s| {
             let playing = s.spawn(now_playing);
             let notices = s.spawn(notices);
-            let controls = controls.then(|| (s.spawn(volume), s.spawn(wifi), s.spawn(bluetooth)));
             Snapshot {
                 playing: playing.join().ok().flatten(),
                 notices: notices.join().ok().flatten(),
-                controls: controls.map(|(v, w, b)| Controls {
-                    volume: v.join().ok().flatten(),
-                    wifi: w.join().ok().flatten(),
-                    bluetooth: b.join().ok().flatten(),
-                }),
             }
         })
     }
@@ -210,20 +188,6 @@ fn parse_volume(s: &str) -> Option<Volume> {
     })
 }
 
-pub fn set_volume(level: f32) {
-    let v = format!("{:.2}", level.clamp(0.0, 1.0));
-    fire("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &v]);
-}
-
-pub fn toggle_mute() {
-    fire("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]);
-}
-
-/// None when NetworkManager isn't there.
-pub fn wifi() -> Option<bool> {
-    crate::dbus::wifi().or_else(|| run("nmcli", &["radio", "wifi"]).map(|s| s == "enabled"))
-}
-
 /// How the computer is online, for the bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
@@ -306,13 +270,6 @@ impl Status {
     }
 }
 
-pub fn set_wifi(on: bool) {
-    if crate::dbus::set_wifi(on).is_some() {
-        return;
-    }
-    fire("nmcli", &["radio", "wifi", if on { "on" } else { "off" }]);
-}
-
 pub fn bluetooth() -> Option<bool> {
     if let Some(answer) = crate::dbus::bluetooth() {
         return answer;
@@ -329,14 +286,7 @@ fn parse_bluetooth(show: &str) -> Option<bool> {
         .map(|v| v.trim() == "yes")
 }
 
-pub fn set_bluetooth(on: bool) {
-    if crate::dbus::set_bluetooth(on).is_some() {
-        return;
-    }
-    fire("bluetoothctl", &["power", if on { "on" } else { "off" }]);
-}
-
-/// One recent notification, for the ambient panel.
+/// One recent notification, for the bar's bell panel.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recent {
     pub id: u32,

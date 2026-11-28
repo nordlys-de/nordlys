@@ -1,6 +1,6 @@
 //! The D-Bus side: `org.freedesktop.Notifications`, the standard every app
 //! sends to, plus `de.nordlys.Notifications` on the same object so the
-//! ambient rail can read counts and recent notifications and switch Do not
+//! bar can read counts and recent notifications and switch Do not
 //! disturb.
 
 use super::store::{Closed, Request, Store, Urgency, plain};

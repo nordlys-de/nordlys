@@ -13,6 +13,8 @@ pub use palette::{Palette, Rgb};
 pub struct Config {
     pub theme: Theme,
     pub stage: StageConfig,
+    pub bar: BarConfig,
+    pub gaps: Gaps,
     #[serde(rename = "group")]
     pub groups: Vec<Group>,
 }
@@ -28,7 +30,13 @@ pub struct Theme {
     /// Swap glass for solid surfaces (weak GPUs, accessibility).
     pub reduce_transparency: bool,
     pub reduce_motion: bool,
+    /// Corner radius in pixels for windows and shell surfaces, 0–24. Every
+    /// other rounded corner scales from it (see `Palette::corner`).
+    pub roundness: u8,
 }
+
+/// The default corner radius, the one the shell was drawn at.
+pub const DEFAULT_ROUNDNESS: u8 = 14;
 
 impl Default for Theme {
     fn default() -> Self {
@@ -38,6 +46,7 @@ impl Default for Theme {
             blur: 24,
             reduce_transparency: false,
             reduce_motion: false,
+            roundness: DEFAULT_ROUNDNESS,
         }
     }
 }
@@ -58,6 +67,9 @@ pub struct StageConfig {
     pub split: f32,
     /// Redraw rate for windows waiting on the shelf.
     pub shelf_fps: u8,
+    /// Show the left shelf rail. Off, the rail isn't started; windows still
+    /// wait, and the keys that cycle them still work.
+    pub shelf: bool,
 }
 
 impl Default for StageConfig {
@@ -66,8 +78,84 @@ impl Default for StageConfig {
             layout: Layout::Auto,
             split: 0.6,
             shelf_fps: 10,
+            shelf: true,
         }
     }
+}
+
+/// The space between the screen's edges and the panels on them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Gaps {
+    /// Pixels from the screen's top edge down to the top bar.
+    pub topbar: u8,
+    /// Pixels from the screen's left edge to the shelf rail.
+    pub shelf: u8,
+}
+
+impl Default for Gaps {
+    fn default() -> Self {
+        Self {
+            topbar: 10,
+            shelf: 12,
+        }
+    }
+}
+
+/// The top bar's spacing and which of its parts show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BarConfig {
+    /// Space in pixels above and below the bar: the gap to the screen's
+    /// edge and to whatever sits under it, like the shelf.
+    pub gap: u8,
+    /// Space in pixels at each end of the bar.
+    pub side: u8,
+    /// Parts of the bar to leave out.
+    pub hidden: Vec<BarItem>,
+}
+
+impl Default for BarConfig {
+    fn default() -> Self {
+        Self {
+            gap: 10,
+            side: 12,
+            hidden: Vec::new(),
+        }
+    }
+}
+
+/// A part of the top bar that can be hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BarItem {
+    Apps,
+    Workspaces,
+    Stage,
+    Clock,
+    Recording,
+    Media,
+    Notifications,
+    Tray,
+    Layout,
+    Indicators,
+    Battery,
+}
+
+impl BarItem {
+    pub const ALL: [BarItem; 11] = [
+        BarItem::Apps,
+        BarItem::Workspaces,
+        BarItem::Stage,
+        BarItem::Clock,
+        BarItem::Recording,
+        BarItem::Media,
+        BarItem::Notifications,
+        BarItem::Tray,
+        BarItem::Layout,
+        BarItem::Indicators,
+        BarItem::Battery,
+    ];
 }
 
 /// How the shelves are drawn. `Auto` picks by monitor width:
@@ -129,6 +217,7 @@ impl Config {
         if let Some(a) = self.theme.accent.as_deref().and_then(Rgb::parse) {
             p.set_accent(a);
         }
+        p.roundness = self.theme.roundness;
         p
     }
 
@@ -160,6 +249,21 @@ impl Config {
             return Err(Error::Invalid(
                 "stage.split must be between 0.3 and 0.8".into(),
             ));
+        }
+        if self.theme.roundness > 24 {
+            return Err(Error::Invalid("theme.roundness must be 0 to 24".into()));
+        }
+        if self.bar.gap > 24 {
+            return Err(Error::Invalid("bar.gap must be 0 to 24".into()));
+        }
+        if self.gaps.topbar > 40 {
+            return Err(Error::Invalid("gaps.topbar must be 0 to 40".into()));
+        }
+        if self.gaps.shelf > 40 {
+            return Err(Error::Invalid("gaps.shelf must be 0 to 40".into()));
+        }
+        if self.bar.side > 40 {
+            return Err(Error::Invalid("bar.side must be 0 to 40".into()));
         }
         for g in &self.groups {
             if g.apps.is_empty() {
@@ -247,6 +351,42 @@ mod tests {
     fn typos_are_rejected() {
         assert!(Config::from_toml("[theme]\nacent = \"#fff\"").is_err());
         assert!(Config::from_toml("[theme]\naccent = \"blue\"").is_err());
+    }
+
+    #[test]
+    fn look_settings_parse_and_validate() {
+        let c = Config::from_toml(
+            "[theme]\nroundness = 0\n[stage]\nshelf = false\n\
+             [bar]\ngap = 4\nside = 20\nhidden = [\"tray\", \"layout\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.theme.roundness, 0);
+        assert!(!c.stage.shelf);
+        assert_eq!((c.bar.gap, c.bar.side), (4, 20));
+        assert_eq!(c.bar.hidden, [BarItem::Tray, BarItem::Layout]);
+        assert_eq!(c.palette().corner(14.0), 0.0);
+        assert!(Config::from_toml("[bar]\nhidden = [\"clok\"]").is_err());
+        assert!(Config::from_toml("[theme]\nroundness = 25").is_err());
+        assert!(Config::from_toml("[bar]\ngap = 25").is_err());
+        assert!(Config::from_toml("[bar]\nside = 41").is_err());
+    }
+
+    #[test]
+    fn screen_gaps_parse_and_validate() {
+        let c = Config::from_toml("[gaps]\ntopbar = 4\nshelf = 30\n").unwrap();
+        assert_eq!((c.gaps.topbar, c.gaps.shelf), (4, 30));
+        assert_eq!(Config::default().gaps, Gaps::default());
+        assert!(Config::from_toml("[gaps]\ntopbar = 41").is_err());
+        assert!(Config::from_toml("[gaps]\nshelf = 41").is_err());
+        assert!(Config::from_toml("[gaps]\ntop = 4").is_err());
+    }
+
+    #[test]
+    fn corners_scale_from_the_default() {
+        let p = Config::default().palette();
+        assert_eq!(p.corner(8.0), 8.0);
+        let big = Config::from_toml("[theme]\nroundness = 24").unwrap();
+        assert_eq!(big.palette().corner(14.0), 24.0);
     }
 
     #[test]

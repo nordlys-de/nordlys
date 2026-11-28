@@ -9,6 +9,7 @@ use crate::calendar;
 use crate::controls;
 use crate::events;
 use crate::icons::{self, icon};
+use crate::now::{self, Action as NowAction, Pop};
 use crate::sources::{self, Battery, Compositor, Desk};
 use crate::system;
 use crate::tray;
@@ -24,7 +25,7 @@ use iced::{
     Task, Vector,
 };
 use iced_layershell::to_layer_message;
-use nordlys_config::{Config, Layout, Palette, Rgb};
+use nordlys_config::{BarConfig, BarItem, Config, Gaps, Layout, Palette, Rgb};
 use std::time::Duration;
 
 pub const INTER: Font = Font::with_name("Inter");
@@ -34,9 +35,20 @@ pub(crate) const INTER_SEMIBOLD: Font = Font {
 };
 pub(crate) const MONO: Font = Font::with_name("JetBrains Mono");
 
-/// Bar height on the canvas, plus the gap above it.
+/// Bar height on the canvas. Above it is `gaps.topbar`, below it `bar.gap`.
 pub const BAR_HEIGHT: u32 = 40;
-pub const BAR_GAP: u32 = 10;
+
+/// The layer surface's height: the gap from the screen's top edge, the bar,
+/// and the gap below it.
+pub fn surface(top: u32, below: u32) -> u32 {
+    top + BAR_HEIGHT + below
+}
+
+/// The space the bar reserves on screen: from the top edge through the bar.
+/// The gap below belongs to the windows' and the shelf's own margin.
+pub fn reserved(top: u32) -> u32 {
+    top + BAR_HEIGHT
+}
 
 /// This same binary's launcher, so it works without anything on PATH.
 fn launcher_command() -> String {
@@ -48,6 +60,10 @@ fn launcher_command() -> String {
 
 pub struct Bar {
     palette: Palette,
+    /// Spacing and which parts show, from `[bar]`.
+    cfg: BarConfig,
+    /// The space from the screen's edges to the panels, from `[gaps]`.
+    gaps: Gaps,
     layout: Layout,
     compositor: Compositor,
     desk: Desk,
@@ -71,6 +87,14 @@ pub struct Bar {
     /// Network, Bluetooth and volume, read every few seconds.
     status: system::Status,
     status_reading: bool,
+    /// Now playing and notifications, read with the indicators.
+    media: Option<system::NowPlaying>,
+    notices: Option<system::Notices>,
+    /// Newest notification the panel has shown; the bell counts what's newer.
+    seen: u32,
+    /// The media or notifications panel, open under its chip.
+    pop: Option<Pop>,
+    now_reads: system::Reads,
 }
 
 /// A tray menu on show. Submenus stack on the levels; Back pops one.
@@ -126,11 +150,14 @@ pub enum Message {
     PanelDone(Option<Result<Option<String>, String>>),
     /// Scroll on the volume: up (+1) or down (-1).
     Volume(i32),
+    /// Open or close the media or notifications panel.
+    Pop(Pop),
+    /// A button in the media or notifications panel.
+    Now(NowAction),
+    /// What the media and notifications read found.
+    NowRead(Option<system::Snapshot>),
 }
 
-/// The surface's height with the calendar closed and open.
-pub const SURFACE: u32 = BAR_HEIGHT + BAR_GAP * 2;
-const SURFACE_OPEN: u32 = SURFACE + CALENDAR_HEIGHT;
 const CALENDAR_HEIGHT: u32 = 320;
 const CALENDAR_WIDTH: f32 = 300.0;
 const MENU_WIDTH: f32 = 270.0;
@@ -142,6 +169,8 @@ impl Bar {
         let compositor = Compositor::detect();
         let mut bar = Self {
             palette: config.palette(),
+            cfg: config.bar.clone(),
+            gaps: config.gaps.clone(),
             layout: config.stage.layout,
             desk: Desk::default(),
             battery: None,
@@ -157,6 +186,11 @@ impl Bar {
             panel: None,
             status: system::Status::default(),
             status_reading: false,
+            media: None,
+            notices: None,
+            seen: 0,
+            pop: None,
+            now_reads: system::Reads::default(),
         };
         bar.tick();
         // The preview can start with a panel open, to look at it:
@@ -167,7 +201,7 @@ impl Bar {
             Ok("sound") if preview => Task::done(Message::Panel(controls::Kind::Sound)),
             _ => Task::none(),
         };
-        let first = Task::batch([bar.read_desk(), bar.read_status(), panel]);
+        let first = Task::batch([bar.read_desk(), bar.read_status(), bar.read_now(), panel]);
         (bar, first)
     }
 
@@ -184,6 +218,14 @@ impl Bar {
         }
         self.status_reading = true;
         Task::perform(system::background(system::Status::read), Message::Status)
+    }
+
+    /// Read now playing and notifications off the UI thread.
+    fn read_now(&mut self) -> Task<Message> {
+        if !self.now_reads.start() {
+            return Task::none();
+        }
+        Task::perform(system::background(system::Snapshot::read), Message::NowRead)
     }
 
     /// Read the open panel again, unless something is changing it.
@@ -246,6 +288,7 @@ impl Bar {
         let service = item.service.clone();
         self.month = None;
         self.panel = None;
+        self.pop = None;
         self.menu = Some(Menu {
             service: service.clone(),
             path: path.clone(),
@@ -284,6 +327,18 @@ impl Bar {
             Message::Config(c) => {
                 self.palette = c.palette();
                 self.layout = c.stage.layout;
+                self.cfg = c.bar.clone();
+                self.gaps = c.gaps.clone();
+                if self.preview {
+                    return Task::none();
+                }
+                // The gap changes the space reserved on screen as well as the surface.
+                return Task::batch([
+                    Task::done(Message::ExclusiveZoneChange(
+                        reserved(self.gaps.topbar as u32) as i32,
+                    )),
+                    self.resize(),
+                ]);
             }
             Message::Changed => return self.read_desk(),
             Message::Desk(desk) => {
@@ -312,6 +367,7 @@ impl Bar {
             Message::Calendar => {
                 self.menu = None;
                 self.panel = None;
+                self.pop = None;
                 self.month = match self.month {
                     Some(_) => None,
                     None => Some(calendar::first_of(today())),
@@ -406,9 +462,12 @@ impl Bar {
                 self.menu = None;
                 self.month = None;
                 self.panel = None;
+                self.pop = None;
                 return self.resize();
             }
-            Message::Poll => return Task::batch([self.read_status(), self.read_panel()]),
+            Message::Poll => {
+                return Task::batch([self.read_status(), self.read_panel(), self.read_now()]);
+            }
             Message::Panel(kind) => {
                 if self.panel.as_ref().is_some_and(|p| p.kind == kind) {
                     self.panel = None;
@@ -416,6 +475,7 @@ impl Bar {
                 }
                 self.menu = None;
                 self.month = None;
+                self.pop = None;
                 self.panel = Some(controls::Panel::new(kind));
                 return Task::batch([self.resize(), self.read_panel()]);
             }
@@ -444,6 +504,66 @@ impl Bar {
                 }
                 // Show the change, and the icons too.
                 return Task::batch([self.read_panel(), self.read_status(), self.resize()]);
+            }
+            Message::Pop(pop) => {
+                if self.pop == Some(pop) {
+                    self.pop = None;
+                } else {
+                    self.menu = None;
+                    self.month = None;
+                    self.panel = None;
+                    self.pop = Some(pop);
+                    self.see_newest();
+                }
+                return Task::batch([self.resize(), self.read_now()]);
+            }
+            Message::Now(action) => {
+                let work: fn() = match action {
+                    NowAction::PlayPause => {
+                        if let Some(np) = &mut self.media {
+                            np.playing = !np.playing;
+                        }
+                        system::play_pause
+                    }
+                    NowAction::Next => system::next_track,
+                    NowAction::ShowLast => system::pop_notification,
+                    NowAction::Clear => system::clear_notifications,
+                    NowAction::Dnd => {
+                        let Some(n) = &mut self.notices else {
+                            return Task::none();
+                        };
+                        n.dnd = !n.dnd;
+                        let on = n.dnd;
+                        return Task::perform(
+                            system::background(move || system::set_dnd(on)),
+                            |_| Message::Poll,
+                        );
+                    }
+                };
+                return Task::perform(system::background(work), |_| Message::Poll);
+            }
+            Message::NowRead(snap) => {
+                let again = self.now_reads.done();
+                let mut tasks = vec![];
+                if let Some(snap) = snap {
+                    let listed = |n: &Option<system::Notices>| {
+                        n.as_ref().is_some_and(|n| !n.recent.is_empty())
+                    };
+                    let before = listed(&self.notices);
+                    self.media = snap.playing;
+                    self.notices = snap.notices;
+                    if self.pop == Some(Pop::Notices) {
+                        self.see_newest();
+                        // The panel's height depends on whether it lists any.
+                        if listed(&self.notices) != before {
+                            tasks.push(self.resize());
+                        }
+                    }
+                }
+                if again {
+                    tasks.push(self.read_now());
+                }
+                return Task::batch(tasks);
             }
             Message::Status(status) => {
                 self.status_reading = false;
@@ -484,20 +604,62 @@ impl Bar {
         Task::none()
     }
 
+    /// Mark the newest notification as seen: the bell counts from here.
+    fn see_newest(&mut self) {
+        if let Some(newest) = self.notices.as_ref().and_then(|n| n.recent.first()) {
+            self.seen = self.seen.max(newest.id);
+        }
+    }
+
+    /// The media or notifications panel under its chip. A click beside it closes it.
+    fn pop_layer(&self, p: &Palette, glass: Glass, pop: Pop) -> Element<'_, Message> {
+        let ground = color(p.ground);
+        let body = match pop {
+            Pop::Media => now::media_panel(self.media.as_ref(), p).map(Message::Now),
+            Pop::Notices => now::notes_panel(self.notices.as_ref(), self.seen, p).map(Message::Now),
+        };
+        let boxed = container(body)
+            .width(now::WIDTH)
+            .height(now::height(pop, self.notices.as_ref()) as f32)
+            .padding(16)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(Color { a: 0.94, ..ground })),
+                border: Border {
+                    radius: glass.corner(14.0).into(),
+                    width: 1.0,
+                    color: glass.bar_border,
+                },
+                ..container::Style::default()
+            });
+        mouse_area(
+            container(mouse_area(boxed).on_press(Message::Keep))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding([0.0, 12.0])
+                .align_x(Horizontal::Right),
+        )
+        .on_press(Message::Dismiss)
+        .into()
+    }
+
     /// The surface grows to hold the calendar. The space the bar reserves
     /// stays the same, so windows don't move.
     fn resize(&self) -> Task<Message> {
         if self.preview {
             return Task::none();
         }
+        let gap = self.cfg.gap as u32;
+        let closed = surface(self.gaps.topbar as u32, gap);
         let height = if self.month.is_some() {
-            SURFACE_OPEN
+            closed + CALENDAR_HEIGHT
+        } else if let Some(pop) = self.pop {
+            closed + now::height(pop, self.notices.as_ref()) + gap
         } else if let Some(m) = &self.menu {
-            SURFACE + menu_height(m) + BAR_GAP
+            closed + menu_height(m) + gap
         } else if let Some(panel) = &self.panel {
-            SURFACE + panel.height() + BAR_GAP
+            closed + panel.height() + gap
         } else {
-            SURFACE
+            closed
         };
         Task::done(Message::SizeChange((0, height)))
     }
@@ -545,7 +707,7 @@ impl Bar {
                     })),
                     text_color: fg,
                     border: Border {
-                        radius: 8.0.into(),
+                        radius: glass.corner(8.0).into(),
                         ..Border::default()
                     },
                     ..button::Style::default()
@@ -572,7 +734,7 @@ impl Bar {
             })),
             text_color: color(p.text),
             border: Border {
-                radius: 8.0.into(),
+                radius: glass.corner(8.0).into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -602,7 +764,7 @@ impl Bar {
                     .then_some(Background::Color(glass.chip_hover)),
                 text_color: color(p.text),
                 border: Border {
-                    radius: 8.0.into(),
+                    radius: glass.corner(8.0).into(),
                     ..Border::default()
                 },
                 ..button::Style::default()
@@ -629,64 +791,97 @@ impl Bar {
         .style(move |_| container::Style {
             background: Some(Background::Color(glass.chip)),
             border: Border {
-                radius: 6.0.into(),
+                radius: glass.corner(6.0).into(),
                 width: 1.0,
                 color: glass.chip_border,
             },
             ..container::Style::default()
         });
 
+        // Parts the user hid in [bar] are left out, here and in the sides' rows.
+        let hidden = |item: BarItem| self.cfg.hidden.contains(&item);
+
         let mut right = row![].spacing(12).align_y(Alignment::Center);
-        if let Some(t) = self.recording {
+        if let Some(t) = self.recording.filter(|_| !hidden(BarItem::Recording)) {
             right = right.push(recording_chip(p, glass, t));
         }
-        if !self.tray.is_empty() {
+        if let Some(np) = self.media.as_ref().filter(|_| !hidden(BarItem::Media)) {
+            right = right.push(media_chip(p, glass, np, self.pop == Some(Pop::Media)));
+        }
+        if let Some(n) = self
+            .notices
+            .as_ref()
+            .filter(|_| !hidden(BarItem::Notifications))
+        {
+            let unread = now::unread(n, self.seen);
+            right = right.push(bell_chip(
+                p,
+                glass,
+                unread,
+                n.dnd,
+                self.pop == Some(Pop::Notices),
+            ));
+        }
+        if !self.tray.is_empty() && !hidden(BarItem::Tray) {
             right = right.push(tray_icons(p, glass, &self.tray, self.menu.as_ref()));
         }
-        right = right.push(chip);
-        if let Some(ind) = indicators(p, glass, self.status) {
+        if !hidden(BarItem::Layout) {
+            right = right.push(chip);
+        }
+        if let Some(ind) =
+            indicators(p, glass, self.status).filter(|_| !hidden(BarItem::Indicators))
+        {
             right = right.push(ind);
         }
-        if let Some(b) = self.battery {
+        if let Some(b) = self.battery.filter(|_| !hidden(BarItem::Battery)) {
             right = right.push(battery(p, b));
         }
 
-        let bar = container(
-            row![
-                container(
-                    row![apps_button, workspaces, stage]
-                        .spacing(12)
-                        .align_y(Alignment::Center)
-                )
-                .width(Length::Fill),
-                clock,
-                container(right)
-                    .width(Length::Fill)
-                    .align_x(Horizontal::Right),
-            ]
-            .align_y(Alignment::Center),
-        )
-        .padding([0, 10])
-        .width(Length::Fill)
-        .height(BAR_HEIGHT as f32)
-        .align_y(Alignment::Center)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(glass.bar)),
-            border: Border {
-                radius: 12.0.into(),
-                width: 1.0,
-                color: glass.bar_border,
-            },
-            shadow: Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.18),
-                offset: Vector::new(0.0, 6.0),
-                blur_radius: 24.0,
-            },
-            ..container::Style::default()
-        });
+        let mut left = row![].spacing(12).align_y(Alignment::Center);
+        if !hidden(BarItem::Apps) {
+            left = left.push(apps_button);
+        }
+        if !hidden(BarItem::Workspaces) {
+            left = left.push(workspaces);
+        }
+        if !hidden(BarItem::Stage) {
+            left = left.push(stage);
+        }
+        let mut middle = row![container(left).width(Length::Fill)].align_y(Alignment::Center);
+        if !hidden(BarItem::Clock) {
+            middle = middle.push(clock);
+        }
+        middle = middle.push(
+            container(right)
+                .width(Length::Fill)
+                .align_x(Horizontal::Right),
+        );
+
+        let bar = container(middle)
+            .padding([0, 10])
+            .width(Length::Fill)
+            .height(BAR_HEIGHT as f32)
+            .align_y(Alignment::Center)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(glass.bar)),
+                border: Border {
+                    radius: glass.corner(12.0).into(),
+                    width: 1.0,
+                    color: glass.bar_border,
+                },
+                shadow: Shadow {
+                    color: Color::from_rgba8(0, 0, 0, 0.18),
+                    offset: Vector::new(0.0, 6.0),
+                    blur_radius: 24.0,
+                },
+                ..container::Style::default()
+            });
 
         let framed = container(bar)
-            .padding([BAR_GAP as f32, 12.0])
+            .padding(
+                iced::Padding::from([self.gaps.topbar as f32, self.cfg.side as f32])
+                    .bottom(self.cfg.gap as f32),
+            )
             .width(Length::Fill);
         let framed: Element<'_, Message> = match self.month {
             Some(month) => column![
@@ -704,25 +899,14 @@ impl Bar {
                 .on_press(Message::Calendar),
             ]
             .into(),
-            None => match &self.menu {
-                Some(menu) => column![
-                    framed,
-                    mouse_area(
-                        container(mouse_area(menu_panel(p, glass, menu)).on_press(Message::Keep))
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .padding([0.0, 12.0])
-                            .align_x(Horizontal::Right)
-                    )
-                    .on_press(Message::Dismiss),
-                ]
-                .into(),
-                None => match &self.panel {
-                    Some(panel) => column![
+            None => match self.pop {
+                Some(pop) => column![framed, self.pop_layer(p, glass, pop)].into(),
+                None => match &self.menu {
+                    Some(menu) => column![
                         framed,
                         mouse_area(
                             container(
-                                mouse_area(control_panel(p, glass, panel)).on_press(Message::Keep)
+                                mouse_area(menu_panel(p, glass, menu)).on_press(Message::Keep)
                             )
                             .width(Length::Fill)
                             .height(Length::Fill)
@@ -732,7 +916,24 @@ impl Bar {
                         .on_press(Message::Dismiss),
                     ]
                     .into(),
-                    None => framed.into(),
+                    None => match &self.panel {
+                        Some(panel) => column![
+                            framed,
+                            mouse_area(
+                                container(
+                                    mouse_area(control_panel(p, glass, panel))
+                                        .on_press(Message::Keep)
+                                )
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .padding([0.0, 12.0])
+                                .align_x(Horizontal::Right)
+                            )
+                            .on_press(Message::Dismiss),
+                        ]
+                        .into(),
+                        None => framed.into(),
+                    },
                 },
             },
         };
@@ -804,7 +1005,7 @@ fn calendar_panel<'a>(
                 })),
                 text_color: ink,
                 border: Border {
-                    radius: 7.0.into(),
+                    radius: glass.corner(7.0).into(),
                     ..Border::default()
                 },
                 ..button::Style::default()
@@ -859,7 +1060,7 @@ fn calendar_panel<'a>(
                 .style(move |_| container::Style {
                     background: is_today.then_some(Background::Color(accent)),
                     border: Border {
-                        radius: 14.0.into(),
+                        radius: glass.corner(14.0).into(),
                         ..Border::default()
                     },
                     ..container::Style::default()
@@ -875,7 +1076,7 @@ fn calendar_panel<'a>(
             // Darker than the bar: it sits over windows, not just wallpaper.
             background: Some(Background::Color(Color { a: 0.94, ..ground })),
             border: Border {
-                radius: 14.0.into(),
+                radius: glass.corner(14.0).into(),
                 width: 1.0,
                 color: glass.bar_border,
             },
@@ -925,7 +1126,7 @@ fn tray_icons<'a>(
                 .style(move |_| container::Style {
                     background: lit.then_some(Background::Color(glass.chip_hover)),
                     border: Border {
-                        radius: 7.0.into(),
+                        radius: glass.corner(7.0).into(),
                         width: if attention { 1.0 } else { 0.0 },
                         color: alert,
                     },
@@ -1011,7 +1212,7 @@ fn indicators<'a>(p: &Palette, glass: Glass, s: system::Status) -> Option<Elemen
             .style(move |_| container::Style {
                 background: Some(Background::Color(glass.chip)),
                 border: Border {
-                    radius: 8.0.into(),
+                    radius: glass.corner(8.0).into(),
                     ..Border::default()
                 },
                 ..container::Style::default()
@@ -1049,7 +1250,7 @@ fn control_panel<'a>(
         .style(move |_| container::Style {
             background: Some(Background::Color(Color { a: 0.94, ..ground })),
             border: Border {
-                radius: 14.0.into(),
+                radius: glass.corner(14.0).into(),
                 width: 1.0,
                 color: glass.bar_border,
             },
@@ -1075,7 +1276,7 @@ fn menu_panel<'a>(p: &Palette, glass: Glass, m: &Menu) -> Element<'a, Message> {
                     ink
                 },
                 border: Border {
-                    radius: 7.0.into(),
+                    radius: glass.corner(7.0).into(),
                     ..Border::default()
                 },
                 ..button::Style::default()
@@ -1150,7 +1351,7 @@ fn menu_panel<'a>(p: &Palette, glass: Glass, m: &Menu) -> Element<'a, Message> {
         .style(move |_| container::Style {
             background: Some(Background::Color(Color { a: 0.94, ..ground })),
             border: Border {
-                radius: 14.0.into(),
+                radius: glass.corner(14.0).into(),
                 width: 1.0,
                 color: glass.bar_border,
             },
@@ -1197,7 +1398,7 @@ fn recording_chip<'a>(p: &Palette, glass: Glass, t: Duration) -> Element<'a, Mes
         })),
         text_color: ink,
         border: Border {
-            radius: 7.0.into(),
+            radius: glass.corner(7.0).into(),
             width: 1.0,
             color: Color { a: 0.6, ..red },
         },
@@ -1209,6 +1410,8 @@ fn recording_chip<'a>(p: &Palette, glass: Glass, t: Duration) -> Element<'a, Mes
 /// Translucent fills from the canvas. The compositor supplies the blur.
 #[derive(Clone, Copy)]
 struct Glass {
+    /// Multiplies corner radii drawn at the default roundness.
+    scale: f32,
     bar: Color,
     bar_border: Color,
     chip: Color,
@@ -1217,9 +1420,15 @@ struct Glass {
 }
 
 impl Glass {
+    fn corner(&self, base: f32) -> f32 {
+        base * self.scale
+    }
+
     fn of(p: &Palette) -> Self {
+        let scale = p.corner(1.0);
         if p.dark {
             Glass {
+                scale,
                 bar: Color::from_rgba8(18, 22, 30, 0.50),
                 bar_border: Color::from_rgba8(255, 255, 255, 0.08),
                 chip: Color::from_rgba8(255, 255, 255, 0.07),
@@ -1228,6 +1437,7 @@ impl Glass {
             }
         } else {
             Glass {
+                scale,
                 bar: Color::from_rgba8(255, 255, 255, 0.50),
                 bar_border: Color::from_rgba8(255, 255, 255, 0.75),
                 chip: Color::from_rgba8(20, 24, 33, 0.06),
@@ -1236,6 +1446,91 @@ impl Glass {
             }
         }
     }
+}
+
+/// A chip in the top right. It is lit while its panel is open.
+fn chip_button<'a>(
+    glass: Glass,
+    open: bool,
+    content: impl Into<Element<'a, Message>>,
+    msg: Message,
+) -> Element<'a, Message> {
+    button(content)
+        .padding([4, 8])
+        .on_press(msg)
+        .style(move |_, status| button::Style {
+            background: Some(Background::Color(
+                if open || status == button::Status::Hovered {
+                    glass.chip_hover
+                } else {
+                    glass.chip
+                },
+            )),
+            border: Border {
+                radius: glass.corner(6.0).into(),
+                width: 1.0,
+                color: glass.chip_border,
+            },
+            ..button::Style::default()
+        })
+        .into()
+}
+
+/// The track now playing, shortened. Amber while it plays.
+fn media_chip<'a>(
+    p: &Palette,
+    glass: Glass,
+    np: &system::NowPlaying,
+    open: bool,
+) -> Element<'a, Message> {
+    let amber = Color::from_rgb8(0xF6, 0xC1, 0x77);
+    let (glyph, label) = if np.playing {
+        (amber, color(p.text))
+    } else {
+        (color(p.dim), color(p.muted))
+    };
+    let content: iced::widget::Row<'a, Message> = row![
+        icon(icons::MUSIC, 12).color(glyph),
+        text(now::chip_title(np)).font(INTER).size(12).color(label),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    chip_button(glass, open, content, Message::Pop(Pop::Media))
+}
+
+/// The bell, with a badge for what arrived since the panel was last open.
+fn bell_chip<'a>(
+    p: &Palette,
+    glass: Glass,
+    unread: u32,
+    dnd: bool,
+    open: bool,
+) -> Element<'a, Message> {
+    let mut content: iced::widget::Row<'a, Message> =
+        row![icon(if dnd { icons::BELL_OFF } else { icons::BELL }, 13).color(color(p.muted)),]
+            .spacing(6)
+            .align_y(Alignment::Center);
+    if unread > 0 {
+        let accent = color(p.accent);
+        content = content.push(
+            container(
+                text(unread.min(99).to_string())
+                    .font(INTER_SEMIBOLD)
+                    .size(10)
+                    .color(color(p.on_accent)),
+            )
+            .padding([1, 6])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(accent)),
+                border: Border {
+                    radius: glass.corner(9.0).into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            }),
+        );
+    }
+    chip_button(glass, open, content, Message::Pop(Pop::Notices))
 }
 
 fn battery<'a>(p: &Palette, b: Battery) -> Element<'a, Message> {
