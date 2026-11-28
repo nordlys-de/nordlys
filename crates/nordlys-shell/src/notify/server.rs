@@ -6,9 +6,9 @@
 use super::store::{Closed, Request, Store, Urgency, plain};
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::{SinkExt, Stream, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::object_server::SignalEmitter;
@@ -327,7 +327,9 @@ async fn connect(store: &Shared, ping: &UnboundedSender<Event>) -> Result<Connec
 fn muted_file() -> Option<std::path::PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })?;
     Some(state.join("nordlys/muted-apps"))
 }
 
