@@ -24,6 +24,10 @@ pub struct State {
     wall_mode: String,
     wall_input: String,
     theming: bool,
+    /// GTK's text scale, when gsettings can say, and where its slider is
+    /// while dragged.
+    text: Option<f32>,
+    text_drag: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +52,10 @@ pub enum Msg {
     Glass(bool),
     Solid(bool),
     Motion(bool),
+    TextRead(Result<f32, String>),
+    TextSize(f32),
+    TextSizeDone,
+    TextSaved(Result<(), String>),
     ThemeApps,
     Themed(Result<String, String>),
     WallInput(String),
@@ -70,7 +78,7 @@ impl PageState for State {
             .unwrap_or_default();
         self.wallpaper = path;
         self.wall_mode = mode;
-        Task::none()
+        job(text_scale, Msg::TextRead)
     }
 
     fn update(&mut self, msg: Msg, ctx: &mut Ctx) -> Task<Msg> {
@@ -163,6 +171,19 @@ impl PageState for State {
                 toml_set(ctx, "theme", "reduce_motion", on);
                 hypr_set(ctx, "animations:enabled", V::Bool(!on));
             }
+            // Without gsettings or its schema there's nothing to offer.
+            Msg::TextRead(r) => self.text = r.ok(),
+            Msg::TextSize(v) => self.text_drag = Some(v),
+            Msg::TextSizeDone => {
+                if let Some(v) = self.text_drag.take() {
+                    self.text = Some(v);
+                    return job(move || set_text_scale(v), Msg::TextSaved);
+                }
+            }
+            Msg::TextSaved(r) => {
+                ctx.report(&r, "Text size changed");
+                return job(text_scale, Msg::TextRead);
+            }
             Msg::ThemeApps => {
                 self.theming = true;
                 return job(theme_apps, Msg::Themed);
@@ -176,6 +197,10 @@ impl PageState for State {
             }
             Msg::WallInput(s) => self.wall_input = s,
             Msg::WallApply => {
+                if self.wall_input.trim().is_empty() {
+                    ctx.fail("Give the image's path, or Browse for one");
+                    return Task::none();
+                }
                 let path = PathBuf::from(expand(self.wall_input.trim()));
                 let mode = self.wall_mode.clone();
                 self.wallpaper = Some(path.clone());
@@ -257,9 +282,39 @@ impl PageState for State {
             bar_rows.push(ui::toggle_row(
                 c,
                 bar_item_title(item),
-                "",
+                bar_item_detail(item),
                 shown,
                 move |on| Msg::BarItem(item, on),
+            ));
+        }
+
+        let mut app_rows = vec![ui::setting(
+            c,
+            "Theme GTK and Qt apps",
+            "Write the palette for GTK 3/4, libadwaita, qt6ct and foot. Restart apps to see it.",
+            ui::btn(
+                c,
+                if self.theming {
+                    "Theming…"
+                } else {
+                    "Apply to apps"
+                },
+                Kind::Primary,
+                (!self.theming).then_some(Msg::ThemeApps),
+            ),
+        )];
+        if let Some(set) = self.text {
+            let size = self.text_drag.unwrap_or(set);
+            app_rows.push(ui::slider_row(
+                c,
+                "Text size in apps",
+                "GTK and libadwaita apps follow it. The top bar and panels don't",
+                0.8..=1.6,
+                0.05,
+                size,
+                format!("{:.0}%", size * 100.0),
+                Msg::TextSize,
+                Some(Msg::TextSizeDone),
             ));
         }
 
@@ -394,7 +449,13 @@ impl PageState for State {
                                 .on_input(Msg::WallInput)
                                 .on_submit(Msg::WallApply)
                                 .width(260),
-                            ui::icon_text_btn(c, Icon::Folder, "Browse", Kind::Secondary, Some(Msg::WallBrowse)),
+                            ui::icon_text_btn(
+                                c,
+                                Icon::Folder,
+                                "Browse",
+                                Kind::Secondary,
+                                Some(Msg::WallBrowse)
+                            ),
                         ]
                         .spacing(8)
                     ),
@@ -419,25 +480,26 @@ impl PageState for State {
                     ),
                 ]
             ),
-            ui::section(
-                c,
-                "Apps",
-                vec![ui::setting(
-                    c,
-                    "Theme GTK and Qt apps",
-                    "Write the palette for GTK 3/4, libadwaita, qt6ct and foot. Restart apps to see it.",
-                    ui::btn(
-                        c,
-                        if self.theming { "Theming…" } else { "Apply to apps" },
-                        Kind::Primary,
-                        (!self.theming).then_some(Msg::ThemeApps)
-                    )
-                )]
-            ),
+            ui::section(c, "Apps", app_rows),
         ]
         .spacing(26)
         .into()
     }
+}
+
+const TEXT_SCHEMA: &str = "org.gnome.desktop.interface";
+const TEXT_KEY: &str = "text-scaling-factor";
+
+fn text_scale() -> Result<f32, String> {
+    sys::run("gsettings", &["get", TEXT_SCHEMA, TEXT_KEY])?
+        .trim()
+        .parse()
+        .map_err(|_| "gsettings didn't give a text size".to_owned())
+}
+
+fn set_text_scale(v: f32) -> Result<(), String> {
+    let v = format!("{v:.2}");
+    sys::run("gsettings", &["set", TEXT_SCHEMA, TEXT_KEY, &v]).map(drop)
 }
 
 impl State {
@@ -482,6 +544,23 @@ fn bar_item_title(item: BarItem) -> &'static str {
         BarItem::Layout => "Layout chip",
         BarItem::Indicators => "Network, Bluetooth and sound",
         BarItem::Battery => "Battery",
+    }
+}
+
+/// What a part of the bar shows, for its row in the list.
+fn bar_item_detail(item: BarItem) -> &'static str {
+    match item {
+        BarItem::Apps => "The launcher button at the left end",
+        BarItem::Workspaces => "The numbered workspaces",
+        BarItem::Stage => "The name of the stage you're on",
+        BarItem::Clock => "The time and date",
+        BarItem::Recording => "How long the screen has been recording",
+        BarItem::Media => "The song playing, with its controls",
+        BarItem::Notifications => "The bell, with what's waiting",
+        BarItem::Tray => "Icons of apps running in the background",
+        BarItem::Layout => "The keyboard layout, when there's more than one",
+        BarItem::Indicators => "Wi-Fi, Bluetooth and volume at a glance",
+        BarItem::Battery => "Charge and time left",
     }
 }
 

@@ -3,6 +3,7 @@
 //! (PipeWire has no simple D-Bus interface), the standard command-line
 //! tools step in: playerctl, nmcli, bluetoothctl, wpctl and dunstctl.
 
+use crate::notify::Entry;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -290,15 +291,6 @@ fn parse_bluetooth(show: &str) -> Option<bool> {
         .map(|v| v.trim() == "yes")
 }
 
-/// One recent notification, for the bar's bell panel.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Recent {
-    pub id: u32,
-    pub app: String,
-    pub summary: String,
-    pub body: String,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Notices {
     /// Waiting while Do not disturb is on.
@@ -307,7 +299,9 @@ pub struct Notices {
     pub history: u32,
     pub dnd: bool,
     /// Newest first. Only the Nordlys daemon lists them; empty with dunst.
-    pub recent: Vec<Recent>,
+    pub recent: Vec<Entry>,
+    /// Apps whose notifications are muted (Nordlys daemon only).
+    pub muted: Vec<String>,
 }
 
 /// Notifications come from the Nordlys daemon (`nordlys-shell notify`)
@@ -319,21 +313,14 @@ pub fn notices() -> Option<Notices> {
 fn nordlys_notices() -> Option<Notices> {
     let (waiting, history, dnd): (u32, u32, bool) =
         nordlys_call("Status", &())?.body().deserialize().ok()?;
-    let recent: Vec<(u32, String, String, String)> =
-        nordlys_call("Recent", &20u32)?.body().deserialize().ok()?;
+    let recent: Vec<Entry> = nordlys_call("Recent", &20u32)?.body().deserialize().ok()?;
+    let muted: Vec<String> = nordlys_call("Muted", &())?.body().deserialize().ok()?;
     Some(Notices {
         waiting,
         history,
         dnd,
-        recent: recent
-            .into_iter()
-            .map(|(id, app, summary, body)| Recent {
-                id,
-                app,
-                summary,
-                body,
-            })
-            .collect(),
+        recent,
+        muted,
     })
 }
 
@@ -349,6 +336,7 @@ fn dunst_notices() -> Option<Notices> {
         history: count("history"),
         dnd,
         recent: vec![],
+        muted: vec![],
     })
 }
 
@@ -394,6 +382,28 @@ pub fn clear_notifications() {
     if nordlys_call("Clear", &()).is_none() {
         fire("dunstctl", &["history-clear"]);
     }
+}
+
+/// Click one of a notification's own actions.
+pub fn invoke_notification(id: u32, key: &str) {
+    nordlys_call("Invoke", &(id, key.to_owned()));
+}
+
+pub fn dismiss_notification(id: u32) {
+    nordlys_call("Dismiss", &id);
+}
+
+/// Put a notification away for `minutes`.
+pub fn snooze_notification(id: u32, minutes: u32) {
+    nordlys_call("Snooze", &(id, minutes));
+}
+
+pub fn set_app_muted(app: &str, on: bool) {
+    nordlys_call("Mute", &(app.to_owned(), on));
+}
+
+pub fn clear_app_notifications(app: &str) {
+    nordlys_call("ClearApp", &app.to_owned());
 }
 
 #[cfg(test)]

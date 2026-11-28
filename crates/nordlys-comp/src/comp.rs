@@ -36,7 +36,8 @@ use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::element::solid::SolidColorBuffer;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{
-    LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output,
+    LayerMap, LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
+    layer_map_for_output,
 };
 use smithay::input::keyboard::{FilterResult, Keycode, ModifiersState, XkbConfig, keysyms};
 use smithay::input::pointer::{
@@ -2270,6 +2271,23 @@ impl XdgDecorationHandler for Comp {
     }
 }
 
+/// Panels take their screen space in the order they were mapped, so a shelf
+/// that started before the bar would take the corner and push the bar aside.
+/// Mapping the shelves again puts them after it.
+fn shelves_after_the_bar(map: &mut LayerMap) {
+    let shelves: Vec<LayerSurface> = map
+        .layers()
+        .filter(|l| l.namespace() == "nordlys-shelf")
+        .cloned()
+        .collect();
+    for shelf in shelves {
+        map.unmap_layer(&shelf);
+        if let Err(e) = map.map_layer(&shelf) {
+            eprintln!("nordlys-comp: layer surface: {e}");
+        }
+    }
+}
+
 impl WlrLayerShellHandler for Comp {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
         &mut self.layer_shell_state
@@ -2294,8 +2312,12 @@ impl WlrLayerShellHandler for Comp {
             return;
         };
         let mut map = layer_map_for_output(&output);
+        let bar = namespace == "nordlys-bar";
         if let Err(e) = map.map_layer(&LayerSurface::new(surface, namespace)) {
             eprintln!("nordlys-comp: layer surface: {e}");
+        }
+        if bar {
+            shelves_after_the_bar(&mut map);
         }
     }
 

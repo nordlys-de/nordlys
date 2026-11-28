@@ -34,6 +34,24 @@ gap = 10
 side = 12
 hidden = []
 
+# The time on the top bar and lock screen.
+[clock]
+twelve_hour = false      # true shows 3:41 PM
+date = true              # day and date before the time on the top bar
+seconds = false          # seconds on the top bar
+
+# Toasts. position: "top-right", "top-center", "top-left", "bottom-right",
+# "bottom-center" or "bottom-left". seconds is how long one stays when the app
+# doesn't say, 1 to 60; critical ones stay until dismissed.
+[notifications]
+position = "top-right"
+seconds = 6
+
+# Warn once when the battery falls to this percentage while unplugged, 0 to
+# 50. 0 turns the warning off.
+[power]
+low_battery = 15
+
 # App groups: Super G, then the key. The first app takes the stage,
 # the rest wait on the shelf in order.
 #   open_in   "new-workspace" (an empty one) or "current"

@@ -476,9 +476,10 @@ fn shelf_window(config: Config) -> Result<(), String> {
 }
 
 fn notify_layer(config: Config) -> Result<(), String> {
-    use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
+    use iced_layershell::reexport::{KeyboardInteractivity, Layer};
     use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 
+    let anchor = notify::anchor(config.notifications.position);
     iced_layershell::application(
         move || Toasts::new(&config, false),
         || "nordlys-notify".to_owned(),
@@ -491,10 +492,9 @@ fn notify_layer(config: Config) -> Result<(), String> {
         default_font: bar::INTER,
         fonts: vec![icons::FONT_BYTES.into()],
         layer_settings: LayerShellSettings {
-            // Top right, under the bar. The
-            // surface is resized to fit the toasts and shrinks to a pixel
-            // when there are none.
-            anchor: Anchor::Top | Anchor::Right,
+            // From `[notifications] position`. The surface is resized to
+            // fit the toasts and shrinks to a pixel when there are none.
+            anchor,
             layer: Layer::Overlay,
             size: Some((1, 1)),
             exclusive_zone: 0,

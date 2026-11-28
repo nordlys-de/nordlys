@@ -15,6 +15,9 @@ pub struct Config {
     pub stage: StageConfig,
     pub bar: BarConfig,
     pub gaps: Gaps,
+    pub clock: Clock,
+    pub notifications: Notifications,
+    pub power: PowerConfig,
     #[serde(rename = "group")]
     pub groups: Vec<Group>,
 }
@@ -121,6 +124,126 @@ impl Default for BarConfig {
             gap: 10,
             side: 12,
             hidden: Vec::new(),
+        }
+    }
+}
+
+/// How the time reads on the top bar and the lock screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Clock {
+    /// `3:41 PM` instead of `15:41`.
+    pub twelve_hour: bool,
+    /// The day and date before the time on the top bar.
+    pub date: bool,
+    /// Seconds on the top bar's clock.
+    pub seconds: bool,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self {
+            twelve_hour: false,
+            date: true,
+            seconds: false,
+        }
+    }
+}
+
+impl Clock {
+    /// The time alone, as a strftime format.
+    pub fn time_format(&self, seconds: bool) -> &'static str {
+        match (self.twelve_hour, seconds) {
+            (false, false) => "%H:%M",
+            (false, true) => "%H:%M:%S",
+            (true, false) => "%-I:%M %p",
+            (true, true) => "%-I:%M:%S %p",
+        }
+    }
+
+    /// The top bar's clock, as a strftime format.
+    pub fn bar_format(&self) -> String {
+        let time = self.time_format(self.seconds);
+        if self.date {
+            format!("%a %-d %b  {time}")
+        } else {
+            time.to_owned()
+        }
+    }
+}
+
+/// Battery care.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PowerConfig {
+    /// Warn once when the battery falls to this percentage, 0–50. 0 turns
+    /// the warning off.
+    pub low_battery: u8,
+}
+
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self { low_battery: 15 }
+    }
+}
+
+/// Where toasts show and how long they stay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notifications {
+    pub position: ToastPosition,
+    /// Seconds a toast stays when the app doesn't say, 1–60. Critical ones
+    /// stay until dismissed.
+    pub seconds: u8,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            position: ToastPosition::TopRight,
+            seconds: 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastPosition {
+    #[default]
+    TopRight,
+    TopCenter,
+    TopLeft,
+    BottomRight,
+    BottomCenter,
+    BottomLeft,
+}
+
+impl ToastPosition {
+    pub const ALL: [ToastPosition; 6] = [
+        ToastPosition::TopRight,
+        ToastPosition::TopCenter,
+        ToastPosition::TopLeft,
+        ToastPosition::BottomRight,
+        ToastPosition::BottomCenter,
+        ToastPosition::BottomLeft,
+    ];
+
+    pub fn bottom(self) -> bool {
+        matches!(
+            self,
+            Self::BottomRight | Self::BottomCenter | Self::BottomLeft
+        )
+    }
+
+    /// The value as nordlys.toml writes it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::TopRight => "top-right",
+            Self::TopCenter => "top-center",
+            Self::TopLeft => "top-left",
+            Self::BottomRight => "bottom-right",
+            Self::BottomCenter => "bottom-center",
+            Self::BottomLeft => "bottom-left",
         }
     }
 }
@@ -265,6 +388,14 @@ impl Config {
         if self.bar.side > 40 {
             return Err(Error::Invalid("bar.side must be 0 to 40".into()));
         }
+        if !(1..=60).contains(&self.notifications.seconds) {
+            return Err(Error::Invalid(
+                "notifications.seconds must be 1 to 60".into(),
+            ));
+        }
+        if self.power.low_battery > 50 {
+            return Err(Error::Invalid("power.low_battery must be 0 to 50".into()));
+        }
         for g in &self.groups {
             if g.apps.is_empty() {
                 return Err(Error::Invalid(format!("group {:?} has no apps", g.name)));
@@ -383,6 +514,37 @@ mod tests {
         assert!(Config::from_toml("[gaps]\ntopbar = 41").is_err());
         assert!(Config::from_toml("[gaps]\nshelf = 41").is_err());
         assert!(Config::from_toml("[gaps]\ntop = 4").is_err());
+    }
+
+    #[test]
+    fn clock_and_toast_settings() {
+        let c = Config::default();
+        assert_eq!(c.clock.bar_format(), "%a %-d %b  %H:%M");
+        let c = Config::from_toml(
+            "[clock]\ntwelve_hour = true\ndate = false\nseconds = true\n\
+             [notifications]\nposition = \"bottom-center\"\nseconds = 12\n",
+        )
+        .unwrap();
+        assert_eq!(c.clock.bar_format(), "%-I:%M:%S %p");
+        assert_eq!(c.clock.time_format(false), "%-I:%M %p");
+        assert_eq!(c.notifications.position, ToastPosition::BottomCenter);
+        assert!(c.notifications.position.bottom());
+        assert_eq!(c.notifications.seconds, 12);
+        for p in ToastPosition::ALL {
+            let t = format!("[notifications]\nposition = {:?}", p.key());
+            assert_eq!(Config::from_toml(&t).unwrap().notifications.position, p);
+        }
+        assert!(Config::from_toml("[notifications]\nseconds = 0").is_err());
+        assert!(Config::from_toml("[notifications]\nseconds = 61").is_err());
+        assert!(Config::from_toml("[notifications]\nposition = \"middle\"").is_err());
+    }
+
+    #[test]
+    fn low_battery_warning() {
+        assert_eq!(Config::default().power.low_battery, 15);
+        let off = Config::from_toml("[power]\nlow_battery = 0").unwrap();
+        assert_eq!(off.power.low_battery, 0);
+        assert!(Config::from_toml("[power]\nlow_battery = 51").is_err());
     }
 
     #[test]

@@ -185,7 +185,10 @@ impl PageState for State {
                     return job(move || launch(&g), Msg::Launched);
                 }
             }
-            Msg::Launched(r) => ctx.report(&r, ""),
+            Msg::Launched(r) => match r {
+                Ok(s) => ctx.done(s),
+                Err(e) => ctx.fail(e),
+            },
         }
         Task::none()
     }

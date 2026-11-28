@@ -570,8 +570,8 @@ fn battery_in(root: &Path) -> Option<Battery> {
 }
 
 /// "Wed 25 Nov  15:41", the format on the design canvas.
-pub fn clock_text(now: chrono::DateTime<chrono::Local>) -> String {
-    now.format("%a %-d %b  %H:%M").to_string()
+pub fn clock_text(now: chrono::DateTime<chrono::Local>, format: &str) -> String {
+    now.format(format).to_string()
 }
 
 #[cfg(test)]
@@ -730,6 +730,10 @@ mod tests {
         let t = chrono::Local
             .with_ymd_and_hms(2026, 11, 25, 15, 41, 0)
             .unwrap();
-        assert_eq!(clock_text(t), "Wed 25 Nov  15:41");
+        let mut clock = nordlys_config::Clock::default();
+        assert_eq!(clock_text(t, &clock.bar_format()), "Wed 25 Nov  15:41");
+        clock.twelve_hour = true;
+        clock.date = false;
+        assert_eq!(clock_text(t, &clock.bar_format()), "3:41 PM");
     }
 }

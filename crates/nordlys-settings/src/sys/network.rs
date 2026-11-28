@@ -236,6 +236,22 @@ pub fn rescan() -> Result<(), String> {
 /// takes `password`, which goes to NetworkManager over D-Bus so it never
 /// shows up in a process list.
 pub fn connect(ssid: &str, security: &str, password: Option<&str>) -> Result<String, String> {
+    connect_with(ssid, security, password, false)
+}
+
+/// A network that doesn't broadcast its name, so it's missing from the list.
+/// The password is optional: without one it's joined as an open network.
+pub fn connect_hidden(ssid: &str, password: Option<&str>) -> Result<String, String> {
+    let security = if password.is_some() { "WPA2" } else { "--" };
+    connect_with(ssid, security, password, true)
+}
+
+fn connect_with(
+    ssid: &str,
+    security: &str,
+    password: Option<&str>,
+    hidden: bool,
+) -> Result<String, String> {
     let saved = run("nmcli", &["-t", "-f", "NAME", "connection", "show"])
         .map(|s| s.lines().any(|l| split_terse(l)[0] == ssid))
         .unwrap_or(false);
@@ -254,7 +270,7 @@ pub fn connect(ssid: &str, security: &str, password: Option<&str>) -> Result<Str
     if security.contains("802.1X") {
         return Err("Enterprise networks need nm-connection-editor for now".into());
     }
-    nm::add_and_activate(ssid, security, password)?;
+    nm::add_and_activate(ssid, security, password, hidden)?;
     Ok(format!("Connected to {ssid}"))
 }
 
@@ -300,6 +316,7 @@ mod nm {
         ssid: &str,
         security: &str,
         password: Option<&str>,
+        hidden: bool,
     ) -> Result<(), String> {
         let bus = bus()?;
         let device = wifi_device(&bus)?;
@@ -316,6 +333,7 @@ mod nm {
             HashMap::from([
                 ("ssid", Value::from(ssid.as_bytes().to_vec())),
                 ("mode", Value::from("infrastructure")),
+                ("hidden", Value::from(hidden)),
             ]),
         );
         if let Some(pw) = password {

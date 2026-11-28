@@ -27,11 +27,14 @@ pub const RAIL: f32 = 76.0;
 pub const ZONE: u32 = 88;
 
 /// Where the rail sits, as layer margins (top, right, bottom, left) and the
-/// space it reserves. It starts `bar.gap` below the top bar and is indented
-/// `gaps.shelf` from the screen's left edge.
+/// exclusive zone it asks for. It starts `bar.gap` below the top bar and is
+/// indented `gaps.shelf` from the screen's left edge.
+///
+/// The compositor adds the margin to the exclusive zone, so the zone is the
+/// rail's own width: adding the indent here would reserve it twice.
 pub fn placement(bar: &BarConfig, gaps: &Gaps) -> ((i32, i32, i32, i32), i32) {
     let (below, side) = (bar.gap as i32, gaps.shelf as i32);
-    ((below, 0, 0, side), ZONE as i32 + side)
+    ((below, 0, 0, side), ZONE as i32)
 }
 const TILE: f32 = 56.0;
 const GAP: f32 = 10.0;
@@ -506,5 +509,16 @@ mod tests {
         std::fs::write(&path, b"junk").unwrap();
         assert!(matches!(read_picture(&path, None), Picture::Missing));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_indent_is_reserved_once() {
+        let gaps = Gaps {
+            shelf: 40,
+            ..Gaps::default()
+        };
+        let ((_, _, _, left), zone) = placement(&BarConfig::default(), &gaps);
+        // What windows are kept clear of: the zone plus the margin.
+        assert_eq!(zone + left, ZONE as i32 + 40);
     }
 }

@@ -1,4 +1,4 @@
-use super::{PageState, Reads};
+use super::{PageState, Reads, toml_set};
 use crate::app::Ctx;
 use crate::icons::Icon;
 use crate::sys::{job, notify};
@@ -6,11 +6,14 @@ use crate::theme::{Kind, SEMIBOLD};
 use crate::ui::{self, El};
 use iced::Task;
 use iced::widget::{column, row, text};
+use nordlys_config::{Notifications, ToastPosition};
 
 #[derive(Default)]
 pub struct State {
     data: Option<notify::Notices>,
     reads: Reads,
+    /// The duration while its slider is being dragged.
+    seconds: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +23,9 @@ pub enum Msg {
     ShowLast,
     Clear,
     Test,
+    Position(ToastPosition),
+    Seconds(f32),
+    SecondsDone,
     Done(Result<(), String>, &'static str),
 }
 
@@ -29,6 +35,82 @@ impl State {
             return Task::none();
         }
         job(notify::read, Msg::Read)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Side {
+    Left,
+    Centre,
+    Right,
+}
+
+fn side(p: ToastPosition) -> Side {
+    match p {
+        ToastPosition::TopLeft | ToastPosition::BottomLeft => Side::Left,
+        ToastPosition::TopCenter | ToastPosition::BottomCenter => Side::Centre,
+        ToastPosition::TopRight | ToastPosition::BottomRight => Side::Right,
+    }
+}
+
+fn position(bottom: bool, side: Side) -> ToastPosition {
+    ToastPosition::ALL
+        .into_iter()
+        .find(|p| p.bottom() == bottom && self::side(*p) == side)
+        .unwrap_or_default()
+}
+
+impl State {
+    /// Where toasts show and for how long. These come from nordlys.toml, so
+    /// they work whether or not the daemon answers.
+    fn toasts<'a>(&'a self, ctx: &'a Ctx) -> El<'a, Msg> {
+        let c = ctx.c;
+        let cfg: &Notifications = &ctx.toml.config.notifications;
+        let at = cfg.position;
+        let seconds = self.seconds.unwrap_or(f32::from(cfg.seconds));
+        ui::section(
+            c,
+            "Toasts",
+            vec![
+                ui::setting(
+                    c,
+                    "Edge",
+                    "The edge of the screen toasts appear at",
+                    ui::segmented(
+                        c,
+                        &[(false, "Top"), (true, "Bottom")],
+                        at.bottom(),
+                        move |b| Msg::Position(position(b, side(at))),
+                    ),
+                ),
+                ui::setting(
+                    c,
+                    "Side",
+                    "Where along that edge",
+                    ui::segmented(
+                        c,
+                        &[
+                            (Side::Left, "Left"),
+                            (Side::Centre, "Centre"),
+                            (Side::Right, "Right"),
+                        ],
+                        side(at),
+                        move |s| Msg::Position(position(at.bottom(), s)),
+                    ),
+                ),
+                ui::slider_row(
+                    c,
+                    "Stay on screen",
+                    "When the app doesn't say how long. Critical ones stay until dismissed",
+                    1.0..=60.0,
+                    1.0,
+                    seconds,
+                    format!("{seconds:.0} s"),
+                    Msg::Seconds,
+                    Some(Msg::SecondsDone),
+                ),
+            ],
+        )
     }
 }
 
@@ -71,9 +153,27 @@ impl PageState for State {
                     },
                 )
             }
-            Msg::ShowLast => job(notify::show_last, |r| Msg::Done(r, "")),
+            Msg::ShowLast => job(notify::show_last, |r| {
+                Msg::Done(r, "Showing the last notification")
+            }),
             Msg::Clear => job(notify::clear, |r| Msg::Done(r, "Notifications cleared")),
-            Msg::Test => job(notify::send_test, |r| Msg::Done(r, "")),
+            Msg::Test => job(notify::send_test, |r| {
+                Msg::Done(r, "Test notification sent")
+            }),
+            Msg::Position(p) => {
+                toml_set(ctx, "notifications", "position", p.key());
+                Task::none()
+            }
+            Msg::Seconds(v) => {
+                self.seconds = Some(v);
+                Task::none()
+            }
+            Msg::SecondsDone => {
+                if let Some(v) = self.seconds.take() {
+                    toml_set(ctx, "notifications", "seconds", v.round() as i64);
+                }
+                Task::none()
+            }
             Msg::Done(r, ok) => {
                 ctx.report(&r, ok);
                 self.read()
@@ -172,6 +272,20 @@ impl PageState for State {
                 })
                 .collect()
         };
-        body.push(ui::section(c, "Recent", recent)).into()
+        body.push(self.toasts(ctx))
+            .push(ui::section(c, "Recent", recent))
+            .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_and_side_name_every_position() {
+        for p in ToastPosition::ALL {
+            assert_eq!(position(p.bottom(), side(p)), p);
+        }
     }
 }

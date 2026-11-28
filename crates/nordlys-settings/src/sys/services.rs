@@ -16,9 +16,17 @@ pub struct Unit {
     pub description: String,
     pub active: String,
     pub sub: String,
+    /// Masked: systemd won't start it, so it stays off at the next login.
+    pub masked: bool,
 }
 
 impl Unit {
+    /// Can "Start at login" be turned off for it? The session's own
+    /// services can. They have no `[Install]` section (the session target
+    /// starts them), so off means masked, not disabled.
+    pub fn optional(&self) -> bool {
+        self.name.starts_with("nordlys-") && self.name.ends_with(".service")
+    }
     pub fn running(&self) -> bool {
         self.active == "active"
     }
@@ -54,6 +62,7 @@ pub fn purpose(name: &str) -> &'static str {
         "nordlys-notify.service" => "Notification daemon and toasts",
         "nordlys-idle.service" => "Dims, locks and suspends when you're away",
         "nordlys-wallpaper.service" => "Draws the wallpaper",
+        "nordlys-clipboard.service" => "Keeps clipboard history for Super V",
         "nordlys-session.target" => "Everything a Nordlys session runs",
         _ => "",
     }
@@ -63,7 +72,7 @@ pub fn read() -> Result<Services, String> {
     if !super::has("systemctl") {
         return Ok(Services::default());
     }
-    let session = parse_units(
+    let mut session = parse_units(
         &run(
             "systemctl",
             &[
@@ -78,6 +87,24 @@ pub fn read() -> Result<Services, String> {
         )
         .unwrap_or_default(),
     );
+    // A masked unit can drop out of list-units, which would leave no way to
+    // turn it back on; the unit files still name it.
+    let masked = parse_masked(
+        &run(
+            "systemctl",
+            &[
+                "--user",
+                "list-unit-files",
+                "--state=masked,masked-runtime",
+                "--plain",
+                "--no-legend",
+                "--no-pager",
+                "nordlys-*",
+            ],
+        )
+        .unwrap_or_default(),
+    );
+    mark_masked(&mut session, &masked);
     let failed = |user: bool| {
         let mut args = vec![
             "list-units",
@@ -117,9 +144,34 @@ fn parse_units(s: &str) -> Vec<Unit> {
                 description,
                 active,
                 sub,
+                masked: false,
             })
         })
         .collect()
+}
+
+/// `name.service masked enabled`, one unit file a line.
+fn parse_masked(s: &str) -> Vec<String> {
+    s.lines()
+        .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
+        .collect()
+}
+
+/// Flag the masked units, adding any that list-units left out.
+fn mark_masked(session: &mut Vec<Unit>, masked: &[String]) {
+    for name in masked {
+        match session.iter_mut().find(|u| &u.name == name) {
+            Some(u) => u.masked = true,
+            None => session.push(Unit {
+                name: name.clone(),
+                active: "inactive".into(),
+                sub: "dead".into(),
+                masked: true,
+                ..Unit::default()
+            }),
+        }
+    }
+    session.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 pub fn control(user: bool, verb: &str, unit: &str) -> Result<(), String> {
@@ -155,5 +207,23 @@ mod tests {
         assert!(u[1].failed());
         assert_eq!(u[1].description, "Nordlys idle (hypridle)");
         assert_eq!(u[1].short(), "Idle");
+    }
+
+    #[test]
+    fn masked_units_stay_listed() {
+        let mut u =
+            parse_units("nordlys-idle.service loaded inactive dead Nordlys idle (hypridle)\n");
+        let masked = parse_masked(
+            "nordlys-idle.service masked enabled\nnordlys-clipboard.service masked enabled\n",
+        );
+        mark_masked(&mut u, &masked);
+        assert_eq!(u.len(), 2);
+        assert_eq!(u[0].name, "nordlys-clipboard.service");
+        assert!(u.iter().all(|u| u.masked && u.optional()));
+        let target = Unit {
+            name: "nordlys-session.target".into(),
+            ..Unit::default()
+        };
+        assert!(!target.optional());
     }
 }

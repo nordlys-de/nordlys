@@ -15,7 +15,7 @@
 pub mod sys;
 
 use crate::bar::{INTER, INTER_SEMIBOLD, color};
-use crate::icons::{self, icon};
+use crate::icons::{self};
 use iced::alignment::Vertical;
 use iced::widget::{
     Space, button, column, container, mouse_area, row, scrollable, slider, text, toggler,
@@ -338,7 +338,7 @@ fn section<'a>(label: &'a str, g: Look) -> El<'a> {
 /// One clickable row: an icon, a label with a detail under or beside it,
 /// and a word on the right ("Connected").
 fn item<'a>(
-    glyph: char,
+    glyph: impl Into<icons::Face>,
     tone: Color,
     label: String,
     detail: String,
@@ -365,7 +365,7 @@ fn item<'a>(
         );
     }
     let content = row![
-        container(icon(glyph, 14).color(tone)).width(20),
+        container(icons::draw(glyph, 14.0, tone)).width(20),
         container(words).width(Length::Fill).clip(true),
         text(trailing).font(INTER).size(11).color(g.accent),
     ]
@@ -533,7 +533,7 @@ fn network_view<'a>(
                 (false, _) => "Open".to_owned(),
             };
             body = body.push(item(
-                icons::WIFI,
+                icons::Symbol::Wifi,
                 signal_tone(ap.signal, g),
                 ap.ssid.clone(),
                 detail,
@@ -599,7 +599,7 @@ fn bluetooth_view<'a>(
             Msg::Do(Action::BtConnect(d.address.clone()))
         };
         body = body.push(item(
-            icons::BLUETOOTH,
+            icons::Symbol::Bluetooth,
             if d.connected { g.accent } else { g.dim },
             if d.name.is_empty() {
                 d.address.clone()
@@ -635,7 +635,7 @@ fn level<'a>(node: &'a audio::Node, sliding: Option<(u32, f32)>, input: bool, g:
     let muted = node.muted;
     row![
         mouse_area(
-            container(icon(glyph, 15).color(if muted { g.dim } else { g.ink }))
+            container(icons::draw(glyph, 15.0, if muted { g.dim } else { g.ink }))
                 .width(28)
                 .height(ROW as f32)
                 .align_y(Vertical::Center)

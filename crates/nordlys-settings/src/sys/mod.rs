@@ -9,6 +9,7 @@ pub mod audio;
 pub mod bluetooth;
 pub mod datetime;
 pub mod display;
+pub mod logind;
 pub mod network;
 pub mod notify;
 pub mod power;

@@ -8,8 +8,8 @@
 // A few are kept ready for pieces still to come (power menu, settings).
 #![allow(dead_code)]
 
-use iced::Font;
-use iced::widget::{Text, text};
+use iced::widget::{Svg, Text, svg, text};
+use iced::{Color, Font, Length};
 
 pub const FONT_BYTES: &[u8] = include_bytes!("../assets/lucide-subset.ttf");
 pub const FONT: Font = Font::with_name("lucide");
@@ -65,14 +65,95 @@ pub fn icon<'a>(glyph: char, size: impl Into<iced::Pixels>) -> Text<'a> {
         .line_height(1.0)
 }
 
-/// The battery glyph for a charge level.
-pub fn battery(percent: u8, charging: bool) -> char {
+/// The Lucide pictures the shell draws as SVG: one stroke weight and one
+/// size everywhere, the same set the Settings app uses (see `symbol`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Symbol {
+    Wifi,
+    WifiLow,
+    WifiZero,
+    WifiOff,
+    Bluetooth,
+    BluetoothOff,
+    Bell,
+    BellOff,
+    BatteryLow,
+    BatteryMedium,
+    BatteryFull,
+    BatteryCharging,
+    Clock,
+    Trash,
+    X,
+    ChevronDown,
+    ChevronUp,
+}
+
+/// A picture `size` pixels square in `color`, recoloured to fit the text around it.
+pub fn symbol<'a>(s: Symbol, size: f32, color: Color) -> Svg<'a> {
+    svg(svg::Handle::from_memory(symbol_bytes(s)))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .style(move |_, _| svg::Style { color: Some(color) })
+}
+
+/// The SVG source of a symbol.
+pub fn symbol_bytes(s: Symbol) -> &'static [u8] {
+    match s {
+        Symbol::Wifi => include_bytes!("../assets/icons/wifi.svg"),
+        Symbol::WifiLow => include_bytes!("../assets/icons/wifi-low.svg"),
+        Symbol::WifiZero => include_bytes!("../assets/icons/wifi-zero.svg"),
+        Symbol::WifiOff => include_bytes!("../assets/icons/wifi-off.svg"),
+        Symbol::Bluetooth => include_bytes!("../assets/icons/bluetooth.svg"),
+        Symbol::BluetoothOff => include_bytes!("../assets/icons/bluetooth-off.svg"),
+        Symbol::Bell => include_bytes!("../assets/icons/bell.svg"),
+        Symbol::BellOff => include_bytes!("../assets/icons/bell-off.svg"),
+        Symbol::BatteryLow => include_bytes!("../assets/icons/battery-low.svg"),
+        Symbol::BatteryMedium => include_bytes!("../assets/icons/battery-medium.svg"),
+        Symbol::BatteryFull => include_bytes!("../assets/icons/battery-full.svg"),
+        Symbol::BatteryCharging => include_bytes!("../assets/icons/battery-charging.svg"),
+        Symbol::Clock => include_bytes!("../assets/icons/clock.svg"),
+        Symbol::Trash => include_bytes!("../assets/icons/trash-2.svg"),
+        Symbol::X => include_bytes!("../assets/icons/x.svg"),
+        Symbol::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
+        Symbol::ChevronUp => include_bytes!("../assets/icons/chevron-up.svg"),
+    }
+}
+
+/// What an icon is drawn from: a font glyph (the older set, still used for
+/// volume and media) or a picture. Both take a size and a colour via `draw`.
+#[derive(Debug, Clone, Copy)]
+pub enum Face {
+    Font(char),
+    Picture(Symbol),
+}
+
+impl From<char> for Face {
+    fn from(glyph: char) -> Self {
+        Face::Font(glyph)
+    }
+}
+
+impl From<Symbol> for Face {
+    fn from(s: Symbol) -> Self {
+        Face::Picture(s)
+    }
+}
+
+/// Draw an icon of either kind `size` pixels, in `color`.
+pub fn draw<'a, M: 'a>(face: impl Into<Face>, size: f32, color: Color) -> iced::Element<'a, M> {
+    match face.into() {
+        Face::Font(glyph) => icon(glyph, size).color(color).into(),
+        Face::Picture(s) => symbol(s, size, color).into(),
+    }
+}
+
+/// The battery picture for a charge level.
+pub fn battery(percent: u8, charging: bool) -> Symbol {
     match (charging, percent) {
-        (true, _) => BATTERY_CHARGING,
-        (false, 0..=5) => BATTERY,
-        (false, 6..=25) => BATTERY_LOW,
-        (false, 26..=65) => BATTERY_MEDIUM,
-        _ => BATTERY_FULL,
+        (true, _) => Symbol::BatteryCharging,
+        (false, 0..=25) => Symbol::BatteryLow,
+        (false, 26..=65) => Symbol::BatteryMedium,
+        _ => Symbol::BatteryFull,
     }
 }
 
@@ -99,12 +180,37 @@ mod tests {
     }
 
     #[test]
-    fn battery_glyphs() {
-        assert_eq!(battery(50, true), BATTERY_CHARGING);
-        assert_eq!(battery(3, false), BATTERY);
-        assert_eq!(battery(15, false), BATTERY_LOW);
-        assert_eq!(battery(40, false), BATTERY_MEDIUM);
-        assert_eq!(battery(90, false), BATTERY_FULL);
+    fn battery_pictures() {
+        assert_eq!(battery(50, true), Symbol::BatteryCharging);
+        assert_eq!(battery(3, false), Symbol::BatteryLow);
+        assert_eq!(battery(15, false), Symbol::BatteryLow);
+        assert_eq!(battery(40, false), Symbol::BatteryMedium);
+        assert_eq!(battery(90, false), Symbol::BatteryFull);
+    }
+
+    #[test]
+    fn every_symbol_is_an_svg() {
+        for s in [
+            Symbol::Wifi,
+            Symbol::WifiLow,
+            Symbol::WifiZero,
+            Symbol::WifiOff,
+            Symbol::Bluetooth,
+            Symbol::BluetoothOff,
+            Symbol::Bell,
+            Symbol::BellOff,
+            Symbol::BatteryLow,
+            Symbol::BatteryMedium,
+            Symbol::BatteryFull,
+            Symbol::BatteryCharging,
+            Symbol::Clock,
+            Symbol::Trash,
+            Symbol::X,
+            Symbol::ChevronDown,
+            Symbol::ChevronUp,
+        ] {
+            assert!(symbol_bytes(s).starts_with(b"<svg"), "{s:?} isn't an SVG");
+        }
     }
 
     #[test]

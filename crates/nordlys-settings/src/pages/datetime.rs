@@ -1,4 +1,4 @@
-use super::{PageState, Reads};
+use super::{PageState, Reads, toml_set};
 use crate::app::Ctx;
 use crate::icons::Icon;
 use crate::sys::{datetime, job};
@@ -27,6 +27,8 @@ pub enum Msg {
     SetTime,
     Locale(String),
     Done(Result<(), String>, String),
+    /// A `[clock]` key in nordlys.toml.
+    Clock(&'static str, bool),
 }
 
 impl State {
@@ -105,6 +107,10 @@ impl PageState for State {
                     move |r| Msg::Done(r, ok.clone()),
                 )
             }
+            Msg::Clock(key, on) => {
+                toml_set(ctx, "clock", key, on);
+                Task::none()
+            }
             Msg::Done(r, ok) => {
                 ctx.report(&r, &ok);
                 self.read()
@@ -114,16 +120,55 @@ impl PageState for State {
 
     fn view<'a>(&'a self, ctx: &'a Ctx) -> El<'a, Msg> {
         let c = ctx.c;
+        // Nordlys's own clock needs no timedatectl, so it's always here.
+        let shown = &ctx.toml.config.clock;
+        let bar = ui::section(
+            c,
+            "Top bar and lock screen",
+            vec![
+                ui::toggle_row(
+                    c,
+                    "12-hour time",
+                    format!(
+                        "The top bar reads {}",
+                        chrono::Local::now().format(&shown.bar_format())
+                    ),
+                    shown.twelve_hour,
+                    |on| Msg::Clock("twelve_hour", on),
+                ),
+                ui::toggle_row(
+                    c,
+                    "Date on the top bar",
+                    "The day and date before the time",
+                    shown.date,
+                    |on| Msg::Clock("date", on),
+                ),
+                ui::toggle_row(
+                    c,
+                    "Seconds on the top bar",
+                    "Count the seconds beside the time",
+                    shown.seconds,
+                    |on| Msg::Clock("seconds", on),
+                ),
+            ],
+        );
         if let Some(e) = &self.failed {
-            return ui::note(
-                c,
-                Icon::CircleAlert,
-                c.warn,
-                format!("Couldn't ask systemd about the clock ({e}). This page needs timedatectl."),
-            );
+            return column![
+                bar,
+                ui::note(
+                    c,
+                    Icon::CircleAlert,
+                    c.warn,
+                    format!(
+                        "Couldn't ask systemd about the clock ({e}). The rest of this page needs timedatectl."
+                    ),
+                ),
+            ]
+            .spacing(26)
+            .into();
         }
         let Some(d) = &self.data else {
-            return ui::loading(c);
+            return column![bar, ui::loading(c)].spacing(26).into();
         };
         let now = chrono::Local::now();
         let clock = column![
@@ -226,8 +271,9 @@ impl PageState for State {
         };
         column![
             ui::section(c, "Clock", clock_rows),
+            bar,
             ui::section(c, "Region", lang),
-            text("Changing these asks for your password, since they apply to everyone using this computer.")
+            text("Changing the time zone, clock sync or language asks for your password, since they apply to everyone using this computer.")
                 .size(12)
                 .color(c.dim),
         ]

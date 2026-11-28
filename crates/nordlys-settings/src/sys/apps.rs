@@ -326,6 +326,19 @@ pub fn set_autostart(s: &Startup, on: bool) -> Result<(), String> {
 
 /// A new startup command of your own.
 pub fn add_autostart(name: &str, command: &str) -> Result<(), String> {
+    write_entry(name, command, None)
+}
+
+/// Rename or re-command one of your own entries. The new file is written
+/// before the old one is removed, so a failure leaves the entry as it was.
+pub fn update_autostart(old: &Startup, name: &str, command: &str) -> Result<(), String> {
+    if !old.yours {
+        return Err("Only startup commands you added can be edited".into());
+    }
+    write_entry(name, command, Some(&old.entry.path))
+}
+
+fn write_entry(name: &str, command: &str, replacing: Option<&Path>) -> Result<(), String> {
     let name = name.trim();
     let command = command.trim();
     if name.is_empty() || command.is_empty() {
@@ -342,13 +355,17 @@ pub fn add_autostart(name: &str, command: &str) -> Result<(), String> {
         })
         .collect();
     let path = user_autostart().join(format!("nordlys-{slug}.desktop"));
-    if path.exists() {
+    if path.exists() && Some(path.as_path()) != replacing {
         return Err(format!("There's already a startup entry called {name}"));
     }
     let text = format!(
         "[Desktop Entry]\nType=Application\nName={name}\nExec={command}\nComment=Added in Nordlys Settings\nX-Nordlys-Added=true\n"
     );
-    super::write_atomic(&path, &text)
+    super::write_atomic(&path, &text)?;
+    if let Some(old) = replacing.filter(|old| *old != path.as_path()) {
+        std::fs::remove_file(old).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn remove_autostart(s: &Startup) -> Result<(), String> {

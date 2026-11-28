@@ -1,8 +1,9 @@
-use super::{PageState, Reads};
+use super::{PageState, Reads, toml_set};
 use crate::app::{Ctx, Page};
 use crate::icons::Icon;
-use crate::sys::{job, power};
-use crate::theme::{BOLD, Kind};
+use crate::sys::logind::{Buttons, Choice, Key};
+use crate::sys::{job, logind, power};
+use crate::theme::{BOLD, C, Kind};
 use crate::ui::{self, El};
 use iced::widget::{column, row, text};
 use iced::{Alignment, Task};
@@ -12,6 +13,10 @@ pub struct State {
     data: Option<power::Power>,
     reads: Reads,
     confirm: Option<power::Action>,
+    /// A lid or button change is waiting at the password prompt.
+    asking: bool,
+    /// The warning level while its slider is being dragged.
+    warn: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +27,12 @@ pub enum Msg {
     Confirm,
     Cancel,
     Done(Result<(), String>),
+    Button(Key, Choice),
+    ResetButtons,
+    /// True when the change applies now, false when it needs a restart.
+    ButtonsDone(Result<bool, String>),
+    Warn(f32),
+    WarnDone,
 }
 
 impl State {
@@ -76,6 +87,43 @@ impl PageState for State {
             Msg::Done(r) => {
                 ctx.report(&r, "");
                 self.read()
+            }
+            Msg::Button(key, choice) => {
+                let now = self
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.buttons.as_ref()?.get(key));
+                if self.asking || now == Some(choice) {
+                    return Task::none();
+                }
+                self.asking = true;
+                job(move || logind::set(key, choice), Msg::ButtonsDone)
+            }
+            Msg::ResetButtons => {
+                if self.asking {
+                    return Task::none();
+                }
+                self.asking = true;
+                job(logind::reset, Msg::ButtonsDone)
+            }
+            Msg::ButtonsDone(r) => {
+                self.asking = false;
+                match r {
+                    Ok(true) => ctx.done("Saved"),
+                    Ok(false) => ctx.done("Saved. It applies after you restart"),
+                    Err(e) => ctx.fail(e),
+                }
+                self.read()
+            }
+            Msg::Warn(v) => {
+                self.warn = Some(v);
+                Task::none()
+            }
+            Msg::WarnDone => {
+                if let Some(v) = self.warn.take() {
+                    toml_set(ctx, "power", "low_battery", v.round() as i64);
+                }
+                Task::none()
             }
         }
     }
@@ -160,6 +208,29 @@ impl PageState for State {
                     },
                 )],
             ));
+        } else {
+            let at = self
+                .warn
+                .unwrap_or(f32::from(ctx.toml.config.power.low_battery));
+            body = body.push(ui::section(
+                c,
+                "Low battery",
+                vec![ui::slider_row(
+                    c,
+                    "Warn me at",
+                    "A notification when the battery runs this low. All the way left is off",
+                    0.0..=30.0,
+                    1.0,
+                    at,
+                    if at < 1.0 {
+                        "Off".to_owned()
+                    } else {
+                        format!("{at:.0}%")
+                    },
+                    Msg::Warn,
+                    Some(Msg::WarnDone),
+                )],
+            ));
         }
         if !d.profiles.is_empty() {
             let current = d.profile.clone().unwrap_or_default();
@@ -211,6 +282,9 @@ impl PageState for State {
                 c.accent,
                 "Install power-profiles-daemon (or tuned-ppd) to switch between power saver, balanced and performance.",
             ));
+        }
+        if let Some(b) = &d.buttons {
+            body = body.push(self.buttons(c, b, d.can_hibernate));
         }
         let action = |a: power::Action, ic: Icon, kind: Kind| {
             ui::icon_text_btn(c, ic, a.label(), kind, Some(Msg::Act(a)))
@@ -283,6 +357,92 @@ impl PageState for State {
             .spacing(14)
             .into(),
         )
+    }
+}
+
+/// What a key can be set to.
+fn choices(key: Key, can_hibernate: bool) -> Vec<Choice> {
+    let mut all = vec![Choice::Suspend];
+    if can_hibernate {
+        all.push(Choice::Hibernate);
+    }
+    all.extend([Choice::Lock, Choice::Ignore]);
+    if key == Key::PowerButton {
+        all.push(Choice::PowerOff);
+    }
+    all
+}
+
+impl State {
+    fn buttons<'a>(&'a self, c: C, b: &Buttons, can_hibernate: bool) -> El<'a, Msg> {
+        let keys = Key::ALL
+            .into_iter()
+            .filter(|k| b.has_lid || *k == Key::PowerButton);
+        let mut rows: Vec<El<'a, Msg>> = keys
+            .map(|key| {
+                let (title, detail) = match key {
+                    Key::Lid => ("Closing the lid", "On battery"),
+                    Key::LidPlugged => ("Closing the lid, plugged in", "On mains power"),
+                    Key::LidDocked => (
+                        "Closing the lid, docked",
+                        "With a dock or another screen connected",
+                    ),
+                    Key::PowerButton => ("Power button", "A short press"),
+                };
+                let selected = b.get(key);
+                let detail = match selected {
+                    Some(_) => detail.to_owned(),
+                    None => format!("{detail}. Now set to \"{}\"", b.word(key)),
+                };
+                let options: Vec<(Option<Choice>, &str)> = choices(key, can_hibernate)
+                    .into_iter()
+                    .map(|o| (Some(o), o.label()))
+                    .collect();
+                ui::setting(
+                    c,
+                    title,
+                    detail,
+                    ui::segmented(c, &options, selected, move |o: Option<Choice>| {
+                        // Every option offered is a choice.
+                        Msg::Button(key, o.unwrap_or(Choice::Ignore))
+                    }),
+                )
+            })
+            .collect();
+        if b.ours {
+            rows.push(ui::setting(
+                c,
+                "System settings",
+                "Forget the choices made here",
+                ui::btn(
+                    c,
+                    "Use system settings",
+                    Kind::Secondary,
+                    (!self.asking).then_some(Msg::ResetButtons),
+                ),
+            ));
+        }
+        column![
+            ui::section(
+                c,
+                if b.has_lid {
+                    "Lid and power button"
+                } else {
+                    "Power button"
+                },
+                rows,
+            ),
+            text(if self.asking {
+                "Waiting for the password prompt…"
+            } else {
+                "These apply to everyone using this computer, so a change asks for your password: \
+                 once to save it and again to apply it."
+            })
+            .size(12)
+            .color(c.dim),
+        ]
+        .spacing(8)
+        .into()
     }
 }
 

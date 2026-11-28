@@ -16,6 +16,7 @@ use crate::tray;
 use chrono::{Datelike, NaiveDate};
 use iced::alignment::Horizontal;
 use iced::font::Weight;
+use iced::futures::channel::mpsc;
 use iced::gradient::Linear;
 use iced::widget::{
     Space, button, column, container, image, mouse_area, row, scrollable, svg, text,
@@ -62,6 +63,8 @@ pub struct Bar {
     palette: Palette,
     /// Spacing and which parts show, from `[bar]`.
     cfg: BarConfig,
+    /// The clock's strftime format, from `[clock]`.
+    clock_format: String,
     /// The space from the screen's edges to the panels, from `[gaps]`.
     gaps: Gaps,
     layout: Layout,
@@ -92,6 +95,8 @@ pub struct Bar {
     notices: Option<system::Notices>,
     /// Newest notification the panel has shown; the bell counts what's newer.
     seen: u32,
+    /// Which app groups and snooze menus are open in the notifications panel.
+    notes_view: now::NotesView,
     /// The media or notifications panel, open under its chip.
     pop: Option<Pop>,
     now_reads: system::Reads,
@@ -109,8 +114,9 @@ struct Menu {
 #[to_layer_message]
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Once a second, for the clock and battery.
-    Tick,
+    /// The watcher saw the clock, battery, recording, indicators or now
+    /// playing change.
+    Seen(Seen),
     /// nordlys.toml was saved.
     Config(Config),
     /// The compositor reported a change to workspaces or windows.
@@ -170,6 +176,7 @@ impl Bar {
         let mut bar = Self {
             palette: config.palette(),
             cfg: config.bar.clone(),
+            clock_format: config.clock.bar_format(),
             gaps: config.gaps.clone(),
             layout: config.stage.layout,
             desk: Desk::default(),
@@ -189,16 +196,30 @@ impl Bar {
             media: None,
             notices: None,
             seen: 0,
+            notes_view: now::NotesView::default(),
             pop: None,
             now_reads: system::Reads::default(),
         };
         bar.tick();
         // The preview can start with a panel open, to look at it:
-        // NORDLYS_PREVIEW_PANEL=network|bluetooth|sound.
+        // NORDLYS_PREVIEW_PANEL=network|bluetooth|sound|notices.
         let panel = match std::env::var("NORDLYS_PREVIEW_PANEL").as_deref() {
             Ok("network") if preview => Task::done(Message::Panel(controls::Kind::Network)),
             Ok("bluetooth") if preview => Task::done(Message::Panel(controls::Kind::Bluetooth)),
             Ok("sound") if preview => Task::done(Message::Panel(controls::Kind::Sound)),
+            // NORDLYS_PREVIEW_HOVER=<app>:<id> shows that card as if hovered.
+            Ok("notices") if preview => {
+                let hover = std::env::var("NORDLYS_PREVIEW_HOVER").ok().and_then(|h| {
+                    let (app, id) = h.split_once(':')?;
+                    Some((app.to_owned(), id.parse::<u32>().ok()?))
+                });
+                let mut tasks = vec![Task::done(Message::Pop(Pop::Notices))];
+                if let Some((app, id)) = hover {
+                    tasks.push(Task::done(Message::Now(now::Action::Hover(now::Hot::App(app)))));
+                    tasks.push(Task::done(Message::Now(now::Action::Hover(now::Hot::Note(id)))));
+                }
+                Task::batch(tasks)
+            }
             _ => Task::none(),
         };
         let first = Task::batch([bar.read_desk(), bar.read_status(), bar.read_now(), panel]);
@@ -206,9 +227,29 @@ impl Bar {
     }
 
     fn tick(&mut self) {
-        self.battery = sources::battery();
-        self.clock = sources::clock_text(chrono::Local::now());
-        self.recording = recording();
+        self.glance(Glance::now(&self.clock_format));
+    }
+
+    fn glance(&mut self, g: Glance) {
+        self.battery = g.battery;
+        self.clock = g.clock;
+        self.recording = g.recording.map(Duration::from_secs);
+    }
+
+    /// Take a now-playing and notifications read.
+    fn take_now(&mut self, snap: system::Snapshot) -> Task<Message> {
+        let listed = |n: &Option<system::Notices>| n.as_ref().is_some_and(|n| !n.recent.is_empty());
+        let before = listed(&self.notices);
+        self.media = snap.playing;
+        self.notices = snap.notices;
+        if self.pop == Some(Pop::Notices) {
+            self.see_newest();
+            // The panel's height depends on whether it lists any.
+            if listed(&self.notices) != before {
+                return self.resize();
+            }
+        }
+        Task::none()
     }
 
     /// Read the indicators off the UI thread, one read at a time.
@@ -323,12 +364,18 @@ impl Bar {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => self.tick(),
+            Message::Seen(Seen::Glance(g)) => self.glance(g),
+            Message::Seen(Seen::Status(s)) => self.status = s,
+            Message::Seen(Seen::Now(snap)) => return self.take_now(snap),
             Message::Config(c) => {
                 self.palette = c.palette();
                 self.layout = c.stage.layout;
                 self.cfg = c.bar.clone();
                 self.gaps = c.gaps.clone();
+                if c.clock.bar_format() != self.clock_format {
+                    self.clock_format = c.clock.bar_format();
+                    self.tick();
+                }
                 if self.preview {
                     return Task::none();
                 }
@@ -518,16 +565,39 @@ impl Bar {
                 return Task::batch([self.resize(), self.read_now()]);
             }
             Message::Now(action) => {
-                let work: fn() = match action {
+                let job: Box<dyn FnOnce() + Send> = match action {
+                    // What the panel shows open: no system call.
+                    NowAction::Expand(app) => {
+                        if !self.notes_view.expanded.remove(&app) {
+                            self.notes_view.expanded.insert(app);
+                        }
+                        return Task::none();
+                    }
+                    NowAction::Menu(id) => {
+                        self.notes_view.menu = if self.notes_view.menu == Some(id) {
+                            None
+                        } else {
+                            Some(id)
+                        };
+                        return Task::none();
+                    }
+                    NowAction::Hover(hot) => {
+                        self.notes_view.hover(hot, true);
+                        return Task::none();
+                    }
+                    NowAction::Leave(hot) => {
+                        self.notes_view.hover(hot, false);
+                        return Task::none();
+                    }
                     NowAction::PlayPause => {
                         if let Some(np) = &mut self.media {
                             np.playing = !np.playing;
                         }
-                        system::play_pause
+                        Box::new(system::play_pause)
                     }
-                    NowAction::Next => system::next_track,
-                    NowAction::ShowLast => system::pop_notification,
-                    NowAction::Clear => system::clear_notifications,
+                    NowAction::Next => Box::new(system::next_track),
+                    NowAction::ShowLast => Box::new(system::pop_notification),
+                    NowAction::Clear => Box::new(system::clear_notifications),
                     NowAction::Dnd => {
                         let Some(n) = &mut self.notices else {
                             return Task::none();
@@ -539,26 +609,28 @@ impl Bar {
                             |_| Message::Poll,
                         );
                     }
+                    NowAction::Invoke(id, key) => {
+                        Box::new(move || system::invoke_notification(id, &key))
+                    }
+                    NowAction::Dismiss(id) => Box::new(move || system::dismiss_notification(id)),
+                    NowAction::Snooze(id, minutes) => {
+                        self.notes_view.menu = None;
+                        Box::new(move || system::snooze_notification(id, minutes))
+                    }
+                    NowAction::Mute(app, on) => {
+                        Box::new(move || system::set_app_muted(&app, on))
+                    }
+                    NowAction::ClearApp(app) => {
+                        Box::new(move || system::clear_app_notifications(&app))
+                    }
                 };
-                return Task::perform(system::background(work), |_| Message::Poll);
+                return Task::perform(system::background(job), |_| Message::Poll);
             }
             Message::NowRead(snap) => {
                 let again = self.now_reads.done();
                 let mut tasks = vec![];
                 if let Some(snap) = snap {
-                    let listed = |n: &Option<system::Notices>| {
-                        n.as_ref().is_some_and(|n| !n.recent.is_empty())
-                    };
-                    let before = listed(&self.notices);
-                    self.media = snap.playing;
-                    self.notices = snap.notices;
-                    if self.pop == Some(Pop::Notices) {
-                        self.see_newest();
-                        // The panel's height depends on whether it lists any.
-                        if listed(&self.notices) != before {
-                            tasks.push(self.resize());
-                        }
-                    }
+                    tasks.push(self.take_now(snap));
                 }
                 if again {
                     tasks.push(self.read_now());
@@ -616,7 +688,10 @@ impl Bar {
         let ground = color(p.ground);
         let body = match pop {
             Pop::Media => now::media_panel(self.media.as_ref(), p).map(Message::Now),
-            Pop::Notices => now::notes_panel(self.notices.as_ref(), self.seen, p).map(Message::Now),
+            Pop::Notices => {
+                now::notes_panel(self.notices.as_ref(), self.seen, &self.notes_view, p)
+                    .map(Message::Now)
+            }
         };
         let boxed = container(body)
             .width(now::WIDTH)
@@ -665,15 +740,23 @@ impl Bar {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
+        let mut subs = vec![
+            // Every message redraws the bar, so the watcher speaks only
+            // when something it shows has changed.
+            Subscription::run_with(self.clock_format.clone(), |f| watch_time(f.clone()))
+                .map(Message::Seen),
+            Subscription::run(watch_status).map(Message::Seen),
             events::changes(&self.compositor).map(|_| Message::Changed),
             events::config_changes().map(Message::Config),
             tray::items().map(Message::Tray),
-            iced::time::every(Duration::from_secs(3)).map(|_| Message::Poll),
             // In case an event is ever missed.
             iced::time::every(Duration::from_secs(15)).map(|_| Message::Changed),
-        ])
+        ];
+        if self.panel.is_some() {
+            // An open panel shows more than the watcher reads.
+            subs.push(iced::time::every(Duration::from_secs(3)).map(|_| Message::Poll));
+        }
+        Subscription::batch(subs)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -1156,9 +1239,9 @@ fn tray_icons<'a>(
 fn indicators<'a>(p: &Palette, glass: Glass, s: system::Status) -> Option<Element<'a, Message>> {
     let (ink, dim, alert) = (color(p.text), color(p.dim), color(p.ansi[1]));
     let mut cells: Vec<Element<'a, Message>> = vec![];
-    let cell = |glyph: char, tone: Color, message: Message| {
+    let cell = |glyph: icons::Face, tone: Color, message: Message| {
         mouse_area(
-            container(icon(glyph, 15).color(tone))
+            container(icons::draw(glyph, 15.0, tone))
                 .width(24)
                 .height(26)
                 .align_x(Horizontal::Center)
@@ -1168,20 +1251,20 @@ fn indicators<'a>(p: &Palette, glass: Glass, s: system::Status) -> Option<Elemen
         .interaction(iced::mouse::Interaction::Pointer)
     };
     if let Some(link) = s.link {
-        let (glyph, tone) = match link {
-            system::Link::Wifi => (icons::WIFI, ink),
+        let (glyph, tone): (icons::Face, Color) = match link {
+            system::Link::Wifi => (icons::Symbol::Wifi.into(), ink),
             // Lucide's ethernet icon isn't in the bundled set yet.
-            system::Link::Wired | system::Link::Other => (icons::SWAP, ink),
-            system::Link::Limited => (icons::WIFI, dim),
-            system::Link::Offline => (icons::WIFI_OFF, alert),
+            system::Link::Wired | system::Link::Other => (icons::SWAP.into(), ink),
+            system::Link::Limited => (icons::Symbol::WifiLow.into(), dim),
+            system::Link::Offline => (icons::Symbol::WifiOff.into(), alert),
         };
         cells.push(cell(glyph, tone, Message::Panel(controls::Kind::Network)).into());
     }
     if let Some(on) = s.bluetooth {
-        let (glyph, tone) = if on {
-            (icons::BLUETOOTH, ink)
+        let (glyph, tone): (icons::Face, Color) = if on {
+            (icons::Symbol::Bluetooth.into(), ink)
         } else {
-            (icons::BLUETOOTH_OFF, dim)
+            (icons::Symbol::BluetoothOff.into(), dim)
         };
         cells.push(cell(glyph, tone, Message::Panel(controls::Kind::Bluetooth)).into());
     }
@@ -1189,7 +1272,7 @@ fn indicators<'a>(p: &Palette, glass: Glass, s: system::Status) -> Option<Elemen
         let tone = if v.muted { dim } else { ink };
         cells.push(
             cell(
-                icons::volume(v.level, v.muted),
+                icons::Face::Font(icons::volume(v.level, v.muted)),
                 tone,
                 Message::Panel(controls::Kind::Sound),
             )
@@ -1361,6 +1444,86 @@ fn menu_panel<'a>(p: &Palette, glass: Glass, m: &Menu) -> Element<'a, Message> {
 }
 
 /// While `nordlys-record` runs: its pid file, and how long ago it started.
+/// What the watcher found changed.
+#[derive(Debug, Clone)]
+pub enum Seen {
+    Glance(Glance),
+    Status(system::Status),
+    Now(system::Snapshot),
+}
+
+/// What the bar shows that changes with time: read once a second.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Glance {
+    battery: Option<Battery>,
+    clock: String,
+    /// Whole seconds, as the chip shows it.
+    recording: Option<u64>,
+}
+
+impl Glance {
+    fn now(clock_format: &str) -> Self {
+        Glance {
+            battery: sources::battery(),
+            clock: sources::clock_text(chrono::Local::now(), clock_format),
+            recording: recording().map(|d| d.as_secs()),
+        }
+    }
+}
+
+/// How often the indicators, now playing and notifications are read.
+const STATUS_EVERY: Duration = Duration::from_secs(3);
+
+/// Read the clock, battery and recording once a second, on the second,
+/// off the UI thread, and say only what changed. Ends when the bar does,
+/// or the clock's format changes (a new one starts).
+fn watch_time(clock_format: String) -> mpsc::UnboundedReceiver<Seen> {
+    let (tx, rx) = mpsc::unbounded();
+    std::thread::spawn(move || {
+        let mut last = None;
+        while !tx.is_closed() {
+            let g = Glance::now(&clock_format);
+            if last.as_ref() != Some(&g) {
+                if tx.unbounded_send(Seen::Glance(g.clone())).is_err() {
+                    return;
+                }
+                last = Some(g);
+            }
+            let into = chrono::Local::now().timestamp_subsec_millis().min(999);
+            std::thread::sleep(Duration::from_millis(u64::from(1000 - into)));
+        }
+    });
+    rx
+}
+
+/// Read the indicators, now playing and notifications every few seconds
+/// and say only what changed: a thread of its own, so a slow tool doesn't
+/// hold the clock up.
+fn watch_status() -> mpsc::UnboundedReceiver<Seen> {
+    let (slow, rx) = mpsc::unbounded();
+    std::thread::spawn(move || {
+        let (mut status, mut now) = (None, None);
+        while !slow.is_closed() {
+            let s = system::Status::read();
+            if status != Some(s) {
+                if slow.unbounded_send(Seen::Status(s)).is_err() {
+                    return;
+                }
+                status = Some(s);
+            }
+            let n = system::Snapshot::read();
+            if now.as_ref() != Some(&n) {
+                if slow.unbounded_send(Seen::Now(n.clone())).is_err() {
+                    return;
+                }
+                now = Some(n);
+            }
+            std::thread::sleep(STATUS_EVERY);
+        }
+    });
+    rx
+}
+
 fn recording() -> Option<Duration> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
     let file = std::path::Path::new(&dir).join("nordlys-record.pid");
@@ -1507,7 +1670,15 @@ fn bell_chip<'a>(
     open: bool,
 ) -> Element<'a, Message> {
     let mut content: iced::widget::Row<'a, Message> =
-        row![icon(if dnd { icons::BELL_OFF } else { icons::BELL }, 13).color(color(p.muted)),]
+        row![icons::symbol(
+            if dnd {
+                icons::Symbol::BellOff
+            } else {
+                icons::Symbol::Bell
+            },
+            13.0,
+            color(p.muted),
+        ),]
             .spacing(6)
             .align_y(Alignment::Center);
     if unread > 0 {
@@ -1542,7 +1713,7 @@ fn battery<'a>(p: &Palette, b: Battery) -> Element<'a, Message> {
         color(p.text)
     };
     row![
-        icon(icons::battery(b.percent, b.charging), 16).color(tone),
+        icons::symbol(icons::battery(b.percent, b.charging), 16.0, tone),
         text(format!("{}%", b.percent))
             .font(INTER)
             .size(12)

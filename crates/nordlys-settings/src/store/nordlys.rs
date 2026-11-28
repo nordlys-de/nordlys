@@ -51,7 +51,7 @@ impl NordlysToml {
     pub fn edit(&mut self, f: impl FnOnce(&mut DocumentMut)) -> Result<(), String> {
         if self.problem.is_some() {
             return Err(format!(
-                "{} has a mistake; fix it in Advanced → Edit nordlys.toml first",
+                "{} has a mistake; fix it in Advanced → Configuration files → Desktop first",
                 self.path.display()
             ));
         }

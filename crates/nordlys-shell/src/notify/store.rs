@@ -2,6 +2,7 @@
 //! behind them and Do not disturb. Pure logic, so it can be tested without
 //! a bus or a screen.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 /// How long a normal toast stays when the sender doesn't say.
@@ -66,6 +67,8 @@ pub struct Note {
     /// Arrived during Do not disturb and hasn't been shown yet.
     pub waiting: bool,
     pub transient: bool,
+    /// Set while snoozed: the moment it comes back as a toast.
+    pub snoozed_until: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -75,7 +78,14 @@ pub struct Store {
     pub shown: Vec<Note>,
     /// Gone from screen, oldest first.
     pub history: Vec<Note>,
+    /// Snoozed, in the order they were put away.
+    pub snoozed: Vec<Note>,
+    /// Apps whose notifications are kept out of sight (still in history).
+    pub muted: BTreeSet<String>,
     pub dnd: bool,
+    /// How long a toast stays when the app doesn't say, from
+    /// `[notifications]`; None is the built-in time.
+    pub default_timeout: Option<Duration>,
 }
 
 impl Store {
@@ -90,7 +100,7 @@ impl Store {
         let urgency = req.urgency.unwrap_or(Urgency::Normal);
         let lifetime = match (req.timeout, urgency) {
             (0, _) | (-1, Urgency::Critical) => None,
-            (t, _) if t < 0 => Some(DEFAULT_TIMEOUT),
+            (t, _) if t < 0 => Some(self.default_timeout.unwrap_or(DEFAULT_TIMEOUT)),
             (t, _) => Some(Duration::from_millis(t as u64)),
         };
         let mut note = Note {
@@ -105,8 +115,12 @@ impl Store {
             deadline: None,
             waiting: false,
             transient: req.transient,
+            snoozed_until: None,
         };
-        if self.dnd && urgency != Urgency::Critical {
+        if self.is_muted(&note.app) && urgency != Urgency::Critical {
+            // Kept for the record, never shown.
+            self.archive(note);
+        } else if self.dnd && urgency != Urgency::Critical {
             note.waiting = true;
             self.archive(note);
         } else {
@@ -183,6 +197,71 @@ impl Store {
         }
     }
 
+    pub fn is_muted(&self, app: &str) -> bool {
+        self.muted.contains(app)
+    }
+
+    pub fn set_muted(&mut self, app: &str, on: bool) {
+        if on {
+            self.muted.insert(app.to_owned());
+        } else {
+            self.muted.remove(app);
+        }
+    }
+
+    /// Put a notification away until `until`. True if it was on screen.
+    pub fn snooze(&mut self, id: u32, until: Instant) -> bool {
+        let was_shown = self.shown.iter().any(|n| n.id == id);
+        if let Some(mut note) = self.take(id) {
+            note.deadline = None;
+            note.snoozed_until = Some(until);
+            self.snoozed.push(note);
+        }
+        was_shown
+    }
+
+    /// Bring back snoozed notifications whose time is up. True if any came back.
+    pub fn wake(&mut self, now: Instant) -> bool {
+        let (due, later): (Vec<Note>, Vec<Note>) = self
+            .snoozed
+            .drain(..)
+            .partition(|n| n.snoozed_until.is_some_and(|t| t <= now));
+        self.snoozed = later;
+        let any = !due.is_empty();
+        for mut note in due {
+            note.snoozed_until = None;
+            if self.dnd && note.urgency != Urgency::Critical {
+                note.waiting = true;
+                self.archive(note);
+            } else {
+                self.show(note, now);
+            }
+        }
+        any
+    }
+
+    /// Remove a notification altogether, as the user dismissed it. True if it was on screen.
+    pub fn dismiss(&mut self, id: u32) -> bool {
+        let was_shown = self.shown.iter().any(|n| n.id == id);
+        self.take(id);
+        self.snoozed.retain(|n| n.id != id);
+        was_shown
+    }
+
+    /// Remove every notification from one app. Returns the ids that were on screen.
+    pub fn clear_app(&mut self, app: &str) -> Vec<u32> {
+        let shown = self
+            .shown
+            .iter()
+            .filter(|n| n.app == app)
+            .map(|n| n.id)
+            .collect();
+        self.shown.retain(|n| n.app != app);
+        self.history.retain(|n| n.app != app);
+        self.snoozed.retain(|n| n.app != app);
+        shown
+    }
+
     pub fn set_dnd(&mut self, on: bool, now: Instant) {
         self.dnd = on;
         if !on {
@@ -217,9 +296,14 @@ impl Store {
         (waiting, self.history.len() as u32, self.dnd)
     }
 
-    /// Newest first, on screen and in history.
+    /// Newest first: on screen, in history and snoozed.
     pub fn recent(&self, n: usize) -> Vec<&Note> {
-        let mut all: Vec<&Note> = self.shown.iter().chain(self.history.iter()).collect();
+        let mut all: Vec<&Note> = self
+            .shown
+            .iter()
+            .chain(self.history.iter())
+            .chain(self.snoozed.iter())
+            .collect();
         all.sort_by_key(|n| std::cmp::Reverse(n.id));
         all.truncate(n);
         all
@@ -389,6 +473,49 @@ mod tests {
         );
         s.close(id, Closed::Dismissed);
         assert!(s.history.is_empty());
+    }
+
+    #[test]
+    fn snooze_wakes_as_a_toast_and_dismiss_removes() {
+        let mut s = Store::default();
+        let t0 = Instant::now();
+        let id = s.notify(req("Later"), t0);
+        assert!(s.snooze(id, t0 + Duration::from_secs(60)));
+        assert!(s.shown.is_empty());
+        assert_eq!(s.snoozed.len(), 1);
+        assert!(!s.wake(t0 + Duration::from_secs(59)));
+        assert!(s.wake(t0 + Duration::from_secs(60)));
+        assert_eq!(s.shown.len(), 1);
+        assert!(s.dismiss(id));
+        assert!(s.shown.is_empty() && s.history.is_empty());
+    }
+
+    #[test]
+    fn muted_apps_go_to_history_only() {
+        let mut s = Store::default();
+        let t0 = Instant::now();
+        s.set_muted("test", true);
+        s.notify(req("Quiet"), t0);
+        assert!(s.shown.is_empty());
+        assert_eq!(s.history.len(), 1);
+        let mut critical = req("Urgent");
+        critical.urgency = Some(Urgency::Critical);
+        s.notify(critical, t0);
+        assert_eq!(s.shown.len(), 1, "critical still gets through");
+    }
+
+    #[test]
+    fn clear_app_takes_only_that_app() {
+        let mut s = Store::default();
+        let t0 = Instant::now();
+        let mut other = req("Other");
+        other.app = "Other".into();
+        s.notify(req("Mine"), t0);
+        s.notify(other, t0);
+        let gone = s.clear_app("test");
+        assert_eq!(gone.len(), 1);
+        assert_eq!(s.shown.len(), 1);
+        assert_eq!(s.shown[0].app, "Other");
     }
 
     #[test]

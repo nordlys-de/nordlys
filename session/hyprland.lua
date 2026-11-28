@@ -202,6 +202,14 @@ hl.layer_rule({
     ignore_alpha = 0.3,
 })
 
+-- Panels take screen space in the order they appear, so a shelf that started
+-- before the bar would take the corner and push the bar aside. The bar goes first.
+hl.layer_rule({
+    name  = "nordlys-bar-first",
+    match = { namespace = "^nordlys-bar$" },
+    order = 1,
+})
+
 -- Small utility windows float over the stage instead of taking it.
 for i, class in ipairs({
     "^(org.pulseaudio.pavucontrol|pavucontrol)$",
