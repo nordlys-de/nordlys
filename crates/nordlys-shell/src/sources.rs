@@ -25,7 +25,7 @@ pub struct Desk {
     pub stage: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Compositor {
     Nordlys(PathBuf),
     Hyprland(PathBuf),
@@ -203,7 +203,7 @@ impl Compositor {
 }
 
 /// Where a window is on its screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Frame {
     pub id: String,
     pub x: i32,
@@ -213,7 +213,7 @@ pub struct Frame {
 }
 
 /// The focused window and where its screen starts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Active {
     /// Relative to its screen.
     pub frame: Frame,

@@ -73,11 +73,15 @@ impl Snapshot {
 /// Wait for `child`, killing it once `limit` has passed.
 fn wait_within(mut child: Child, limit: Duration) -> Option<(ExitStatus, Child)> {
     let deadline = Instant::now() + limit;
+    // Most tools are done in a few milliseconds; a slow one is looked at
+    // less and less often rather than every few milliseconds.
+    let mut nap = Duration::from_millis(1);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some((status, child)),
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(Duration::from_millis(50));
             }
             _ => {
                 let _ = child.kill();

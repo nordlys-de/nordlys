@@ -3,7 +3,10 @@
 //! The Vulkan loader opens every installed driver, and on a laptop with an
 //! Intel and an NVIDIA GPU, NVIDIA's costs each shell process some 50 MB
 //! of memory (and video memory) to draw a bar. So where there's an Intel
-//! GPU, those pieces load only Intel's driver.
+//! GPU, those pieces load only Intel's driver, and none of the Vulkan
+//! layers installed to load into every app: NVIDIA's Optimus layer loads
+//! its OpenGL libraries, Mesa's device select loads Gallium and LLVM, and
+//! overlays such as MangoHud have nothing to show on a bar.
 //!
 //! The variables are read by this process alone: [`restore`] takes them
 //! out again for the apps it starts. `NORDLYS_SHELL_GPU=auto` turns all
@@ -17,11 +20,12 @@ const SWITCH: &str = "NORDLYS_SHELL_GPU";
 /// Names what we set, so a supervisor's children know it too.
 const MARKER: &str = "NORDLYS_GPU_SET";
 /// Someone who sets one of these has made their own choice.
-const CHOSEN: [&str; 8] = [
+const CHOSEN: [&str; 9] = [
     "VK_DRIVER_FILES",
     "VK_ICD_FILENAMES",
     "VK_LOADER_DRIVERS_SELECT",
     "VK_LOADER_DRIVERS_DISABLE",
+    "VK_LOADER_LAYERS_DISABLE",
     "WGPU_BACKEND",
     "WGPU_ADAPTER_NAME",
     "WGPU_POWER_PREF",
@@ -84,6 +88,8 @@ fn plan(
     }
     vec![
         ("VK_DRIVER_FILES", icds.join(":")),
+        // Layers that load into every Vulkan app; see the top of the file.
+        ("VK_LOADER_LAYERS_DISABLE", "~implicit~".to_owned()),
         // Without this wgpu also tries OpenGL, which loads NVIDIA's again.
         ("WGPU_BACKEND", "vulkan".to_owned()),
     ]
@@ -137,6 +143,7 @@ mod tests {
             plan(|_| None, &icds(), true),
             [
                 ("VK_DRIVER_FILES", "/a.json:/b.json".to_owned()),
+                ("VK_LOADER_LAYERS_DISABLE", "~implicit~".to_owned()),
                 ("WGPU_BACKEND", "vulkan".to_owned()),
             ]
         );

@@ -414,7 +414,22 @@ fn spawn(cmdline: &str, dir: Option<&Path>, id: Option<&str>) -> std::io::Result
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .map(|_| ())
+        .map(reap)
+}
+
+/// The app stays our child (systemd-run --scope becomes it), so wait for
+/// it on a small thread of its own: one that exits doesn't linger as a
+/// zombie for as long as the shell piece that started it runs.
+fn reap(mut child: std::process::Child) {
+    let waited = std::thread::Builder::new()
+        .name("reap".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    if let Err(e) = waited {
+        eprintln!("nordlys-shell: can't watch a started app: {e}");
+    }
 }
 
 /// Open a file or folder with the user's default handler.
