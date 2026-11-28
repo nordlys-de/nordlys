@@ -7,6 +7,7 @@
 //! into files beside its socket, and the flyout re-reads the hovered one's
 //! a few times a second while it's open. Elsewhere it's name and title.
 
+use crate::apps;
 use crate::bar::{INTER, INTER_SEMIBOLD, color};
 use crate::events;
 use crate::icons::{self, icon};
@@ -306,21 +307,30 @@ impl Shelf {
 
 fn slot(i: usize, w: &ShelfWindow, hovered: bool, r: Rail) -> Element<'static, Message> {
     let tint = ui::tint(&w.app);
+    let art = apps::icon_for(&w.app);
     let initial = w
         .app
         .chars()
         .next()
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_default();
-    let tile = container(text(initial).font(INTER_SEMIBOLD).size(20).color(r.text))
+    let face: Element<'static, Message> = match &art {
+        Some(path) => ui::app_art(path, TILE * 0.8),
+        None => text(initial).font(INTER_SEMIBOLD).size(20).color(r.text).into(),
+    };
+    let tile = container(face)
         .width(TILE)
         .height(TILE)
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center)
         .style(move |_| container::Style {
-            background: Some(Background::Color(Color { a: 0.24, ..tint })),
+            background: Some(Background::Color(if art.is_some() {
+                Color::TRANSPARENT
+            } else {
+                Color { a: 0.24, ..tint }
+            })),
             border: Border {
-                radius: 14.0.into(),
+                radius: r.corner(14.0).into(),
                 width: 1.5,
                 color: if hovered { tint } else { Color::TRANSPARENT },
             },

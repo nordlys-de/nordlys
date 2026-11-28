@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
@@ -18,6 +19,8 @@ pub struct App {
     pub terminal: bool,
     /// `Path=`: the folder the app wants to start in.
     pub path: Option<PathBuf>,
+    /// The file for `Icon=`, found in the icon themes; None when there is none.
+    pub icon: Option<PathBuf>,
 }
 
 impl App {
@@ -96,8 +99,31 @@ impl App {
             exec: String::new(),
             terminal: false,
             path: None,
+            icon: None,
         }
     }
+}
+
+/// The icon file for an app by its id stem, short id, name or window
+/// class (any case). Built once from the installed apps.
+pub fn icon_for(name: &str) -> Option<PathBuf> {
+    static INDEX: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            let mut index = HashMap::new();
+            for app in installed() {
+                let Some(icon) = app.icon.clone() else {
+                    continue;
+                };
+                let stem = app.id.strip_suffix(".desktop").unwrap_or(&app.id);
+                for key in [app.short_id(), app.name.to_lowercase(), stem.to_lowercase()] {
+                    index.entry(key).or_insert_with(|| icon.clone());
+                }
+            }
+            index
+        })
+        .get(&name.to_lowercase())
+        .cloned()
 }
 
 fn data_dirs() -> Vec<PathBuf> {
@@ -252,6 +278,10 @@ pub fn parse_for(id: &str, text: &str, locales: &[String], desktops: &[String]) 
         generic: opt("GenericName"),
         comment: opt("Comment"),
         path: kv.get("Path").filter(|p| !p.is_empty()).map(PathBuf::from),
+        icon: kv
+            .get("Icon")
+            .filter(|n| !n.is_empty())
+            .and_then(|n| crate::tray::find_icon(n, "")),
         keywords: local("Keywords")
             .map(|k| {
                 k.split(';')

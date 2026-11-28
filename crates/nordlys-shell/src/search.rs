@@ -78,8 +78,10 @@ pub struct Item {
     pub desc: String,
     pub key: Option<String>,
     pub action: Action,
-    /// Icon for commands and files; apps get their letter tile.
+    /// Icon for commands and files; apps get their art, else a letter tile.
     pub icon: Option<char>,
+    /// The app's icon file, when its theme has one.
+    pub art: Option<PathBuf>,
     /// Extra lower-case words to match on (keywords, generic name, id).
     terms: Vec<String>,
 }
@@ -127,6 +129,7 @@ impl Catalog {
                 key: None,
                 action: Action::App(i),
                 icon: None,
+                art: a.icon.clone(),
                 terms: a
                     .keywords
                     .iter()
@@ -234,6 +237,7 @@ impl Catalog {
                 key: None,
                 action: Action::Open(p.clone()),
                 icon: Some(icons::FILE),
+                art: None,
                 terms: vec![],
             })
             .collect()
@@ -279,6 +283,7 @@ impl Catalog {
                         "printf '%s\\t\\n' {id} | cliphist decode | wl-copy"
                     )),
                     icon: Some(if image { icons::EYE } else { icons::FILE }),
+                    art: None,
                     terms: vec![],
                 }
             })
@@ -345,6 +350,7 @@ fn commands(config: &Config) -> Vec<Item> {
         |icon: char, name: &str, desc: &str, key: &str, action: Action, terms: &[&str]| Item {
             kind: Kind::Command,
             icon: Some(icon),
+            art: None,
             name: name.into(),
             desc: desc.into(),
             key: (!key.is_empty()).then(|| key.into()),
@@ -478,6 +484,7 @@ fn commands(config: &Config) -> Vec<Item> {
     let power = |icon, name: &str, desc: &str, cmd: &str, verb, terms: &[&str]| Item {
         kind: Kind::Command,
         icon: Some(icon),
+        art: None,
         name: name.into(),
         desc: desc.into(),
         key: None,
@@ -741,6 +748,7 @@ mod tests {
             exec: id.into(),
             terminal: false,
             path: None,
+            icon: None,
         }
     }
 
