@@ -98,7 +98,9 @@ pub fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
 /// Start a program and leave it running on its own.
 pub fn spawn(cmd: &str, args: &[&str]) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
-    Command::new(cmd)
+    let mut command = Command::new(cmd);
+    crate::gpu::restore(&mut command);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

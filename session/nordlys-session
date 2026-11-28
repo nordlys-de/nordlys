@@ -37,6 +37,19 @@ if [ ! -e "$config_dir/nordlys.toml" ] && [ -f "$NORDLYS_DATA/nordlys.toml.examp
     mkdir -p "$config_dir" && cp "$NORDLYS_DATA/nordlys.toml.example" "$config_dir/nordlys.toml"
 fi
 
+# Your own variables for the compositor, such as AQ_DRM_DEVICES to pick a
+# GPU: ~/.config/nordlys/env is a shell file read before it starts, and
+# every variable it sets is exported. One with a syntax error is skipped
+# rather than stopping the login.
+if [ -f "$config_dir/env" ] && ! sh -n "$config_dir/env" 2>/dev/null; then
+    echo "nordlys-session: skipping $config_dir/env, it has a syntax error" >&2
+elif [ -f "$config_dir/env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$config_dir/env"
+    set +a
+fi
+
 # Saved passwords for browsers, VS Code and git (the Secret Service).
 # The display manager's PAM unlocks the keyring with your login password
 # (scripts/setup.sh sets that up); here the daemon is made sure of, and

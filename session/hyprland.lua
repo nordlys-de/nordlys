@@ -62,7 +62,6 @@ local by_hand = table.concat({
     "nordlys-shell notify &",
     "nordlys-shell &",
     "nordlys-shell shelf &",
-    "nordlys-shell ambient &",
     "nordlys-shell close-button &",
     "swaybg -m " .. wallpaper_mode .. " -i '" .. wallpaper .. "' &",
     "hypridle -c '" .. idle .. "' &",
@@ -79,8 +78,9 @@ hl.on("hyprland.start", function()
 
     -- Theme GTK, Qt and the default apps from nordlys.toml, and write the
     -- starting dotfiles that are missing. Files you've made your own are
-    -- left alone (see nordlys-theme --dry-run).
-    hl.exec_cmd("nordlys-theme --quiet")
+    -- left alone (see nordlys-theme --dry-run). It stays running and does
+    -- it again when the mode or accent changes, so open GTK apps follow.
+    hl.exec_cmd("nordlys-theme --quiet --watch")
     -- ~/Pictures, ~/Downloads… for the file manager's sidebar and Print.
     hl.exec_cmd("sh -c 'command -v xdg-user-dirs-update >/dev/null && xdg-user-dirs-update'")
 
@@ -197,9 +197,17 @@ hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
 -- blur to the painted parts, not the clear margins around them.
 hl.layer_rule({
     name  = "nordlys-glass",
-    match = { namespace = "^nordlys-(bar|launcher|shelf|ambient|notify|osd|welcome)$" },
+    match = { namespace = "^nordlys-(bar|launcher|shelf|notify|osd|welcome)$" },
     blur  = true,
     ignore_alpha = 0.3,
+})
+
+-- Panels take screen space in the order they appear, so a shelf that started
+-- before the bar would take the corner and push the bar aside. The bar goes first.
+hl.layer_rule({
+    name  = "nordlys-bar-first",
+    match = { namespace = "^nordlys-bar$" },
+    order = 1,
 })
 
 -- Small utility windows float over the stage instead of taking it.

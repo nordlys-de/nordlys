@@ -26,8 +26,6 @@ pub enum Request {
     /// Register a window (normally the compositor does this itself).
     Open {
         id: String,
-        #[serde(default)]
-        ambient: bool,
     },
     Close {
         id: String,
@@ -196,6 +194,10 @@ pub fn decode_preview(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 #[cfg(test)]
+#[path = "lib_tests.rs"]
+mod lib_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -236,10 +238,7 @@ mod tests {
     fn round_trip() {
         let reqs = [
             Request::State,
-            Request::Open {
-                id: "chat".into(),
-                ambient: true,
-            },
+            Request::Open { id: "chat".into() },
             Request::Slot { n: 2 },
             Request::Screenshot {
                 path: "/tmp/stage.png".into(),
@@ -297,15 +296,10 @@ mod tests {
         assert!(!to_line(&state).contains("screens"));
     }
 
+    /// Older clients may still send the removed `ambient` flag.
     #[test]
-    fn ambient_defaults_to_false() {
-        let r: Request = from_line(r#"{"cmd":"open","id":"x"}"#).unwrap();
-        assert_eq!(
-            r,
-            Request::Open {
-                id: "x".into(),
-                ambient: false
-            }
-        );
+    fn open_ignores_the_old_ambient_flag() {
+        let r: Request = from_line(r#"{"cmd":"open","id":"x","ambient":true}"#).unwrap();
+        assert_eq!(r, Request::Open { id: "x".into() });
     }
 }

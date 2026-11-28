@@ -171,7 +171,7 @@ impl PageState for State {
                 Icon::Monitor,
                 c.muted,
                 "Turn the screen off",
-                "",
+                "The monitors go dark; the computer keeps running",
                 pick(Step::ScreenOff, i.screen_off),
             ),
             ui::icon_setting(

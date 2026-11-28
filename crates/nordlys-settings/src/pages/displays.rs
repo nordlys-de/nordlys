@@ -257,10 +257,8 @@ impl PageState for State {
             Msg::Brightness(dev, v) => {
                 self.brightness = Some((dev.clone(), v));
                 let p = v.round() as u8;
-                return job(
-                    move || display::set_brightness(&dev, p),
-                    |_| Msg::Done(Ok(())),
-                );
+                // A failed brightness change is reported, not dropped.
+                return job(move || display::set_brightness(&dev, p), Msg::Done);
             }
             Msg::BrightnessDone => {
                 self.brightness = None;

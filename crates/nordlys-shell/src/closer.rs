@@ -5,13 +5,16 @@
 //!
 //! The window's place is read when Hyprland reports a change (and every
 //! second for a floating window, which can move silently). Only the pointer
-//! is polled, and only while there is a window to close.
+//! is polled, on a thread of its own and only while there is a window to
+//! close; it says something only when the pointer goes into or out of the
+//! corner, so an idle desktop costs no redraws.
 
 use crate::events;
 use crate::icons::{self, icon};
 use crate::sources::{Active, Compositor, Frame};
 use crate::system;
 use iced::alignment::{Horizontal, Vertical};
+use iced::futures::channel::mpsc;
 use iced::widget::{Space, button, container, mouse_area};
 use iced::{Background, Border, Color, Element, Length, Subscription, Task};
 use iced_layershell::to_layer_message;
@@ -23,6 +26,9 @@ const INSET: i32 = 8;
 /// The corner that reveals the button: this far left of and below it.
 const REACH_X: i32 = 160;
 const REACH_Y: i32 = 64;
+/// How often the pointer is looked at near the corner, and elsewhere.
+const CLOSE_BY: Duration = Duration::from_millis(150);
+const FAR_OFF: Duration = Duration::from_millis(400);
 
 pub struct Closer {
     compositor: Compositor,
@@ -31,18 +37,16 @@ pub struct Closer {
     active: Option<Active>,
     shown: Option<Frame>,
     window_reads: system::Reads,
-    pointer_reads: system::Reads,
 }
 
 #[to_layer_message]
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Look at the pointer.
-    Tick,
     /// Hyprland reported a change, or a floating window may have moved.
     Changed,
     Window(Option<Option<Active>>),
-    Pointer(Option<Option<(i32, i32)>>),
+    /// The pointer went into (true) or out of the active window's corner.
+    Near(bool),
     Close,
 }
 
@@ -50,6 +54,34 @@ pub enum Message {
 fn near_corner(w: &Frame, (x, y): (i32, i32)) -> bool {
     let right = w.x + w.width;
     x >= right - REACH_X.min(w.width) && x <= right && y >= w.y && y <= w.y + REACH_Y.min(w.height)
+}
+
+/// Whether the pointer is close enough to the corner to be looked at often.
+fn close_by(w: &Frame, (x, y): (i32, i32)) -> bool {
+    let right = w.x + w.width;
+    x >= right - 3 * REACH_X && x <= right + REACH_X && y >= w.y - REACH_Y && y <= w.y + 3 * REACH_Y
+}
+
+/// Watch the pointer on a thread, saying only when it goes into or out of
+/// `a`'s corner. Ends when the subscription goes.
+fn watch_corner(compositor: Compositor, a: Active) -> mpsc::UnboundedReceiver<bool> {
+    let (tx, rx) = mpsc::unbounded();
+    std::thread::spawn(move || {
+        let mut last = None;
+        while !tx.is_closed() {
+            let p = compositor.pointer().map(|p| a.local(p));
+            let near = p.is_some_and(|p| near_corner(&a.frame, p));
+            if last != Some(near) {
+                if tx.unbounded_send(near).is_err() {
+                    return;
+                }
+                last = Some(near);
+            }
+            let soon = p.is_some_and(|p| close_by(&a.frame, p));
+            std::thread::sleep(if soon { CLOSE_BY } else { FAR_OFF });
+        }
+    });
+    rx
 }
 
 /// Layer margins (top, right, bottom, left) that put the button there.
@@ -66,7 +98,6 @@ impl Closer {
             active: None,
             shown: None,
             window_reads: system::Reads::default(),
-            pointer_reads: system::Reads::default(),
         };
         let first = me.read_window();
         (me, first)
@@ -81,14 +112,6 @@ impl Closer {
             system::background(move || c.active_window()),
             Message::Window,
         )
-    }
-
-    fn read_pointer(&mut self) -> Task<Message> {
-        if !self.pointer_reads.start() {
-            return Task::none();
-        }
-        let c = self.compositor.clone();
-        Task::perform(system::background(move || c.pointer()), Message::Pointer)
     }
 
     fn show(&mut self, next: Option<Frame>) -> Task<Message> {
@@ -110,7 +133,6 @@ impl Closer {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => self.read_pointer(),
             Message::Changed => self.read_window(),
             Message::Window(read) => {
                 let again = self.window_reads.done();
@@ -134,20 +156,13 @@ impl Closer {
                 }
                 Task::batch(tasks)
             }
-            Message::Pointer(read) => {
-                let again = self.pointer_reads.done();
-                let next = match (&self.active, read.flatten()) {
-                    (Some(a), Some(p)) if near_corner(&a.frame, a.local(p)) => {
-                        Some(a.frame.clone())
-                    }
-                    _ => None,
-                };
-                let shown = self.show(next);
-                if again {
-                    Task::batch([shown, self.read_pointer()])
-                } else {
-                    shown
-                }
+            Message::Near(near) => {
+                let next = self
+                    .active
+                    .as_ref()
+                    .filter(|_| near)
+                    .map(|a| a.frame.clone());
+                self.show(next)
             }
             Message::Close => {
                 if let Some(w) = &self.shown {
@@ -162,7 +177,12 @@ impl Closer {
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs = vec![events::changes(&self.compositor).map(|_| Message::Changed)];
         if let Some(a) = &self.active {
-            subs.push(iced::time::every(Duration::from_millis(150)).map(|_| Message::Tick));
+            subs.push(
+                Subscription::run_with((self.compositor.clone(), a.clone()), |(c, a)| {
+                    watch_corner(c.clone(), a.clone())
+                })
+                .map(Message::Near),
+            );
             if a.floating {
                 subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Changed));
             }

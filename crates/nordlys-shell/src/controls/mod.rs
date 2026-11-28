@@ -15,7 +15,7 @@
 pub mod sys;
 
 use crate::bar::{INTER, INTER_SEMIBOLD, color};
-use crate::icons::{self, icon};
+use crate::icons::{self};
 use iced::alignment::Vertical;
 use iced::widget::{
     Space, button, column, container, mouse_area, row, scrollable, slider, text, toggler,
@@ -241,6 +241,8 @@ fn paired(b: &bluetooth::Bluetooth) -> Vec<&bluetooth::Device> {
 /// Colours on the panel's dark or light glass.
 #[derive(Clone, Copy)]
 struct Look {
+    /// Multiplies corner radii drawn at the default roundness.
+    scale: f32,
     ink: Color,
     muted: Color,
     dim: Color,
@@ -251,6 +253,10 @@ struct Look {
 }
 
 impl Look {
+    fn corner(&self, base: f32) -> f32 {
+        base * self.scale
+    }
+
     fn of(p: &Palette) -> Self {
         let (hover, line) = if p.dark {
             (
@@ -264,6 +270,7 @@ impl Look {
             )
         };
         Look {
+            scale: p.corner(1.0),
             ink: color(p.text),
             muted: color(p.muted),
             dim: color(p.dim),
@@ -331,7 +338,7 @@ fn section<'a>(label: &'a str, g: Look) -> El<'a> {
 /// One clickable row: an icon, a label with a detail under or beside it,
 /// and a word on the right ("Connected").
 fn item<'a>(
-    glyph: char,
+    glyph: impl Into<icons::Face>,
     tone: Color,
     label: String,
     detail: String,
@@ -358,7 +365,7 @@ fn item<'a>(
         );
     }
     let content = row![
-        container(icon(glyph, 14).color(tone)).width(20),
+        container(icons::draw(glyph, 14.0, tone)).width(20),
         container(words).width(Length::Fill).clip(true),
         text(trailing).font(INTER).size(11).color(g.accent),
     ]
@@ -373,7 +380,7 @@ fn item<'a>(
             background: (status == button::Status::Hovered).then_some(Background::Color(g.hover)),
             text_color: g.ink,
             border: Border {
-                radius: 8.0.into(),
+                radius: g.corner(8.0).into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -388,7 +395,7 @@ fn link<'a>(label: &'a str, on: Msg, g: Look) -> El<'a> {
         .style(move |_, status| button::Style {
             background: (status == button::Status::Hovered).then_some(Background::Color(g.hover)),
             border: Border {
-                radius: 7.0.into(),
+                radius: g.corner(7.0).into(),
                 ..Border::default()
             },
             ..button::Style::default()
@@ -526,7 +533,7 @@ fn network_view<'a>(
                 (false, _) => "Open".to_owned(),
             };
             body = body.push(item(
-                icons::WIFI,
+                icons::Symbol::Wifi,
                 signal_tone(ap.signal, g),
                 ap.ssid.clone(),
                 detail,
@@ -592,7 +599,7 @@ fn bluetooth_view<'a>(
             Msg::Do(Action::BtConnect(d.address.clone()))
         };
         body = body.push(item(
-            icons::BLUETOOTH,
+            icons::Symbol::Bluetooth,
             if d.connected { g.accent } else { g.dim },
             if d.name.is_empty() {
                 d.address.clone()
@@ -628,7 +635,7 @@ fn level<'a>(node: &'a audio::Node, sliding: Option<(u32, f32)>, input: bool, g:
     let muted = node.muted;
     row![
         mouse_area(
-            container(icon(glyph, 15).color(if muted { g.dim } else { g.ink }))
+            container(icons::draw(glyph, 15.0, if muted { g.dim } else { g.ink }))
                 .width(28)
                 .height(ROW as f32)
                 .align_y(Vertical::Center)
@@ -643,7 +650,7 @@ fn level<'a>(node: &'a audio::Node, sliding: Option<(u32, f32)>, input: bool, g:
                     backgrounds: (Background::Color(g.accent), Background::Color(g.hover)),
                     width: 4.0,
                     border: Border {
-                        radius: 2.0.into(),
+                        radius: g.corner(2.0).into(),
                         ..Border::default()
                     },
                 },

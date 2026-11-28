@@ -15,6 +15,8 @@ pub struct State {
     name: String,
     command: String,
     remove: Option<apps::Startup>,
+    /// The entry being edited; Save replaces it instead of adding one.
+    editing: Option<apps::Startup>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +24,7 @@ pub enum Msg {
     Read(Vec<apps::Startup>),
     Toggle(usize, bool),
     Add,
+    Edit(usize),
     Name(String),
     Command(String),
     Save,
@@ -63,10 +66,24 @@ impl PageState for State {
                 );
             }
             Msg::Add => self.adding = true,
+            Msg::Edit(i) => {
+                if let Some(s) = self
+                    .list
+                    .as_ref()
+                    .and_then(|l| l.get(i))
+                    .filter(|s| s.yours)
+                {
+                    self.name = s.entry.name.clone();
+                    self.command = s.entry.exec.clone();
+                    self.editing = Some(s.clone());
+                    self.adding = true;
+                }
+            }
             Msg::Name(s) => self.name = s,
             Msg::Command(s) => self.command = s,
             Msg::CancelAdd => {
                 self.adding = false;
+                self.editing = None;
                 self.name.clear();
                 self.command.clear();
             }
@@ -79,11 +96,18 @@ impl PageState for State {
                 self.adding = false;
                 self.name.clear();
                 self.command.clear();
+                let editing = self.editing.take();
                 let ok = format!("{} starts when you log in", name.trim());
-                return job(
-                    move || apps::add_autostart(&name, &command),
-                    move |r| Msg::Done(r, ok.clone()),
-                );
+                return match editing {
+                    Some(old) => job(
+                        move || apps::update_autostart(&old, &name, &command),
+                        move |r| Msg::Done(r, ok.clone()),
+                    ),
+                    None => job(
+                        move || apps::add_autostart(&name, &command),
+                        move |r| Msg::Done(r, ok.clone()),
+                    ),
+                };
             }
             Msg::AskRemove(i) => self.remove = self.list.as_ref().and_then(|l| l.get(i)).cloned(),
             Msg::CancelRemove => self.remove = None,
@@ -126,7 +150,12 @@ impl PageState for State {
                     detail,
                     row![
                         if s.yours {
-                            ui::icon_btn(c, Icon::Trash2, Kind::Ghost, Some(Msg::AskRemove(i)))
+                            row![
+                                ui::icon_btn(c, Icon::Pencil, Kind::Ghost, Some(Msg::Edit(i))),
+                                ui::icon_btn(c, Icon::Trash2, Kind::Ghost, Some(Msg::AskRemove(i))),
+                            ]
+                            .spacing(4)
+                            .into()
                         } else {
                             ui::gap(0.0)
                         },
@@ -143,10 +172,14 @@ impl PageState for State {
         if self.adding {
             rows.push(
                 column![
-                    text("New startup command")
-                        .size(14)
-                        .font(BOLD)
-                        .color(c.text),
+                    text(if self.editing.is_some() {
+                        "Edit startup command"
+                    } else {
+                        "New startup command"
+                    })
+                    .size(14)
+                    .font(BOLD)
+                    .color(c.text),
                     ui::input(c, "Name, like Syncthing", &self.name).on_input(Msg::Name),
                     ui::input(
                         c,
@@ -161,7 +194,11 @@ impl PageState for State {
                         ui::btn(c, "Cancel", Kind::Secondary, Some(Msg::CancelAdd)),
                         ui::btn(
                             c,
-                            "Add",
+                            if self.editing.is_some() {
+                                "Save"
+                            } else {
+                                "Add"
+                            },
                             Kind::Primary,
                             (!self.name.trim().is_empty() && !self.command.trim().is_empty())
                                 .then_some(Msg::Save)

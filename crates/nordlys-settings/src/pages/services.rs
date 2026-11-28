@@ -20,6 +20,7 @@ pub struct State {
 pub enum Msg {
     Read(Result<services::Services, String>),
     Control(bool, &'static str, String),
+    AtLogin(String, bool),
     Log(bool, String),
     Logged(String, bool, Result<String, String>),
     CloseLog,
@@ -67,6 +68,18 @@ impl PageState for State {
                 };
                 job(
                     move || services::control(user, verb, &unit),
+                    move |r| Msg::Done(r, ok.clone()),
+                )
+            }
+            Msg::AtLogin(unit, on) => {
+                self.busy = Some(unit.clone());
+                let (verb, ok) = if on {
+                    ("unmask", format!("{unit} starts at login again"))
+                } else {
+                    ("mask", format!("{unit} stays off from your next login"))
+                };
+                job(
+                    move || services::control(true, verb, &unit),
                     move |r| Msg::Done(r, ok.clone()),
                 )
             }
@@ -146,6 +159,14 @@ impl PageState for State {
                             Some(Msg::Control(user, "reset-failed", name.clone())),
                         ));
                     }
+                    if user && u.optional() {
+                        let unit = name.clone();
+                        r = r
+                            .push(text("At login").size(12).color(c.muted))
+                            .push(ui::toggle(!u.masked, move |on| {
+                                Msg::AtLogin(unit.clone(), on)
+                            }));
+                    }
                     if !target {
                         if u.running() {
                             r = r
@@ -161,7 +182,7 @@ impl PageState for State {
                                     Kind::Ghost,
                                     Some(Msg::Control(user, "stop", name.clone())),
                                 ));
-                        } else {
+                        } else if !u.masked {
                             r = r.push(ui::icon_btn(
                                 c,
                                 Icon::Play,
@@ -217,7 +238,17 @@ impl PageState for State {
                 )
             }))
             .collect();
-        let mut body = column![ui::section(c, "Desktop session", session)].spacing(26);
+        let mut body = column![
+            ui::section(c, "Desktop session", session),
+            ui::note(
+                c,
+                Icon::Info,
+                c.accent,
+                "At login off keeps a service from starting next time; what's running now keeps running. \
+                 To start it by hand, turn At login back on first.",
+            ),
+        ]
+        .spacing(26);
         body = body.push(ui::section(
             c,
             "Failed",

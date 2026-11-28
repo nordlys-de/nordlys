@@ -45,6 +45,8 @@ pub struct Palette {
     pub dim: Rgb,
     pub accent: Rgb,
     pub on_accent: Rgb,
+    /// Corner radius base in pixels (see `corner`). From the config.
+    pub roundness: u8,
     /// Terminal colours 0–15.
     pub ansi: [Rgb; 16],
 }
@@ -54,6 +56,12 @@ const fn c(v: u32) -> Rgb {
 }
 
 impl Palette {
+    /// A corner radius: `base` px at the default roundness, scaled to the
+    /// configured one. Zero roundness gives square corners.
+    pub fn corner(&self, base: f32) -> f32 {
+        base * f32::from(self.roundness) / f32::from(crate::DEFAULT_ROUNDNESS)
+    }
+
     pub fn dark() -> Self {
         Self {
             dark: true,
@@ -66,6 +74,7 @@ impl Palette {
             dim: c(0x8590A0),
             accent: c(0x8AB4FF),
             on_accent: c(0x0A0D13),
+            roundness: crate::DEFAULT_ROUNDNESS,
             ansi: [
                 c(0x1B2029),
                 c(0xF28B82),
@@ -99,6 +108,7 @@ impl Palette {
             dim: c(0x5D6675),
             accent: c(0x2F5BD8),
             on_accent: c(0xFFFFFF),
+            roundness: crate::DEFAULT_ROUNDNESS,
             ansi: [
                 c(0x141821),
                 c(0xC4362B),

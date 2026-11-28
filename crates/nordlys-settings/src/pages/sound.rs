@@ -25,6 +25,9 @@ pub enum Msg {
     Release,
     Mute(u32, bool),
     Test,
+    /// Input or not, the device, and its socket.
+    Port(bool, String, audio::Choice),
+    Profile(String, audio::Choice),
     Done(Result<(), String>),
 }
 
@@ -38,6 +41,26 @@ impl std::fmt::Display for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.name)
     }
+}
+
+impl std::fmt::Display for audio::Choice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// A picker over `choices` with the one whose key is `active` chosen.
+fn picker<'a>(
+    choices: &[audio::Choice],
+    active: &str,
+    on_pick: impl Fn(audio::Choice) -> Msg + 'a,
+) -> El<'a, Msg> {
+    let chosen = choices.iter().find(|c| c.key == active).cloned();
+    pick_list(choices.to_vec(), chosen, on_pick)
+        .padding([6, 12])
+        .text_size(13)
+        .width(320)
+        .into()
 }
 
 fn devices(nodes: &[audio::Node]) -> Vec<Device> {
@@ -123,6 +146,13 @@ impl PageState for State {
                 job(move || audio::set_mute(id, muted), Msg::Done)
             }
             Msg::Test => job(audio::test_sound, Msg::Done),
+            Msg::Port(input, device, port) => job(
+                move || audio::set_port(input, &device, &port.key),
+                Msg::Done,
+            ),
+            Msg::Profile(card, profile) => {
+                job(move || audio::set_profile(&card, &profile.key), Msg::Done)
+            }
             Msg::Done(r) => {
                 if let Err(e) = r {
                     ctx.fail(e);
@@ -174,7 +204,8 @@ impl PageState for State {
                 ]
                 .spacing(2)
                 .width(Length::FillPortion(2)),
-                slider(0.0..=v.max(1.0), v, move |x| Msg::Volume(id, x))
+                // Up to 150%: a quiet source can be boosted, not only lowered.
+                slider(0.0..=1.5, v, move |x| Msg::Volume(id, x))
                     .step(0.01_f32)
                     .on_release(Msg::Release)
                     .width(Length::FillPortion(3)),
@@ -191,6 +222,21 @@ impl PageState for State {
             .align_y(Alignment::Center)
             .padding([12, 18])
             .into()
+        };
+
+        let socket_row = |ports: &'a audio::Ports, input: bool| -> El<'a, Msg> {
+            ui::setting(
+                c,
+                "Connector",
+                if input {
+                    "Which microphone on this device"
+                } else {
+                    "Speakers, headphones or another socket on this device"
+                },
+                picker(&ports.choices, &ports.active, move |p| {
+                    Msg::Port(input, ports.device.clone(), p)
+                }),
+            )
         };
 
         let mut out = vec![];
@@ -212,6 +258,9 @@ impl PageState for State {
                     .text_size(13)
                     .width(320),
                 ));
+                if let Some(p) = &d.output_ports {
+                    out.push(socket_row(p, false));
+                }
                 out.push(volume_row(
                     sink,
                     "Volume".into(),
@@ -251,6 +300,9 @@ impl PageState for State {
                     .text_size(13)
                     .width(320),
                 ));
+                if let Some(p) = &d.input_ports {
+                    inp.push(socket_row(p, true));
+                }
                 inp.push(volume_row(
                     src,
                     "Input level".into(),
@@ -285,12 +337,33 @@ impl PageState for State {
                 })
                 .collect()
         };
-        column![
+        let mut body = column![
             ui::section(c, "Output", out),
             ui::section(c, "Input", inp),
             ui::section(c, "Apps", apps),
         ]
-        .spacing(26)
-        .into()
+        .spacing(26);
+        if !d.cards.is_empty() {
+            let cards = d
+                .cards
+                .iter()
+                .map(|card| {
+                    ui::setting(
+                        c,
+                        card.label.clone(),
+                        if card.name.starts_with("bluez_card") {
+                            "Mode: headsets have one for music and one for calls"
+                        } else {
+                            "Mode: which outputs and inputs it offers"
+                        },
+                        picker(&card.profiles, &card.active, move |p| {
+                            Msg::Profile(card.name.clone(), p)
+                        }),
+                    )
+                })
+                .collect();
+            body = body.push(ui::section(c, "Sound cards", cards));
+        }
+        body.into()
     }
 }

@@ -20,15 +20,17 @@ mod blur;
 mod comp;
 mod cursor;
 mod layout;
+mod outputs;
 mod preview;
 mod render;
+mod screencopy;
 mod tty;
 mod winit;
 mod xwayland;
 
 use nordlys_config::Config;
 use nordlys_ipc::{Request, Response, ScreenState, StageState, WorkspaceState};
-use nordlys_stage::{Desk, Home};
+use nordlys_stage::Desk;
 use smithay::reexports::calloop::channel::Sender;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -161,8 +163,8 @@ impl State {
             Request::Open { .. } if self.live => {
                 Err("windows open themselves here; start the app instead".into())
             }
-            Request::Open { id, ambient } => {
-                d.open(id, if ambient { Home::Ambient } else { Home::Shelf });
+            Request::Open { id } => {
+                d.open(id);
                 Ok(After::Answer)
             }
             // The window goes when its app has closed it.
@@ -211,7 +213,7 @@ impl State {
                         self.desk.bring(app);
                     } else {
                         let id = self.fresh_id(app);
-                        self.desk.open(id, Home::Shelf);
+                        self.desk.open(id);
                     }
                 }
                 Ok(After::Answer)
@@ -662,7 +664,7 @@ mod tests {
     #[test]
     fn live_close_asks_the_app_and_keeps_the_window_until_it_goes() {
         let mut s = live();
-        s.desk.open("foot".into(), Home::Shelf);
+        s.desk.open("foot".into());
         let st = ok(&mut s, r#"{"cmd":"close","id":"foot"}"#);
         assert_eq!(st.main.as_deref(), Some("foot"));
         assert_eq!(s.effects, [Effect::Close("foot".into())]);
@@ -675,7 +677,7 @@ mod tests {
     #[test]
     fn live_groups_start_apps_on_an_empty_workspace() {
         let mut s = live();
-        s.desk.open("foot".into(), Home::Shelf);
+        s.desk.open("foot".into());
         let st = ok(&mut s, r#"{"cmd":"group","name":"d"}"#);
         assert_eq!(st.workspace, 2);
         let cmds: Vec<_> = s
@@ -703,8 +705,8 @@ mod tests {
     #[test]
     fn running_matches_numbered_copies_only() {
         let mut s = state();
-        s.desk.open("foot#2".into(), Home::Shelf);
-        s.desk.open("footbar".into(), Home::Shelf);
+        s.desk.open("foot#2".into());
+        s.desk.open("footbar".into());
         assert_eq!(s.running("foot").as_deref(), Some("foot#2"));
         assert_eq!(s.running("helix"), None);
     }

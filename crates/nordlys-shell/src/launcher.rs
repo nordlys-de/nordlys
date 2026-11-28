@@ -493,6 +493,8 @@ fn result_row(i: usize, it: &Item, selected: bool, g: Look) -> Element<'static, 
 /// The coloured letter tile used for apps; commands and files get an icon.
 fn tile(it: &Item, size: f32, g: Look) -> Element<'static, Message> {
     let (bg, fg) = match it.kind {
+        // Real icons carry their own colours, so they sit on no tint.
+        Kind::App if it.art.is_some() => (Color::TRANSPARENT, g.text),
         Kind::App => (
             Color {
                 a: 0.24,
@@ -503,9 +505,10 @@ fn tile(it: &Item, size: f32, g: Look) -> Element<'static, Message> {
         Kind::Command => (g.accent_soft, g.accent),
         Kind::File | Kind::Clip => (g.chip, g.muted),
     };
-    let face: Element<'static, Message> = match it.icon {
-        Some(glyph) => icon(glyph, size * 0.46).color(fg).into(),
-        None => text(
+    let face: Element<'static, Message> = match (&it.art, it.icon) {
+        (Some(path), _) => crate::ui::app_art(path, size * 0.9),
+        (None, Some(glyph)) => icon(glyph, size * 0.46).color(fg).into(),
+        (None, None) => text(
             it.name
                 .chars()
                 .next()

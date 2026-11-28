@@ -91,7 +91,7 @@ impl Page {
             Page::Sound => "Outputs, inputs and the apps playing right now.",
             Page::Displays => "Resolution, refresh rate, scale, arrangement and brightness.",
             Page::Power => "Battery, power mode and turning off.",
-            Page::DateTime => "Time zone, network time and language.",
+            Page::DateTime => "Time zone, network time, the top bar's clock and language.",
             Page::DefaultApps => "Which app opens links, folders, pictures and more.",
             Page::Startup => "Apps that start when you log in.",
             Page::Services => "The pieces of the Nordlys session and anything failing.",
@@ -148,13 +148,15 @@ impl Page {
     fn keywords(self) -> &'static str {
         match self {
             Page::Appearance => {
-                "theme dark light mode accent colour color blur glass transparency motion wallpaper background gtk qt"
+                "theme dark light mode accent colour color blur glass transparency motion wallpaper background gtk qt text size font scale roundness corners top bar topbar gap gaps screen edge shelf sides hide widgets clock tray battery bluetooth network sound"
             }
             Page::Windows => {
-                "stage shelf layout two-up tiled monocle split gaps border rounding corners animations shadow dim opacity ultrawide rails peek"
+                "stage shelf hide show layout two-up tiled monocle split gaps border rounding corners animations shadow dim opacity ultrawide rails peek"
             }
             Page::Groups => "groups apps workspace super g launch",
-            Page::Notifications => "do not disturb dnd toasts history clear dunst",
+            Page::Notifications => {
+                "do not disturb dnd toasts history clear dunst position corner duration timeout"
+            }
             Page::LockIdle => {
                 "lock screen idle dim timeout suspend sleep screen off hypridle password pam"
             }
@@ -162,23 +164,29 @@ impl Page {
                 "layout keymap language repeat delay rate numlock shortcuts keys bindings caps"
             }
             Page::Mouse => {
-                "pointer cursor speed sensitivity acceleration scroll natural touchpad tap click left handed focus"
+                "pointer cursor speed sensitivity acceleration scroll natural touchpad tap click left handed focus drag middle"
             }
             Page::Network => {
-                "wifi wi-fi wireless ethernet wired vpn airplane hostname ip dns connection"
+                "wifi wi-fi wireless hidden network join ethernet wired vpn airplane hostname ip dns connection static hotspot enterprise advanced editor"
             }
             Page::Bluetooth => "pair devices headphones speaker mouse keyboard",
-            Page::Sound => "audio volume output input microphone speakers headphones mute pipewire",
+            Page::Sound => {
+                "audio volume boost louder output input microphone speakers headphones mute pipewire connector port profile sound card hdmi"
+            }
             Page::Displays => {
                 "monitor screen resolution refresh rate scale hidpi rotate arrangement brightness night light vrr"
             }
             Page::Power => {
-                "battery power profile performance saver suspend hibernate restart shut down log out"
+                "battery power profile performance saver suspend hibernate restart shut down log out lid close button low battery warning"
             }
-            Page::DateTime => "time zone timezone clock ntp locale language region",
+            Page::DateTime => {
+                "time zone timezone clock ntp locale language region 12 24 hour seconds date"
+            }
             Page::DefaultApps => "browser email files mime open with default",
             Page::Startup => "autostart login startup",
-            Page::Services => "systemd units restart logs journal failed bar shelf ambient",
+            Page::Services => {
+                "start at login enable disable systemd units restart logs journal failed bar shelf"
+            }
             Page::Advanced => "config files reset reload hyprland lua toml edit",
             Page::About => "system info cpu memory gpu disk kernel version hostname",
         }

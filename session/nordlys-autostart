@@ -13,7 +13,8 @@ if command -v systemctl >/dev/null && systemctl --user cat nordlys-session.targe
     systemctl --user --no-block start nordlys-session.target
 else
     # No systemd user session: start the pieces by hand (no restarts).
-    for piece in notify bar shelf ambient close-button; do
+    command -v cliphist >/dev/null && wl-paste --watch cliphist store &
+    for piece in notify bar shelf close-button; do
         nordlys-shell "$piece" &
     done
     command -v swaybg >/dev/null && swaybg -m fill -i "${NORDLYS_DATA:-/usr/share/nordlys}/wallpaper.jpg" &
@@ -21,7 +22,7 @@ else
 fi
 
 # Palette into the apps' config, and the usual home folders.
-nordlys-theme --quiet &
+nordlys-theme --quiet --watch &
 command -v xdg-user-dirs-update >/dev/null && xdg-user-dirs-update &
 
 # Something to answer "enter your password" prompts from apps.

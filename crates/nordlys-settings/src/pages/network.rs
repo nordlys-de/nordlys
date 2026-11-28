@@ -18,6 +18,15 @@ pub struct State {
     forget: Option<(String, String)>,
     hostname: String,
     unavailable: Option<String>,
+    /// Joining a network that doesn't show in the list.
+    hidden: Option<Hidden>,
+}
+
+#[derive(Default)]
+struct Hidden {
+    ssid: String,
+    password: String,
+    shown: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +51,13 @@ pub enum Msg {
     Autoconnect(String, bool),
     Hostname(String),
     SaveHostname,
+    OpenEditor,
+    AskHidden,
+    HiddenSsid(String),
+    HiddenPassword(String),
+    HiddenShow,
+    CancelHidden,
+    JoinHidden,
     Done(Result<(), String>, &'static str),
 }
 
@@ -216,6 +232,49 @@ impl PageState for State {
                     |r| Msg::Done(r, "Computer name changed"),
                 );
             }
+            Msg::OpenEditor => {
+                let opened = sys::spawn("nm-connection-editor", &[]);
+                ctx.report(&opened, "Opening the connection editor");
+            }
+            Msg::AskHidden => self.hidden = Some(Hidden::default()),
+            Msg::HiddenSsid(s) => {
+                if let Some(h) = self.hidden.as_mut() {
+                    h.ssid = s;
+                }
+            }
+            Msg::HiddenPassword(p) => {
+                if let Some(h) = self.hidden.as_mut() {
+                    h.password = p;
+                }
+            }
+            Msg::HiddenShow => {
+                if let Some(h) = self.hidden.as_mut() {
+                    h.shown = !h.shown;
+                }
+            }
+            Msg::CancelHidden => self.hidden = None,
+            Msg::JoinHidden => {
+                let Some(h) = self.hidden.as_ref() else {
+                    return Task::none();
+                };
+                let ssid = h.ssid.trim().to_owned();
+                let pw = h.password.clone();
+                if ssid.is_empty() {
+                    ctx.fail("Type the network's name");
+                    return Task::none();
+                }
+                if !pw.is_empty() && pw.len() < 8 {
+                    ctx.fail("Wi-Fi passwords are at least 8 characters");
+                    return Task::none();
+                }
+                self.hidden = None;
+                self.connecting = Some(ssid.clone());
+                let password = (!pw.is_empty()).then_some(pw);
+                return job(
+                    move || network::connect_hidden(&ssid, password.as_deref()),
+                    Msg::Connected,
+                );
+            }
             Msg::Done(r, ok) => {
                 ctx.report(&r, ok);
                 return self.read();
@@ -320,7 +379,10 @@ impl PageState for State {
         if d.wifi_enabled {
             wifi.push(ui::setting(
                 c,
-                format!("{} networks nearby", d.access_points.len()),
+                match d.access_points.len() {
+                    1 => "1 network nearby".to_owned(),
+                    n => format!("{n} networks nearby"),
+                },
                 "",
                 ui::icon_text_btn(
                     c,
@@ -394,6 +456,20 @@ impl PageState for State {
                 );
             }
         }
+        if d.wifi_enabled {
+            wifi.push(ui::setting(
+                c,
+                "Hidden network",
+                "Join one that doesn't show up in the list",
+                ui::icon_text_btn(
+                    c,
+                    Icon::Plus,
+                    "Join",
+                    Kind::Secondary,
+                    (self.connecting.is_none()).then_some(Msg::AskHidden),
+                ),
+            ));
+        }
         body = body.push(ui::section(c, "Wi-Fi", wifi));
 
         let saved: Vec<El<'a, Msg>> = if d.saved.is_empty() {
@@ -466,9 +542,20 @@ impl PageState for State {
                 .spacing(8),
             )],
         ));
-        if !sys::has("nm-connection-editor") {
+        if sys::has("nm-connection-editor") {
+            body = body.push(ui::section(
+                c,
+                "Advanced",
+                vec![ui::setting(
+                    c,
+                    "Connection editor",
+                    "Fixed IP address, DNS servers, VPNs, hotspots and enterprise Wi-Fi",
+                    ui::btn(c, "Open", Kind::Secondary, Some(Msg::OpenEditor)),
+                )],
+            ));
+        } else {
             body = body.push(
-                text("VPNs and enterprise Wi-Fi: set them up with nmcli or nm-connection-editor; they show up here once saved.")
+                text("For a fixed IP address, VPNs or enterprise Wi-Fi, install nm-connection-editor or use nmcli. Saved connections show up here.")
                     .size(12)
                     .color(c.dim),
             );
@@ -494,6 +581,55 @@ impl PageState for State {
                         ui::btn(c, "Forget", Kind::Danger, Some(Msg::Forget)),
                     ]
                     .spacing(8)
+                ]
+                .spacing(14)
+                .into(),
+            );
+        }
+        if let Some(h) = &self.hidden {
+            return Some(
+                column![
+                    row![
+                        crate::icons::icon(Icon::Wifi, 20.0, c.accent),
+                        text("Join a hidden network")
+                            .size(18)
+                            .font(BOLD)
+                            .color(c.text)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    text("Its name isn't broadcast, so type it exactly. The password is optional.")
+                        .size(13)
+                        .color(c.muted),
+                    ui::input(c, "Network name", &h.ssid)
+                        .on_input(Msg::HiddenSsid)
+                        .on_submit(Msg::JoinHidden)
+                        .width(Length::Fill),
+                    row![
+                        ui::input(c, "Password, if it has one", &h.password)
+                            .secure(!h.shown)
+                            .on_input(Msg::HiddenPassword)
+                            .on_submit(Msg::JoinHidden)
+                            .width(Length::Fill),
+                        ui::icon_btn(
+                            c,
+                            if h.shown { Icon::EyeOff } else { Icon::Eye },
+                            Kind::Secondary,
+                            Some(Msg::HiddenShow)
+                        ),
+                    ]
+                    .spacing(8),
+                    row![
+                        ui::fill(),
+                        ui::btn(c, "Cancel", Kind::Secondary, Some(Msg::CancelHidden)),
+                        ui::btn(
+                            c,
+                            "Join",
+                            Kind::Primary,
+                            (!h.ssid.trim().is_empty()).then_some(Msg::JoinHidden)
+                        ),
+                    ]
+                    .spacing(8),
                 ]
                 .spacing(14)
                 .into(),

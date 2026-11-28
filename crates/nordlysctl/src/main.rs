@@ -20,7 +20,7 @@ usage: nordlysctl [--json] <command>
   move-to <n> [id]       Super Shift 1-9 - the main window, or id
   focus-screen <name>    Super Ctrl Left/Right - eDP-1, DP-2…
   group <name|key>       Super G  - launch an app group
-  open <id> [--ambient]  register a window (testing)
+  open <id>              register a window (testing)
   close <id>
   reload                 re-read nordlys.toml
   screenshot <file.png>  save what nordlys-comp shows
@@ -72,7 +72,6 @@ fn parse(args: &[String]) -> Result<Request, String> {
         }
         "open" => Request::Open {
             id: arg(1, "a window id")?,
-            ambient: args.iter().any(|a| a == "--ambient"),
         },
         "close" => Request::Close {
             id: arg(1, "a window id")?,
@@ -222,6 +221,10 @@ fn show(line: &str, json: bool) -> ExitCode {
 }
 
 #[cfg(test)]
+#[path = "main_tests.rs"]
+mod main_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -239,13 +242,7 @@ mod tests {
                 name: "Nordlys dev".into()
             }
         );
-        assert_eq!(
-            p("open chat --ambient").unwrap(),
-            Request::Open {
-                id: "chat".into(),
-                ambient: true
-            }
-        );
+        assert_eq!(p("open chat").unwrap(), Request::Open { id: "chat".into() });
         assert_eq!(p("workspace 3").unwrap(), Request::Workspace { n: 3 });
         assert_eq!(
             p("move-to 2 foot").unwrap(),

@@ -84,6 +84,8 @@ pub struct Lock {
     shake: Option<Instant>,
     caps: bool,
     since: String,
+    /// 12 or 24 hour, from `[clock]`.
+    time_format: &'static str,
     clock: String,
     date: String,
     battery: Option<Battery>,
@@ -114,6 +116,7 @@ impl Lock {
             }
             hidden = n.waiting;
         }
+        let time_format = config.clock.time_format(false);
         let mut me = Self {
             palette: config.palette(),
             login,
@@ -123,7 +126,8 @@ impl Lock {
             status: Status::Idle,
             shake: None,
             caps: false,
-            since: chrono::Local::now().format("%H:%M").to_string(),
+            since: chrono::Local::now().format(time_format).to_string(),
+            time_format,
             clock: String::new(),
             date: String::new(),
             battery: None,
@@ -140,7 +144,7 @@ impl Lock {
 
     fn tick(&mut self) {
         let now = chrono::Local::now();
-        self.clock = now.format("%H:%M").to_string();
+        self.clock = now.format(self.time_format).to_string();
         self.date = now.format("%A, %-d %B").to_string();
         self.battery = sources::battery();
         if !self.preview && self.ticks.is_multiple_of(5) {
@@ -281,7 +285,7 @@ impl Lock {
         if let Some(b) = self.battery {
             top = top.push(
                 row![
-                    icon(icons::battery(b.percent, b.charging), 16).color(look.muted),
+                    icons::symbol(icons::battery(b.percent, b.charging), 16.0, look.muted),
                     text(format!("{}%", b.percent))
                         .font(INTER)
                         .size(13)
@@ -318,7 +322,7 @@ impl Lock {
             clock = clock.push(Space::new().height(16)).push(
                 container(
                     row![
-                        icon(icons::BELL_OFF, 14).color(look.muted),
+                        icons::symbol(icons::Symbol::BellOff, 14.0, look.muted),
                         text(label).font(INTER).size(13).color(look.muted)
                     ]
                     .spacing(8)

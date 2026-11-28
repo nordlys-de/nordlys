@@ -2,9 +2,10 @@
 
 use crate::bar::{INTER_SEMIBOLD, MONO, color};
 use iced::gradient::Linear;
-use iced::widget::{container, text};
+use iced::widget::{container, image, svg, text};
 use iced::{Background, Border, Color, Element, Radians};
 use nordlys_config::{Palette, Rgb};
+use std::path::Path;
 
 /// Tile tints from the canvas, picked by name so an app keeps its colour.
 const TINTS: [u32; 7] = [
@@ -18,10 +19,27 @@ pub fn tint(name: &str) -> Color {
     color(Rgb::hex_u32(TINTS[h % TINTS.len()]))
 }
 
+/// An app's icon file, drawn square at `size`: SVG as vector, anything else as a bitmap.
+pub fn app_art<'a, M: 'a>(path: &Path, size: f32) -> Element<'a, M> {
+    if path.extension().is_some_and(|e| e == "svg") {
+        svg(svg::Handle::from_path(path))
+            .width(size)
+            .height(size)
+            .into()
+    } else {
+        image(image::Handle::from_path(path))
+            .width(size)
+            .height(size)
+            .into()
+    }
+}
+
 /// Glass colours for rails and pull-out panels.
 #[derive(Clone, Copy)]
 pub struct Rail {
     pub rail: Color,
+    /// Multiplies a corner radius drawn at the default roundness (see `corner`).
+    scale: f32,
     pub rail_border: Color,
     pub panel: Color,
     pub chip: Color,
@@ -35,8 +53,14 @@ pub struct Rail {
 }
 
 impl Rail {
+    /// A corner radius: `base` px at the default roundness, scaled to the setting.
+    pub fn corner(&self, base: f32) -> f32 {
+        base * self.scale
+    }
+
     pub fn of(p: &Palette) -> Self {
         let base = Rail {
+            scale: p.corner(1.0),
             rail: Color::from_rgba8(18, 22, 30, 0.50),
             rail_border: Color::from_rgba8(255, 255, 255, 0.09),
             panel: Color::from_rgba8(24, 28, 38, 0.82),

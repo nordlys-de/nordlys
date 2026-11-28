@@ -26,21 +26,43 @@ use crate::render;
 use crate::{Effect, Shared, State, blur, cursor, lock, preview, xwayland};
 use nordlys_config::{Config, Rgb};
 use nordlys_ipc::{Request, Response};
-use nordlys_stage::Home;
 use smithay::backend::allocator::Format;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
+    AbsolutePositionEvent, GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
     KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::element::solid::SolidColorBuffer;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{
-    LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output,
+    LayerMap, LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
+    layer_map_for_output,
 };
 use smithay::input::keyboard::{FilterResult, Keycode, ModifiersState, XkbConfig, keysyms};
-use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent};
+use smithay::input::pointer::{
+    self as gesture,
+    AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle, RelativeMotionEvent,
+};
+use smithay::wayland::input_method::{
+    InputMethodHandler, InputMethodManagerState, PopupSurface as ImePopupSurface,
+};
+use smithay::wayland::keyboard_shortcuts_inhibit::{
+    KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
+    KeyboardShortcutsInhibitorSeat,
+};
+use smithay::wayland::pointer_constraints::{
+    PointerConstraint, PointerConstraintsHandler, PointerConstraintsState, with_pointer_constraint,
+};
+use smithay::wayland::foreign_toplevel_list::{
+    ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+};
+use smithay::wayland::pointer_gestures::PointerGesturesState;
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
+use smithay::wayland::xdg_foreign::{XdgForeignHandler, XdgForeignState};
+use smithay::wayland::text_input::TextInputManagerState;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::channel::{self, Channel};
@@ -67,9 +89,16 @@ use smithay::wayland::dmabuf::{
     DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
 };
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::ext_data_control::{
+    DataControlHandler as ExtDataControlHandler, DataControlState as ExtDataControlState,
+};
+use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
     set_data_device_focus,
@@ -93,10 +122,10 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_idle_inhibit,
-    delegate_idle_notify, delegate_layer_shell, delegate_output, delegate_primary_selection,
+    delegate_compositor, delegate_data_control, delegate_data_device, delegate_ext_data_control, delegate_dmabuf, delegate_idle_inhibit,
+    delegate_foreign_toplevel_list, delegate_idle_notify, delegate_pointer_gestures, delegate_single_pixel_buffer, delegate_virtual_keyboard_manager, delegate_xdg_foreign, delegate_input_method_manager, delegate_keyboard_shortcuts_inhibit, delegate_pointer_constraints, delegate_relative_pointer, delegate_text_input_manager, delegate_layer_shell, delegate_output, delegate_primary_selection,
     delegate_seat, delegate_session_lock, delegate_shm, delegate_viewporter,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -105,9 +134,10 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The slowest frame rate: what keeps clients (and screenshots) going
-/// while nothing asks for frames.
-const IDLE_FRAME: Duration = Duration::from_millis(250);
+/// The slowest frame rate: a safety net that keeps clients going if a
+/// frame they wait for was ever missed. Changes ask for frames of their
+/// own, so this is rare: each one wakes the GPU on an idle desktop.
+const IDLE_FRAME: Duration = Duration::from_secs(1);
 
 /// The accent ring around the window that has the keyboard, in two-up.
 const RING: i32 = 2;
@@ -151,6 +181,10 @@ pub enum Action {
     /// Served exactly like the same request from a client.
     Ipc(Request),
     CloseFocused,
+    /// Fullscreen on or off for the window with the keyboard.
+    ToggleFullscreen,
+    /// The focused app had the Nordlys keys (a VM, say): give them back.
+    RestoreShortcuts,
     MoveFocused(u32),
     WorkspaceBy(i32),
     FocusMain,
@@ -177,6 +211,13 @@ const EDITOR: &str = "for p in \"$NORDLYS_EDITOR\" gnome-text-editor kate code z
 const FILES: &str = "for p in \"$NORDLYS_FILES\" nautilus thunar nemo dolphin; do command -v \"$p\" >/dev/null && exec \"$p\"; done";
 const BROWSER: &str = "for p in \"$BROWSER\" firefox chromium zen-browser librewolf brave; do command -v \"$p\" >/dev/null && exec \"$p\"; done";
 const LOCK: &str = "exec nordlys-shell lock";
+const CLIPBOARD: &str = "exec nordlys-shell launcher --query '# '";
+const WELCOME: &str = "exec nordlys-shell welcome";
+const RECORD_REGION: &str = "exec nordlys-record region";
+const RECORD_SCREEN: &str = "exec nordlys-record screen";
+/// A region to the clipboard. grim and slurp come through screencopy
+/// and layer-shell, as on the Hyprland session.
+const REGION_TO_CLIPBOARD: &str = "r=\"$(slurp)\" && grim -g \"$r\" - | wl-copy";
 const SCREENSHOT: &str = "d=\"$(xdg-user-dir PICTURES 2>/dev/null || echo \"$HOME/Pictures\")/Screenshots\"; mkdir -p \"$d\"; exec nordlysctl screenshot \"$d/$(date +%Y-%m-%d_%H-%M-%S).png\"";
 
 /// The Nordlys key bindings (the Nordlys key is already held). `sym` is
@@ -204,10 +245,16 @@ fn binding(shift: bool, ctrl: bool, sym: u32) -> Option<Action> {
         (false, keysyms::KEY_Tab) => ipc(Request::Swap),
         (false, keysyms::KEY_s) => ipc(Request::SendToShelf),
         (false, keysyms::KEY_q) => Some(CloseFocused),
+        (true, keysyms::KEY_f) => Some(ToggleFullscreen),
         (false, keysyms::KEY_e) => Some(Spawn(EDITOR)),
         (false, keysyms::KEY_n) => Some(Spawn(FILES)),
         (false, keysyms::KEY_b) => Some(Spawn(BROWSER)),
         (false, keysyms::KEY_comma) => Some(Settings),
+        (false, keysyms::KEY_v) => Some(Spawn(CLIPBOARD)),
+        (false, keysyms::KEY_F1) => Some(Spawn(WELCOME)),
+        (false, keysyms::KEY_r) => Some(Spawn(RECORD_REGION)),
+        (true, keysyms::KEY_r) => Some(Spawn(RECORD_SCREEN)),
+        (true, keysyms::KEY_s) => Some(Spawn(REGION_TO_CLIPBOARD)),
         (false, keysyms::KEY_l | keysyms::KEY_Escape) => Some(Spawn(LOCK)),
         (false, keysyms::KEY_bracketleft) => Some(WorkspaceBy(-1)),
         (false, keysyms::KEY_bracketright) => Some(WorkspaceBy(1)),
@@ -328,10 +375,20 @@ pub struct Comp {
     suppressed: Vec<Keycode>,
     /// Where to save the next frame.
     pub shots: Vec<PathBuf>,
+    /// Screencopy frames waiting for their screen's next frame.
+    pub copies: Vec<crate::screencopy::Pending>,
+    /// wlr-randr, kanshi and the like, and what they were last told.
+    pub output_managers: crate::outputs::Managers,
     /// When the last frame was drawn.
     pub last_frame: Instant,
     /// Surfaces asking the screen to stay awake (video players).
     inhibitors: Vec<WlSurface>,
+    /// Windows that asked to be fullscreen, by id. Each fills its screen
+    /// while it's on stage there.
+    fullscreen: Vec<String>,
+    /// Screens a fullscreen window covers at the last layout: the bar and
+    /// shelf (the top layer) aren't drawn or clickable there.
+    covered: Vec<String>,
 
     pub shared: Shared,
 
@@ -347,9 +404,33 @@ pub struct Comp {
     seat_state: SeatState<Comp>,
     data_device_state: DataDeviceState,
     primary_selection_state: PrimarySelectionState,
+    /// Clipboard managers (cliphist through `wl-paste --watch`) read and
+    /// set the selection through these; neither is ever offered a focus.
+    data_control_state: DataControlState,
+    ext_data_control_state: ExtDataControlState,
     lock_state: SessionLockManagerState,
     idle_state: IdleNotifierState<Comp>,
     _idle_inhibit_state: IdleInhibitManagerState,
+    /// Games and 3D apps lock or confine the pointer and read raw motion.
+    _pointer_constraints_state: PointerConstraintsState,
+    _relative_pointer_state: RelativePointerManagerState,
+    /// A VM or remote desktop takes the Nordlys keys while it has the
+    /// keyboard; Super+Escape gives them back.
+    shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
+    /// Input methods (fcitx5, ibus) for the apps' text fields.
+    _text_input_state: TextInputManagerState,
+    _input_method_state: InputMethodManagerState,
+    /// Touchpad swipes and pinches, for apps that zoom or go back with them.
+    _gestures_state: PointerGesturesState,
+    /// On-screen keyboards and wtype.
+    _virtual_keyboard_state: VirtualKeyboardManagerState,
+    _single_pixel_state: SinglePixelBufferState,
+    /// Portal dialogs (file pickers) parented to the app that asked.
+    xdg_foreign_state: XdgForeignState,
+    /// The open windows, for taskbars and switchers that aren't ours.
+    toplevel_list_state: ForeignToplevelListState,
+    toplevel_handles: Vec<(WlSurface, ForeignToplevelHandle)>,
+    activation_state: XdgActivationState,
     pub seat: Seat<Comp>,
 }
 
@@ -375,6 +456,9 @@ pub fn run(
     let mut event_loop: EventLoop<'static, Comp> = EventLoop::try_new()?;
     let display: Display<Comp> = Display::new()?;
     let dh = display.handle();
+    let primary_selection_state = PrimarySelectionState::new::<Comp>(&dh);
+    crate::screencopy::init(&dh);
+    crate::outputs::init(&dh);
 
     let socket = ListeningSocketSource::new_auto()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
@@ -469,8 +553,12 @@ pub fn run(
         lock: Lock::Unlocked,
         suppressed: Vec::new(),
         shots: Vec::new(),
+        copies: Vec::new(),
+        output_managers: Default::default(),
         last_frame: Instant::now(),
         inhibitors: Vec::new(),
+        fullscreen: Vec::new(),
+        covered: Vec::new(),
         shared,
         compositor_state: CompositorState::new::<Comp>(&dh),
         xdg_shell_state: XdgShellState::new::<Comp>(&dh),
@@ -483,10 +571,32 @@ pub fn run(
         _viewporter_state: ViewporterState::new::<Comp>(&dh),
         seat_state,
         data_device_state: DataDeviceState::new::<Comp>(&dh),
-        primary_selection_state: PrimarySelectionState::new::<Comp>(&dh),
+        data_control_state: DataControlState::new::<Comp, _>(
+            &dh,
+            Some(&primary_selection_state),
+            |_| true,
+        ),
+        ext_data_control_state: ExtDataControlState::new::<Comp, _>(
+            &dh,
+            Some(&primary_selection_state),
+            |_| true,
+        ),
+        primary_selection_state,
         lock_state: SessionLockManagerState::new::<Comp, _>(&dh, |_| true),
         idle_state: IdleNotifierState::new(&dh, handle.clone()),
         _idle_inhibit_state: IdleInhibitManagerState::new::<Comp>(&dh),
+        _pointer_constraints_state: PointerConstraintsState::new::<Comp>(&dh),
+        _relative_pointer_state: RelativePointerManagerState::new::<Comp>(&dh),
+        shortcuts_inhibit_state: KeyboardShortcutsInhibitState::new::<Comp>(&dh),
+        _text_input_state: TextInputManagerState::new::<Comp>(&dh),
+        _input_method_state: InputMethodManagerState::new::<Comp, _>(&dh, |_| true),
+        _gestures_state: PointerGesturesState::new::<Comp>(&dh),
+        _virtual_keyboard_state: VirtualKeyboardManagerState::new::<Comp, _>(&dh, |_| true),
+        _single_pixel_state: SinglePixelBufferState::new::<Comp>(&dh),
+        xdg_foreign_state: XdgForeignState::new::<Comp>(&dh),
+        toplevel_list_state: ForeignToplevelListState::new::<Comp>(&dh),
+        toplevel_handles: Vec::new(),
+        activation_state: XdgActivationState::new::<Comp>(&dh),
         seat,
     };
 
@@ -565,6 +675,22 @@ pub fn run(
     drop(UnixStream::connect(&ipc_path));
     let _ = std::fs::remove_file(&ipc_path);
     Ok(())
+}
+
+/// A toplevel's title and full app id, as the app set them.
+fn names(t: &ToplevelSurface) -> (String, String) {
+    with_states(t.wl_surface(), |s| {
+        s.data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|d| {
+                let d = d.lock().ok()?;
+                Some((
+                    d.title.clone().unwrap_or_default(),
+                    d.app_id.clone().unwrap_or_default(),
+                ))
+            })
+            .unwrap_or_default()
+    })
 }
 
 pub fn app_id(t: &ToplevelSurface) -> String {
@@ -673,6 +799,22 @@ impl Comp {
             }
         }
         self.relayout();
+        crate::outputs::refresh(self);
+    }
+
+    /// Change the screens as a client asked (wlr-output-management): the
+    /// backend switches modes; then everything is laid out again.
+    pub fn configure_outputs(&mut self, changes: &[crate::outputs::Change]) -> Result<(), String> {
+        let result = match &mut self.backend {
+            Backend::Tty(t) => t.configure(changes),
+            Backend::Winit(_) => crate::winit::configure(changes),
+            Backend::Taken => Err("busy".into()),
+        };
+        result?;
+        let outputs = self.outputs.clone();
+        self.set_outputs(outputs);
+        self.request_redraw();
+        Ok(())
     }
 
     /// The screens now connected, sized and placed (hotplug). Screens
@@ -850,6 +992,7 @@ impl Comp {
         self.areas = self.stage_areas();
         // (window, frame, screen)
         let mut visible: Vec<(String, Rect, String)> = Vec::new();
+        let mut covered: Vec<String> = Vec::new();
         for (screen, main, side) in screens {
             let Some(area) = self
                 .areas
@@ -859,10 +1002,26 @@ impl Comp {
             else {
                 continue;
             };
+            let full = [main.as_ref(), side.as_ref()]
+                .into_iter()
+                .flatten()
+                .find(|id| self.fullscreen.contains(id))
+                .cloned();
+            let whole = self
+                .output_named(&screen)
+                .and_then(|o| self.space.output_geometry(o));
+            if let (Some(id), Some(g)) = (full, whole) {
+                // Only the fullscreen window shows; the other waits behind it.
+                let r = Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h);
+                visible.push((id, r, screen.clone()));
+                covered.push(screen);
+                continue;
+            }
             let (main_r, side_r) = layout::arrange(area, layout, split, side.is_some());
             visible.extend(main.map(|m| (m, main_r, screen.clone())));
             visible.extend(side.zip(side_r).map(|(s, r)| (s, r, screen.clone())));
         }
+        self.covered = covered;
         // The keyboard stays on the focused screen.
         let on_focused = |id: &str| {
             visible
@@ -879,7 +1038,12 @@ impl Comp {
         for (id, w) in &self.windows {
             let Some(t) = w.toplevel() else { continue };
             match visible.iter().find(|(v, _, _)| v == id) {
-                Some((_, r, _)) => {
+                Some((_, r, screen)) => {
+                    let full = self.covered.contains(screen) && self.fullscreen.contains(id);
+                    let wl_output = self
+                        .output_named(screen)
+                        .filter(|_| full)
+                        .and_then(|o| o.client_outputs(&t.wl_surface().client()?).next());
                     t.with_pending_state(|s| {
                         s.size = Some((r.w, r.h).into());
                         for tiled in [
@@ -888,8 +1052,18 @@ impl Comp {
                             xdg_toplevel::State::TiledTop,
                             xdg_toplevel::State::TiledBottom,
                         ] {
-                            s.states.set(tiled);
+                            if full {
+                                s.states.unset(tiled);
+                            } else {
+                                s.states.set(tiled);
+                            }
                         }
+                        if full {
+                            s.states.set(xdg_toplevel::State::Fullscreen);
+                        } else {
+                            s.states.unset(xdg_toplevel::State::Fullscreen);
+                        }
+                        s.fullscreen_output = wl_output;
                     });
                     w.set_activated(self.focus.as_deref() == Some(id));
                     if t.is_initial_configure_sent() {
@@ -996,9 +1170,14 @@ impl Comp {
             let app = app_id(&t);
             let id = self.shared.change(|s| {
                 let id = s.fresh_id(&app);
-                s.desk.open(id.clone(), Home::Shelf);
+                s.desk.open(id.clone());
                 id
             });
+            let wants_full =
+                t.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Fullscreen));
+            if wants_full {
+                self.fullscreen.push(id.clone());
+            }
             self.focus = Some(id.clone());
             self.windows.push((id, w));
         }
@@ -1056,6 +1235,16 @@ impl Comp {
                 let w = dialog.or_else(|| self.window(self.focus.as_deref()?));
                 if let Some(t) = w.and_then(|w| w.toplevel()) {
                     t.send_close();
+                }
+            }
+            Action::RestoreShortcuts => {
+                if let Some(i) = self.shortcuts_inhibitor() {
+                    i.inactivate();
+                }
+            }
+            Action::ToggleFullscreen => {
+                if let Some(id) = self.focus.clone() {
+                    self.set_fullscreen(&id, !self.fullscreen.contains(&id));
                 }
             }
             Action::MoveFocused(n) => {
@@ -1124,6 +1313,43 @@ impl Comp {
         }
     }
 
+    /// Fullscreen on or off for a window. On, it also comes to the stage.
+    fn set_fullscreen(&mut self, id: &str, on: bool) {
+        self.fullscreen.retain(|f| f != id);
+        if on {
+            self.fullscreen.push(id.to_owned());
+            self.activate(id.to_owned());
+        } else {
+            self.relayout();
+        }
+    }
+
+    /// Bring a window to the stage (going to its workspace) and give it
+    /// the keyboard.
+    fn activate(&mut self, id: String) {
+        if let (Response::Error { message }, _) =
+            self.shared.request(Ok(Request::Bring { id: id.clone() }))
+        {
+            eprintln!("nordlys-comp: {message}");
+        }
+        self.focus = Some(id);
+        self.sync();
+    }
+
+    /// Whether this window fills its screen right now.
+    fn is_fullscreen_shown(&self, id: &str) -> bool {
+        self.fullscreen.iter().any(|f| f == id)
+            && self
+                .window(id)
+                .and_then(|w| self.space.outputs_for_element(w).into_iter().next())
+                .is_some_and(|o| self.covered.contains(&o.name()))
+    }
+
+    /// Whether a fullscreen window covers `o`: then its bar and shelf hide.
+    pub fn covered(&self, o: &Output) -> bool {
+        self.covered.contains(&o.name())
+    }
+
     /// The screen `d` places from the focused one, wrapping around; None
     /// with one screen.
     fn screen_by(&self, d: i32) -> Option<Output> {
@@ -1156,8 +1382,9 @@ impl Comp {
             l.surface_under(pos - at.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + at).to_f64()))
         };
+        let covered = self.covered.contains(&output.name());
         in_layer(Layer::Overlay)
-            .or_else(|| in_layer(Layer::Top))
+            .or_else(|| in_layer(Layer::Top).filter(|_| !covered))
             .or_else(|| {
                 self.space.element_under(pos).and_then(|(w, at)| {
                     w.surface_under(pos - at.to_f64(), WindowSurfaceType::ALL)
@@ -1232,9 +1459,91 @@ impl Comp {
             },
         );
         pointer.frame(self);
+        self.activate_constraint();
         if self.cursor.drawn {
             self.request_redraw();
         }
+    }
+
+    /// Switch on the pointer lock or confinement of the surface under the
+    /// pointer, once the pointer is in its region and its app has the
+    /// keyboard: a window in the background can't take the pointer.
+    fn activate_constraint(&mut self) {
+        let pointer = self.seat.get_pointer().expect("seat has a pointer");
+        let at = pointer.current_location();
+        let Some((s, origin)) = self.surface_under(at) else {
+            return;
+        };
+        let focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|k| k.current_focus())
+            .is_some_and(|f| f.client() == s.client());
+        if !focused {
+            return;
+        }
+        with_pointer_constraint(&s, &pointer, |c| {
+            if let Some(c) = c
+                && !c.is_active()
+                && c.region()
+                    .is_none_or(|r| r.contains((at - origin).to_i32_round()))
+            {
+                c.activate();
+            }
+        });
+    }
+
+    fn pointer(&self) -> PointerHandle<Self> {
+        self.seat.get_pointer().expect("seat has a pointer")
+    }
+
+    /// Bring the open-windows list (ext-foreign-toplevel-list) up to date:
+    /// a handle per window, with its title and app id, gone when it is.
+    fn sync_toplevel_list(&mut self) {
+        let live: Vec<ToplevelSurface> = self
+            .windows
+            .iter()
+            .map(|(_, w)| w)
+            .chain(&self.floating)
+            .filter_map(|w| w.toplevel().cloned())
+            .collect();
+        let (state, handles) = (&mut self.toplevel_list_state, &mut self.toplevel_handles);
+        handles.retain(|(s, h)| {
+            let alive = live.iter().any(|t| t.wl_surface() == s);
+            if !alive {
+                state.remove_toplevel(h);
+            }
+            alive
+        });
+        for t in live {
+            let (title, app) = names(&t);
+            match handles.iter().find(|(s, _)| s == t.wl_surface()) {
+                Some((_, h)) => {
+                    let changed = h.title() != title || h.app_id() != app;
+                    if h.title() != title {
+                        h.send_title(&title);
+                    }
+                    if h.app_id() != app {
+                        h.send_app_id(&app);
+                    }
+                    if changed {
+                        h.send_done();
+                    }
+                }
+                None => {
+                    let h = state.new_toplevel::<Comp>(title, app);
+                    handles.push((t.wl_surface().clone(), h));
+                }
+            }
+        }
+    }
+
+    /// The focused surface's keyboard-shortcuts inhibitor, when it's on.
+    fn shortcuts_inhibitor(&self) -> Option<KeyboardShortcutsInhibitor> {
+        let focus = self.seat.get_keyboard()?.current_focus()?;
+        self.seat
+            .keyboard_shortcuts_inhibitor_for_surface(&focus)
+            .filter(KeyboardShortcutsInhibitor::is_active)
     }
 
     pub fn input<B: InputBackend>(&mut self, event: InputEvent<B>) {
@@ -1250,6 +1559,7 @@ impl Comp {
                 let state = event.state();
                 let key = self.nordlys_key;
                 let locked = self.locked();
+                let inhibited = self.shortcuts_inhibitor().is_some();
                 let kb = self.seat.get_keyboard().expect("seat has a keyboard");
                 let action = kb.input(
                     self,
@@ -1269,10 +1579,16 @@ impl Comp {
                             // Locked, only the VT switch gets past the lock screen.
                             .filter(|a| !locked || matches!(a, Action::Vt(_)));
                         let found = global.or_else(|| {
-                            (!locked && key.held(mods))
+                            let s = (!locked && key.held(mods))
                                 .then(|| sym.raw_latin_sym_or_raw_current_sym())
-                                .flatten()
-                                .and_then(|s| binding(mods.shift, mods.ctrl, s.raw()))
+                                .flatten()?
+                                .raw();
+                            if inhibited {
+                                // Only the way out stays ours.
+                                return (s == keysyms::KEY_Escape && !mods.shift)
+                                    .then_some(Action::RestoreShortcuts);
+                            }
+                            binding(mods.shift, mods.ctrl, s)
                         });
                         match found {
                             Some(a) => {
@@ -1289,8 +1605,36 @@ impl Comp {
             }
             InputEvent::PointerMotion { event } => {
                 let pointer = self.seat.get_pointer().expect("seat has a pointer");
-                let pos = pointer.current_location() + event.delta();
-                self.pointer_to(pos, event.time_msec());
+                let at = pointer.current_location();
+                let under = self.surface_under(at);
+                let held = under
+                    .as_ref()
+                    .and_then(|(s, origin)| constraint_at(s, &pointer, at - *origin));
+                pointer.relative_motion(
+                    self,
+                    under.clone(),
+                    &RelativeMotionEvent {
+                        delta: event.delta(),
+                        delta_unaccel: event.delta_unaccel(),
+                        utime: event.time(),
+                    },
+                );
+                let pos = at + event.delta();
+                let stays = match (&held, &under) {
+                    (None, _) | (_, None) => true,
+                    (Some(Held::Locked), _) => false,
+                    (Some(Held::Confined(region)), Some((s, origin))) => {
+                        self.surface_under(pos).is_some_and(|(n, _)| n == *s)
+                            && region
+                                .as_ref()
+                                .is_none_or(|r| r.contains((pos - *origin).to_i32_round()))
+                    }
+                };
+                if stays {
+                    self.pointer_to(pos, event.time_msec());
+                } else {
+                    pointer.frame(self);
+                }
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 // Absolute devices (tablets, a VM's pointer) span every screen.
@@ -1337,6 +1681,70 @@ impl Comp {
                 let pointer = self.seat.get_pointer().expect("seat has a pointer");
                 pointer.axis(self, frame);
                 pointer.frame(self);
+            }
+            InputEvent::GestureSwipeBegin { event } => {
+                let e = gesture::GestureSwipeBeginEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    fingers: event.fingers(),
+                };
+                self.pointer().gesture_swipe_begin(self, &e);
+            }
+            InputEvent::GestureSwipeUpdate { event } => {
+                let e = gesture::GestureSwipeUpdateEvent {
+                    time: event.time_msec(),
+                    delta: event.delta(),
+                };
+                self.pointer().gesture_swipe_update(self, &e);
+            }
+            InputEvent::GestureSwipeEnd { event } => {
+                let e = gesture::GestureSwipeEndEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                };
+                self.pointer().gesture_swipe_end(self, &e);
+            }
+            InputEvent::GesturePinchBegin { event } => {
+                let e = gesture::GesturePinchBeginEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    fingers: event.fingers(),
+                };
+                self.pointer().gesture_pinch_begin(self, &e);
+            }
+            InputEvent::GesturePinchUpdate { event } => {
+                let e = gesture::GesturePinchUpdateEvent {
+                    time: event.time_msec(),
+                    delta: event.delta(),
+                    scale: event.scale(),
+                    rotation: event.rotation(),
+                };
+                self.pointer().gesture_pinch_update(self, &e);
+            }
+            InputEvent::GesturePinchEnd { event } => {
+                let e = gesture::GesturePinchEndEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                };
+                self.pointer().gesture_pinch_end(self, &e);
+            }
+            InputEvent::GestureHoldBegin { event } => {
+                let e = gesture::GestureHoldBeginEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    fingers: event.fingers(),
+                };
+                self.pointer().gesture_hold_begin(self, &e);
+            }
+            InputEvent::GestureHoldEnd { event } => {
+                let e = gesture::GestureHoldEndEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                };
+                self.pointer().gesture_hold_end(self, &e);
             }
             _ => {}
         }
@@ -1388,7 +1796,7 @@ impl Comp {
         let geo = self
             .focus
             .as_deref()
-            .filter(|_| two_up && self.layer_focus.is_none())
+            .filter(|id| two_up && self.layer_focus.is_none() && !self.is_fullscreen_shown(id))
             .and_then(|id| self.window(id))
             .and_then(|w| self.space.element_geometry(w));
         let Some(g) = geo else { return Vec::new() };
@@ -1557,6 +1965,7 @@ impl CompositorHandler for Comp {
                 let w = self.unregistered.remove(i);
                 w.on_commit();
                 self.register(w);
+                self.sync_toplevel_list();
             }
         }
 
@@ -1638,11 +2047,13 @@ impl XdgShellHandler for Comp {
             let (id, w) = self.windows.remove(i);
             self.space.unmap_elem(&w);
             self.previews.forget(&id);
+            self.fullscreen.retain(|f| *f != id);
             self.shared.change(|st| st.desk.close(&id));
             if self.focus.as_ref() == Some(&id) {
                 self.focus = None;
             }
         }
+        self.sync_toplevel_list();
         self.relayout();
     }
 
@@ -1677,7 +2088,169 @@ impl XdgShellHandler for Comp {
         }
     }
 
-    fn title_changed(&mut self, _: ToplevelSurface) {}
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _: Option<WlOutput>) {
+        match self.id_of(surface.wl_surface()) {
+            Some(id) => self.set_fullscreen(&id, true),
+            // Before its first commit: register() reads it from here.
+            None => {
+                surface.with_pending_state(|s| s.states.set(xdg_toplevel::State::Fullscreen));
+            }
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        match self.id_of(surface.wl_surface()) {
+            Some(id) => self.set_fullscreen(&id, false),
+            None => {
+                surface.with_pending_state(|s| s.states.unset(xdg_toplevel::State::Fullscreen));
+            }
+        }
+    }
+
+    fn title_changed(&mut self, _: ToplevelSurface) {
+        self.sync_toplevel_list();
+    }
+
+    fn app_id_changed(&mut self, _: ToplevelSurface) {
+        self.sync_toplevel_list();
+    }
+}
+
+/// How long an activation token stays good.
+const TOKEN_LIFETIME: Duration = Duration::from_secs(10);
+
+/// What an active pointer constraint does to motion.
+enum Held {
+    Locked,
+    Confined(Option<smithay::wayland::compositor::RegionAttributes>),
+}
+
+/// The active constraint of `surface`, if the pointer (at `local` on it) is
+/// inside its region.
+fn constraint_at(
+    surface: &WlSurface,
+    pointer: &PointerHandle<Comp>,
+    local: Point<f64, Logical>,
+) -> Option<Held> {
+    with_pointer_constraint(surface, pointer, |c| {
+        let c = c.filter(|c| c.is_active())?;
+        if !c.region().is_none_or(|r| r.contains(local.to_i32_round())) {
+            return None;
+        }
+        Some(match &*c {
+            PointerConstraint::Locked(_) => Held::Locked,
+            PointerConstraint::Confined(c) => Held::Confined(c.region().cloned()),
+        })
+    })
+}
+
+impl PointerConstraintsHandler for Comp {
+    fn new_constraint(&mut self, _: &WlSurface, _: &PointerHandle<Self>) {
+        self.activate_constraint();
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
+    ) {
+        // Where a locked pointer is shown to be, for when it's let go.
+        let active =
+            with_pointer_constraint(surface, pointer, |c| c.is_some_and(|c| c.is_active()));
+        if let Some((s, origin)) = self.surface_under(pointer.current_location())
+            && active
+            && s == *surface
+        {
+            pointer.set_location(origin + location);
+        }
+    }
+}
+
+impl XdgForeignHandler for Comp {
+    fn xdg_foreign_state(&mut self) -> &mut XdgForeignState {
+        &mut self.xdg_foreign_state
+    }
+}
+
+impl ForeignToplevelListHandler for Comp {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.toplevel_list_state
+    }
+}
+
+impl KeyboardShortcutsInhibitHandler for Comp {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.shortcuts_inhibit_state
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        inhibitor.activate();
+    }
+}
+
+impl InputMethodHandler for Comp {
+    fn new_popup(&mut self, surface: ImePopupSurface) {
+        if let Err(e) = self.popups.track_popup(PopupKind::from(surface)) {
+            eprintln!("nordlys-comp: input method popup: {e:?}");
+        }
+    }
+
+    fn popup_repositioned(&mut self, _: ImePopupSurface) {}
+
+    fn dismiss_popup(&mut self, surface: ImePopupSurface) {
+        if let Some(parent) = surface.get_parent().map(|p| p.surface.clone()) {
+            let _ = PopupManager::dismiss_popup(&parent, &PopupKind::from(surface));
+        }
+    }
+
+    fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, Logical> {
+        self.space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == parent))
+            .map(|w| w.geometry())
+            .unwrap_or_default()
+    }
+}
+
+impl XdgActivationHandler for Comp {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.activation_state
+    }
+
+    /// A token is good only if its app had the keyboard when it asked: a
+    /// click or key in the app (or the launcher) that's launching another.
+    /// So no app can pull itself in front later on its own.
+    fn token_created(&mut self, _: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        let Some((serial, seat)) = data.serial else {
+            return false;
+        };
+        let kb = self.seat.get_keyboard().expect("seat has a keyboard");
+        Seat::from_resource(&seat).as_ref() == Some(&self.seat)
+            && kb.last_enter().is_some_and(|e| serial.is_no_older_than(&e))
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        self.activation_state.remove_token(&token);
+        if data.timestamp.elapsed() >= TOKEN_LIFETIME || self.locked() {
+            return;
+        }
+        // A dialog brings its parent.
+        let parent = self.floating.iter().find_map(|w| {
+            w.toplevel()
+                .filter(|t| t.wl_surface() == &surface)?
+                .parent()
+        });
+        let Some(id) = self.id_of(parent.as_ref().unwrap_or(&surface)) else {
+            return;
+        };
+        self.activate(id);
+    }
 }
 
 impl XdgDecorationHandler for Comp {
@@ -1695,6 +2268,23 @@ impl XdgDecorationHandler for Comp {
 
     fn unset_mode(&mut self, t: ToplevelSurface) {
         self.request_mode(t, DecorationMode::ServerSide);
+    }
+}
+
+/// Panels take their screen space in the order they were mapped, so a shelf
+/// that started before the bar would take the corner and push the bar aside.
+/// Mapping the shelves again puts them after it.
+fn shelves_after_the_bar(map: &mut LayerMap) {
+    let shelves: Vec<LayerSurface> = map
+        .layers()
+        .filter(|l| l.namespace() == "nordlys-shelf")
+        .cloned()
+        .collect();
+    for shelf in shelves {
+        map.unmap_layer(&shelf);
+        if let Err(e) = map.map_layer(&shelf) {
+            eprintln!("nordlys-comp: layer surface: {e}");
+        }
     }
 }
 
@@ -1722,8 +2312,12 @@ impl WlrLayerShellHandler for Comp {
             return;
         };
         let mut map = layer_map_for_output(&output);
+        let bar = namespace == "nordlys-bar";
         if let Err(e) = map.map_layer(&LayerSurface::new(surface, namespace)) {
             eprintln!("nordlys-comp: layer surface: {e}");
+        }
+        if bar {
+            shelves_after_the_bar(&mut map);
         }
     }
 
@@ -1869,6 +2463,18 @@ impl PrimarySelectionHandler for Comp {
     }
 }
 
+impl DataControlHandler for Comp {
+    fn data_control_state(&self) -> &DataControlState {
+        &self.data_control_state
+    }
+}
+
+impl ExtDataControlHandler for Comp {
+    fn data_control_state(&self) -> &ExtDataControlState {
+        &self.ext_data_control_state
+    }
+}
+
 impl ClientDndGrabHandler for Comp {}
 impl ServerDndGrabHandler for Comp {}
 impl OutputHandler for Comp {}
@@ -1882,11 +2488,24 @@ delegate_dmabuf!(Comp);
 delegate_seat!(Comp);
 delegate_data_device!(Comp);
 delegate_primary_selection!(Comp);
+delegate_data_control!(Comp);
+delegate_ext_data_control!(Comp);
 delegate_output!(Comp);
 delegate_viewporter!(Comp);
 delegate_session_lock!(Comp);
 delegate_idle_notify!(Comp);
 delegate_idle_inhibit!(Comp);
+delegate_xdg_activation!(Comp);
+delegate_pointer_constraints!(Comp);
+delegate_relative_pointer!(Comp);
+delegate_keyboard_shortcuts_inhibit!(Comp);
+delegate_text_input_manager!(Comp);
+delegate_input_method_manager!(Comp);
+delegate_pointer_gestures!(Comp);
+delegate_virtual_keyboard_manager!(Comp);
+delegate_single_pixel_buffer!(Comp);
+delegate_xdg_foreign!(Comp);
+delegate_foreign_toplevel_list!(Comp);
 
 #[cfg(test)]
 mod tests {
@@ -1915,6 +2534,43 @@ mod tests {
             Some(Action::Spawn(LOCK))
         );
         assert_eq!(binding(false, false, keysyms::KEY_z), None);
+    }
+
+    #[test]
+    fn session_keys_match_the_hyprland_session() {
+        assert_eq!(
+            binding(false, false, keysyms::KEY_v),
+            Some(Action::Spawn(CLIPBOARD))
+        );
+        assert_eq!(
+            binding(false, false, keysyms::KEY_F1),
+            Some(Action::Spawn(WELCOME))
+        );
+        assert_eq!(
+            binding(false, false, keysyms::KEY_r),
+            Some(Action::Spawn(RECORD_REGION))
+        );
+        assert_eq!(
+            binding(true, false, keysyms::KEY_r),
+            Some(Action::Spawn(RECORD_SCREEN))
+        );
+        assert_eq!(
+            binding(true, false, keysyms::KEY_s),
+            Some(Action::Spawn(REGION_TO_CLIPBOARD))
+        );
+        assert_eq!(
+            binding(false, false, keysyms::KEY_s),
+            Some(Action::Ipc(Request::SendToShelf))
+        );
+    }
+
+    #[test]
+    fn shift_f_is_fullscreen_and_plain_f_stays_free_for_float() {
+        assert_eq!(
+            binding(true, false, keysyms::KEY_f),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(binding(false, false, keysyms::KEY_f), None);
     }
 
     #[test]

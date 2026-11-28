@@ -1,9 +1,11 @@
-//! The notification daemon and its toasts. Notifications pop in at the top
-//! right, under the bar and beside the ambient rail, as glass cards.
+//! The notification daemon and its toasts. Notifications pop in as glass
+//! cards, at the top right under the bar unless `[notifications]` says
+//! otherwise.
 //! Hovering one holds it; clicking it runs its default action or dismisses
-//! it. Everything that leaves the screen goes to history, which the ambient
-//! rail shows.
+//! it. Everything that leaves the screen goes to history, which the bar's
+//! bell shows.
 
+mod battery;
 mod server;
 pub mod store;
 
@@ -14,15 +16,29 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::text::Wrapping;
 use iced::widget::{Space, button, column, container, mouse_area, row, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task};
+use iced_layershell::reexport::Anchor;
 use iced_layershell::to_layer_message;
-use nordlys_config::{Config, Palette};
+use nordlys_config::{Config, Notifications, Palette, ToastPosition};
 use server::{Event, Shared};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::{Closed, Note, Request, Store, Urgency};
 use zbus::Connection;
 
-pub use server::{CONTROL, NAME, PATH};
+pub use server::{CONTROL, Entry, NAME, PATH};
+
+/// The screen edges the toasts hang from. A centred stack names one edge, so
+/// the compositor centres it along that edge.
+pub fn anchor(position: ToastPosition) -> Anchor {
+    match position {
+        ToastPosition::TopRight => Anchor::Top | Anchor::Right,
+        ToastPosition::TopCenter => Anchor::Top,
+        ToastPosition::TopLeft => Anchor::Top | Anchor::Left,
+        ToastPosition::BottomRight => Anchor::Bottom | Anchor::Right,
+        ToastPosition::BottomCenter => Anchor::Bottom,
+        ToastPosition::BottomLeft => Anchor::Bottom | Anchor::Left,
+    }
+}
 
 const CARD: f32 = 360.0;
 const GAP: f32 = 10.0;
@@ -38,11 +54,16 @@ const ACTIONS: f32 = 44.0;
 
 pub struct Toasts {
     palette: Palette,
+    /// Where the toasts show and for how long.
+    cfg: Notifications,
     conn: Option<Connection>,
     store: Option<Shared>,
     shown: Vec<Note>,
     hovered: Option<u32>,
     preview: bool,
+    /// Warn when the battery falls to this percentage; 0 is off.
+    low_battery: u8,
+    warning: battery::Warning,
 }
 
 #[to_layer_message]
@@ -50,6 +71,8 @@ pub struct Toasts {
 pub enum Message {
     Bus(Event),
     Tick,
+    /// Time to look at the battery.
+    Battery,
     /// nordlys.toml was saved.
     Config(nordlys_config::Config),
     Hover(u32),
@@ -94,11 +117,14 @@ impl Toasts {
     pub fn new(config: &Config, preview: bool) -> Self {
         Self {
             palette: config.palette(),
+            cfg: config.notifications.clone(),
             conn: None,
             store: None,
             shown: vec![],
             hovered: None,
             preview,
+            low_battery: config.power.low_battery,
+            warning: battery::Warning::default(),
         }
     }
 
@@ -121,6 +147,14 @@ impl Toasts {
         Task::done(Message::SizeChange(size))
     }
 
+    /// Hand the store the time a toast stays when its app doesn't say.
+    fn apply_timeout(&self) {
+        if let Some(store) = &self.store {
+            server::lock(store).default_timeout =
+                Some(Duration::from_secs(u64::from(self.cfg.seconds)));
+        }
+    }
+
     fn signal_closed(&self, ids: Vec<u32>, reason: Closed) -> Task<Message> {
         let Some(conn) = self.conn.clone() else {
             return Task::none();
@@ -136,11 +170,24 @@ impl Toasts {
             Message::Bus(Event::Ready { conn, store }) => {
                 self.conn = Some(conn);
                 self.store = Some(store);
+                self.apply_timeout();
                 self.sync()
             }
             Message::Bus(Event::Changed) => self.sync(),
+            Message::Bus(Event::Invoke(id, key)) => self.update(Message::Invoke(id, key)),
+            Message::Bus(Event::Gone(ids)) => {
+                let signals = self.signal_closed(ids, Closed::Dismissed);
+                Task::batch([signals, self.sync()])
+            }
             Message::Config(c) => {
                 self.palette = c.palette();
+                self.low_battery = c.power.low_battery;
+                let moved = self.cfg.position != c.notifications.position;
+                self.cfg = c.notifications;
+                self.apply_timeout();
+                if moved && !self.preview {
+                    return Task::done(Message::AnchorChange(anchor(self.cfg.position)));
+                }
                 Task::none()
             }
             Message::Bus(Event::Failed(e)) => {
@@ -157,13 +204,18 @@ impl Toasts {
                 let Some(store) = &self.store else {
                     return Task::none();
                 };
-                let gone = server::lock(store).expire(Instant::now(), self.hovered);
-                if gone.is_empty() {
+                let now = Instant::now();
+                let (gone, woke) = {
+                    let mut s = server::lock(store);
+                    (s.expire(now, self.hovered), s.wake(now))
+                };
+                if gone.is_empty() && !woke {
                     return Task::none();
                 }
                 let signals = self.signal_closed(gone, Closed::Expired);
                 Task::batch([signals, self.sync()])
             }
+            Message::Battery => self.check_battery(),
             Message::Hover(id) => {
                 self.hovered = Some(id);
                 Task::none()
@@ -189,6 +241,28 @@ impl Toasts {
         }
     }
 
+    /// Put the low-battery warning up, or take it down once on charge.
+    fn check_battery(&mut self) -> Task<Message> {
+        let (Some(store), Some(now)) = (&self.store, crate::sources::battery()) else {
+            return Task::none();
+        };
+        match self.warning.check(&now, self.low_battery) {
+            battery::Step::Warn => {
+                let request = battery::request(now.percent, self.warning.id);
+                self.warning.id = server::lock(store).notify(request, Instant::now());
+                self.sync()
+            }
+            battery::Step::Clear(id) => {
+                if !server::lock(store).close(id, Closed::Called) {
+                    return Task::none();
+                }
+                let signal = self.signal_closed(vec![id], Closed::Called);
+                Task::batch([signal, self.sync()])
+            }
+            battery::Step::Nothing => Task::none(),
+        }
+    }
+
     fn dismiss(&mut self, id: u32) -> Task<Message> {
         let Some(store) = &self.store else {
             return Task::none();
@@ -206,17 +280,19 @@ impl Toasts {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let bus = Subscription::run(server::serve).map(Message::Bus);
-        let config = crate::events::config_changes().map(Message::Config);
-        if self.shown.is_empty() {
-            Subscription::batch([bus, config])
-        } else {
-            Subscription::batch([
-                bus,
-                config,
-                iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
-            ])
+        let mut all = vec![
+            Subscription::run(server::serve).map(Message::Bus),
+            crate::events::config_changes().map(Message::Config),
+        ];
+        // Toasts need a quick tick to time out; snoozed notes only need a slow
+        // one to wake, so that's all there is when nothing is on screen.
+        let tick = if self.shown.is_empty() { 1000 } else { 250 };
+        all.push(iced::time::every(Duration::from_millis(tick)).map(|_| Message::Tick));
+        // Once a minute is soon enough for a battery, and costs next to nothing.
+        if self.low_battery > 0 && self.store.is_some() && !self.preview {
+            all.push(iced::time::every(Duration::from_secs(60)).map(|_| Message::Battery));
         }
+        Subscription::batch(all)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -224,14 +300,29 @@ impl Toasts {
         let critical = crate::bar::color(self.palette.ansi[1]);
         let now = Instant::now();
 
-        // Newest on top.
-        let cards =
-            column(self.shown.iter().rev().map(|n| toast(n, now, critical, r))).spacing(GAP);
+        // The newest is nearest the screen's edge: on top, or at the bottom
+        // when the toasts hang from the bottom.
+        let bottom = self.cfg.position.bottom();
+        let mut notes: Vec<&Note> = self.shown.iter().collect();
+        if !bottom {
+            notes.reverse();
+        }
+        let cards = column(notes.into_iter().map(|n| toast(n, now, critical, r))).spacing(GAP);
+        let side = match self.cfg.position {
+            ToastPosition::TopLeft | ToastPosition::BottomLeft => Horizontal::Left,
+            ToastPosition::TopCenter | ToastPosition::BottomCenter => Horizontal::Center,
+            ToastPosition::TopRight | ToastPosition::BottomRight => Horizontal::Right,
+        };
         let page = container(cards)
             .padding(MARGIN)
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_x(Horizontal::Right);
+            .align_x(side)
+            .align_y(if bottom {
+                Vertical::Bottom
+            } else {
+                Vertical::Top
+            });
 
         if self.preview {
             let bg = ui::wallpaper(&self.palette);

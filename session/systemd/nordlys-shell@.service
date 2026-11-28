@@ -1,4 +1,4 @@
-# One piece of the shell: bar, shelf, ambient or close-button.
+# One piece of the shell: bar, shelf or close-button.
 [Unit]
 Description=Nordlys %i
 Documentation=https://github.com/nordlys-de/nordlys

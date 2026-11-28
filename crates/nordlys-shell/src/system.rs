@@ -3,6 +3,7 @@
 //! (PipeWire has no simple D-Bus interface), the standard command-line
 //! tools step in: playerctl, nmcli, bluetoothctl, wpctl and dunstctl.
 
+use crate::notify::Entry;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -46,47 +47,25 @@ impl Reads {
         self.busy = false;
         std::mem::take(&mut self.again)
     }
-
-    /// Ask for a fresh read after the current one, if one is running.
-    pub fn invalidate(&mut self) {
-        self.again |= self.busy;
-    }
 }
 
-/// Everything the ambient rail shows, read in one go.
+/// What the bar's now-playing chip and bell show, read in one go.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub playing: Option<NowPlaying>,
     pub notices: Option<Notices>,
-    /// Only read while the panel is open.
-    pub controls: Option<Controls>,
-}
-
-/// The quick settings in the ambient panel.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Controls {
-    pub volume: Option<Volume>,
-    pub wifi: Option<bool>,
-    pub bluetooth: Option<bool>,
 }
 
 impl Snapshot {
-    /// Ask every tool at once, so the whole read takes as long as the
-    /// slowest tool rather than the sum of them. Blocking: call it through
-    /// [`background`].
-    pub fn read(controls: bool) -> Self {
+    /// Ask both tools at once, so the read takes as long as the slower one
+    /// rather than the sum. Blocking: call it through [`background`].
+    pub fn read() -> Self {
         std::thread::scope(|s| {
             let playing = s.spawn(now_playing);
             let notices = s.spawn(notices);
-            let controls = controls.then(|| (s.spawn(volume), s.spawn(wifi), s.spawn(bluetooth)));
             Snapshot {
                 playing: playing.join().ok().flatten(),
                 notices: notices.join().ok().flatten(),
-                controls: controls.map(|(v, w, b)| Controls {
-                    volume: v.join().ok().flatten(),
-                    wifi: w.join().ok().flatten(),
-                    bluetooth: b.join().ok().flatten(),
-                }),
             }
         })
     }
@@ -95,11 +74,15 @@ impl Snapshot {
 /// Wait for `child`, killing it once `limit` has passed.
 fn wait_within(mut child: Child, limit: Duration) -> Option<(ExitStatus, Child)> {
     let deadline = Instant::now() + limit;
+    // Most tools are done in a few milliseconds; a slow one is looked at
+    // less and less often rather than every few milliseconds.
+    let mut nap = Duration::from_millis(1);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some((status, child)),
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(Duration::from_millis(50));
             }
             _ => {
                 let _ = child.kill();
@@ -210,20 +193,6 @@ fn parse_volume(s: &str) -> Option<Volume> {
     })
 }
 
-pub fn set_volume(level: f32) {
-    let v = format!("{:.2}", level.clamp(0.0, 1.0));
-    fire("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &v]);
-}
-
-pub fn toggle_mute() {
-    fire("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]);
-}
-
-/// None when NetworkManager isn't there.
-pub fn wifi() -> Option<bool> {
-    crate::dbus::wifi().or_else(|| run("nmcli", &["radio", "wifi"]).map(|s| s == "enabled"))
-}
-
 /// How the computer is online, for the bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
@@ -306,13 +275,6 @@ impl Status {
     }
 }
 
-pub fn set_wifi(on: bool) {
-    if crate::dbus::set_wifi(on).is_some() {
-        return;
-    }
-    fire("nmcli", &["radio", "wifi", if on { "on" } else { "off" }]);
-}
-
 pub fn bluetooth() -> Option<bool> {
     if let Some(answer) = crate::dbus::bluetooth() {
         return answer;
@@ -329,22 +291,6 @@ fn parse_bluetooth(show: &str) -> Option<bool> {
         .map(|v| v.trim() == "yes")
 }
 
-pub fn set_bluetooth(on: bool) {
-    if crate::dbus::set_bluetooth(on).is_some() {
-        return;
-    }
-    fire("bluetoothctl", &["power", if on { "on" } else { "off" }]);
-}
-
-/// One recent notification, for the ambient panel.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Recent {
-    pub id: u32,
-    pub app: String,
-    pub summary: String,
-    pub body: String,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Notices {
     /// Waiting while Do not disturb is on.
@@ -353,7 +299,9 @@ pub struct Notices {
     pub history: u32,
     pub dnd: bool,
     /// Newest first. Only the Nordlys daemon lists them; empty with dunst.
-    pub recent: Vec<Recent>,
+    pub recent: Vec<Entry>,
+    /// Apps whose notifications are muted (Nordlys daemon only).
+    pub muted: Vec<String>,
 }
 
 /// Notifications come from the Nordlys daemon (`nordlys-shell notify`)
@@ -365,21 +313,14 @@ pub fn notices() -> Option<Notices> {
 fn nordlys_notices() -> Option<Notices> {
     let (waiting, history, dnd): (u32, u32, bool) =
         nordlys_call("Status", &())?.body().deserialize().ok()?;
-    let recent: Vec<(u32, String, String, String)> =
-        nordlys_call("Recent", &20u32)?.body().deserialize().ok()?;
+    let recent: Vec<Entry> = nordlys_call("Recent", &20u32)?.body().deserialize().ok()?;
+    let muted: Vec<String> = nordlys_call("Muted", &())?.body().deserialize().ok()?;
     Some(Notices {
         waiting,
         history,
         dnd,
-        recent: recent
-            .into_iter()
-            .map(|(id, app, summary, body)| Recent {
-                id,
-                app,
-                summary,
-                body,
-            })
-            .collect(),
+        recent,
+        muted,
     })
 }
 
@@ -395,6 +336,7 @@ fn dunst_notices() -> Option<Notices> {
         history: count("history"),
         dnd,
         recent: vec![],
+        muted: vec![],
     })
 }
 
@@ -440,6 +382,28 @@ pub fn clear_notifications() {
     if nordlys_call("Clear", &()).is_none() {
         fire("dunstctl", &["history-clear"]);
     }
+}
+
+/// Click one of a notification's own actions.
+pub fn invoke_notification(id: u32, key: &str) {
+    nordlys_call("Invoke", &(id, key.to_owned()));
+}
+
+pub fn dismiss_notification(id: u32) {
+    nordlys_call("Dismiss", &id);
+}
+
+/// Put a notification away for `minutes`.
+pub fn snooze_notification(id: u32, minutes: u32) {
+    nordlys_call("Snooze", &(id, minutes));
+}
+
+pub fn set_app_muted(app: &str, on: bool) {
+    nordlys_call("Mute", &(app.to_owned(), on));
+}
+
+pub fn clear_app_notifications(app: &str) {
+    nordlys_call("ClearApp", &app.to_owned());
 }
 
 #[cfg(test)]

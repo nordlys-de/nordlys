@@ -43,11 +43,15 @@ use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
+use smithay::reexports::drm;
 use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::utils::{Buffer as BufferCoords, DeviceFd, Rectangle, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoords, DeviceFd, Logical, Point, Rectangle, Size, Transform,
+};
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -68,6 +72,9 @@ pub struct Tty {
     active: bool,
     /// A render is already queued for when the loop is idle.
     queued: bool,
+    /// Where a client (wlr-randr, kanshi…) put each screen, by name; the
+    /// rest go to the right of them.
+    placed: HashMap<String, Point<i32, Logical>>,
 }
 
 /// One GPU and the screens it can drive.
@@ -95,6 +102,8 @@ struct Screen {
     /// A laptop's own panel: it goes first.
     panel: bool,
     compositor: Compositor,
+    /// The connector's modes, as the output lists them.
+    modes: Vec<(Mode, drm::control::Mode)>,
     /// On a GPU other than the main one: how its frames get there.
     copy: Option<Copy>,
     /// A frame is on its way to the screen; the next waits for vblank.
@@ -240,14 +249,74 @@ impl Tty {
         Ok(changed)
     }
 
-    /// Left to right, tops aligned, in logical pixels.
+    /// Where a client put them; the others left to right after those,
+    /// tops aligned, in logical pixels.
     fn place(&self) {
-        let mut x = 0;
+        let fixed = |s: &&Screen| self.placed.get(&s.output.name()).copied();
+        let mut x = self
+            .screens
+            .iter()
+            .filter_map(|s| fixed(&s).map(|p| p.x + logical_width(&s.output)))
+            .max()
+            .unwrap_or(0);
         for s in &self.screens {
-            s.output
-                .change_current_state(None, None, None, Some((x, 0).into()));
-            x += logical_width(&s.output);
+            let at = match fixed(&s) {
+                Some(p) => p,
+                None => {
+                    let p = (x, 0).into();
+                    x += logical_width(&s.output);
+                    p
+                }
+            };
+            s.output.change_current_state(None, None, None, Some(at));
         }
+    }
+
+    /// Switch modes, scales and places as a client asked. Every change is
+    /// checked before any is made.
+    pub fn configure(&mut self, changes: &[crate::outputs::Change]) -> Result<(), String> {
+        let mut todo = Vec::new();
+        for c in changes {
+            let i = self
+                .screens
+                .iter()
+                .position(|s| s.output == c.output)
+                .ok_or_else(|| format!("{} is gone", c.output.name()))?;
+            let drm_mode = self.screens[i]
+                .modes
+                .iter()
+                .find(|(m, _)| *m == c.mode)
+                .map(|(_, d)| *d)
+                .ok_or_else(|| format!("{} has no such mode", c.output.name()))?;
+            todo.push((i, drm_mode, c));
+        }
+        for (i, drm_mode, c) in todo {
+            let main = &self.gpus[0].gbm;
+            let s = &mut self.screens[i];
+            if s.output.current_mode() != Some(c.mode) {
+                s.compositor
+                    .use_mode(drm_mode)
+                    .map_err(|e| format!("{}: {e:?}", s.output.name()))?;
+                s.output
+                    .change_current_state(Some(c.mode), None, None, None);
+                if s.copy.is_some() {
+                    let (w, h) = drm_mode.size();
+                    s.copy = Some(Copy::new(main, &s.output, (w, h)));
+                }
+                eprintln!(
+                    "nordlys-comp: {} now at {}×{}@{}Hz",
+                    s.output.name(),
+                    c.mode.size.w,
+                    c.mode.size.h,
+                    drm_mode.vrefresh()
+                );
+            }
+            s.output
+                .change_current_state(None, None, Some(crate::outputs::scale_of(c)), None);
+            self.placed.insert(s.output.name(), c.position);
+        }
+        self.place();
+        Ok(())
     }
 
     /// A screen on `crtc` of the GPU at `i`, in the connector's preferred
@@ -302,6 +371,25 @@ impl Tty {
             Some((0, 0).into()),
         );
         output.set_preferred(mode);
+        let mut modes: Vec<(Mode, drm::control::Mode)> = Vec::new();
+        for m in conn.modes() {
+            let (mw, mh) = m.size();
+            let mode = Mode {
+                size: (i32::from(mw), i32::from(mh)).into(),
+                refresh: (m.vrefresh() * 1000) as i32,
+            };
+            if !modes.iter().any(|(x, _)| *x == mode) {
+                output.add_mode(mode);
+                modes.push((mode, *m));
+            }
+        }
+        // The one driven, whichever of the same size and rate came first.
+        if let Some(e) = modes.iter_mut().find(|(x, _)| {
+            x.size == (i32::from(w), i32::from(h)).into()
+                && x.refresh == (drm_mode.vrefresh() * 1000) as i32
+        }) {
+            e.1 = drm_mode;
+        }
 
         // What the renderer drawing into this screen's buffers can draw to.
         let renderer_formats: Vec<Format> = match &gpu.copier {
@@ -350,6 +438,7 @@ impl Tty {
                 connector::Interface::EmbeddedDisplayPort | connector::Interface::LVDS
             ),
             compositor,
+            modes,
             copy,
             pending: false,
             again: false,
@@ -469,6 +558,7 @@ pub fn init(
         screens: Vec::new(),
         active: true,
         queued: false,
+        placed: HashMap::new(),
     };
     tty.scan(false);
     if tty.screens.is_empty() {
@@ -789,6 +879,7 @@ fn draw(comp: &mut Comp, only: Option<(libc_dev_t, crtc::Handle)>) {
             Err(e) => eprintln!("nordlys-comp: render on {} failed: {e}", s.output.name()),
         }
         render::shots(comp, renderer, &s.output, &elements);
+        crate::screencopy::serve(comp, renderer, &s.output, &elements, true);
         drawn.push(s.output.clone());
     }
     comp.backend = Backend::Tty(t);

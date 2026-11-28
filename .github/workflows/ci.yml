@@ -40,10 +40,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Tools
-        run: sudo apt-get update && sudo apt-get install -y shellcheck lua5.4
+        run: sudo apt-get update && sudo apt-get install -y shellcheck lua5.4 python3-pil
       - name: shellcheck
         run: shellcheck -S warning scripts/*.sh session/nordlys-session session/nordlys-autostart session/nordlys-record vm/nordlys-vm
       - name: hyprland.lua parses
         run: luac5.4 -p session/hyprland.lua
       - name: VM agent compiles
         run: python3 -m py_compile vm/nordlys-vm-agent vm/clipboard.py
+      # Runs the scripts with fake sudo, pacman, QEMU and friends.
+      - name: Script, config and hyprland.lua tests
+        run: sh tests/run.sh

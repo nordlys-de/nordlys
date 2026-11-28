@@ -1,4 +1,4 @@
-//! Sound through PipeWire's `wpctl`.
+//! Sound through PipeWire's `wpctl`, and `pactl` for sockets and card modes.
 
 use super::run;
 
@@ -9,6 +9,34 @@ pub struct Audio {
     pub sources: Vec<Node>,
     /// Apps playing or recording right now.
     pub streams: Vec<Node>,
+    /// The sockets of the current output and input, when there's a choice.
+    pub output_ports: Option<Ports>,
+    pub input_ports: Option<Ports>,
+    /// Sound cards that can work in more than one way.
+    pub cards: Vec<Card>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Choice {
+    pub key: String,
+    pub label: String,
+}
+
+/// Speakers or headphones, say, on one device.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ports {
+    pub device: String,
+    pub active: String,
+    pub choices: Vec<Choice>,
+}
+
+/// A card and its modes: HDMI or analog, or music or calls on a headset.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Card {
+    pub name: String,
+    pub label: String,
+    pub active: String,
+    pub profiles: Vec<Choice>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -77,7 +105,107 @@ pub fn read() -> Result<Audio, String> {
             }
         }
     }
+    read_pactl(&mut audio);
     Ok(audio)
+}
+
+/// Extras: without `pactl` the page does without them.
+fn read_pactl(audio: &mut Audio) {
+    let list = |what: &str| {
+        run("pactl", &["-f", "json", "list", what])
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_default()
+    };
+    if let Ok(name) = run("pactl", &["get-default-sink"]) {
+        audio.output_ports = parse_ports(&list("sinks"), &name);
+    }
+    if let Ok(name) = run("pactl", &["get-default-source"]) {
+        audio.input_ports = parse_ports(&list("sources"), &name);
+    }
+    audio.cards = parse_cards(&list("cards"));
+}
+
+fn string(v: &serde_json::Value) -> String {
+    v.as_str().unwrap_or_default().to_owned()
+}
+
+/// The sockets of `device`, leaving out ones with nothing plugged in.
+fn parse_ports(list: &serde_json::Value, device: &str) -> Option<Ports> {
+    let d = list
+        .as_array()?
+        .iter()
+        .find(|d| d["name"].as_str() == Some(device))?;
+    let active = string(&d["active_port"]);
+    let choices: Vec<Choice> = d["ports"]
+        .as_array()?
+        .iter()
+        .filter(|p| {
+            p["availability"].as_str() != Some("not available")
+                || p["name"].as_str() == Some(&active)
+        })
+        .map(|p| Choice {
+            key: string(&p["name"]),
+            label: string(&p["description"]),
+        })
+        .collect();
+    (choices.len() > 1).then(|| Ports {
+        device: device.to_owned(),
+        active,
+        choices,
+    })
+}
+
+/// Cards with their usable modes, best first.
+fn parse_cards(list: &serde_json::Value) -> Vec<Card> {
+    let Some(cards) = list.as_array() else {
+        return vec![];
+    };
+    cards
+        .iter()
+        .filter_map(|card| {
+            let active = string(&card["active_profile"]);
+            let mut profiles: Vec<(u64, Choice)> = card["profiles"]
+                .as_object()?
+                .iter()
+                .filter(|(key, p)| p["available"].as_bool() != Some(false) || **key == active)
+                .map(|(key, p)| {
+                    (
+                        p["priority"].as_u64().unwrap_or(0),
+                        Choice {
+                            key: key.clone(),
+                            label: string(&p["description"]),
+                        },
+                    )
+                })
+                .collect();
+            profiles.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.key.cmp(&b.1.key)));
+            let name = string(&card["name"]);
+            let label = card["properties"]["device.description"]
+                .as_str()
+                .unwrap_or(&name)
+                .to_owned();
+            (profiles.len() > 1).then(|| Card {
+                name,
+                label,
+                active,
+                profiles: profiles.into_iter().map(|p| p.1).collect(),
+            })
+        })
+        .collect()
+}
+
+pub fn set_port(input: bool, device: &str, port: &str) -> Result<(), String> {
+    let verb = if input {
+        "set-source-port"
+    } else {
+        "set-sink-port"
+    };
+    run("pactl", &[verb, device, port]).map(|_| ())
+}
+
+pub fn set_profile(card: &str, profile: &str) -> Result<(), String> {
+    run("pactl", &["set-card-profile", card, profile]).map(|_| ())
 }
 
 /// The Audio part of `wpctl status`.
@@ -258,6 +386,37 @@ Video
         assert_eq!(a.streams.len(), 1);
         assert_eq!(a.streams[0].name, "Firefox");
         assert_eq!(a.default_sink().unwrap().id, 58);
+    }
+
+    #[test]
+    fn ports_and_card_modes() {
+        let sinks = serde_json::json!([{
+            "name": "analog",
+            "active_port": "speaker",
+            "ports": [
+                {"name": "speaker", "description": "Speakers", "availability": "availability unknown"},
+                {"name": "phones", "description": "Headphones", "availability": "available"},
+                {"name": "line", "description": "Line out", "availability": "not available"},
+            ],
+        }]);
+        let p = parse_ports(&sinks, "analog").unwrap();
+        assert_eq!(p.active, "speaker");
+        assert_eq!(p.choices.len(), 2);
+        assert!(parse_ports(&sinks, "other").is_none());
+        let cards = serde_json::json!([{
+            "name": "card0",
+            "active_profile": "off",
+            "properties": {"device.description": "Headset"},
+            "profiles": {
+                "off": {"description": "Off", "available": true, "priority": 0},
+                "a2dp": {"description": "Music", "available": true, "priority": 40},
+                "hdmi": {"description": "HDMI", "available": false, "priority": 90},
+            },
+        }]);
+        let c = parse_cards(&cards);
+        assert_eq!(c[0].label, "Headset");
+        let keys: Vec<&str> = c[0].profiles.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, ["a2dp", "off"]);
     }
 
     #[test]

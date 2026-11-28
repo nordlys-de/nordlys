@@ -30,11 +30,11 @@ pub enum Msg {
 }
 
 /// Common xkb options, as a quick way to add one.
-const PRESETS: [(&str, &str); 5] = [
+/// Super+Space is left out: it's the launcher's key, so xkb would fight it.
+const PRESETS: [(&str, &str); 4] = [
     ("caps:escape", "Caps Lock is Escape"),
     ("caps:ctrl_modifier", "Caps Lock is Ctrl"),
     ("grp:alt_shift_toggle", "Alt+Shift switches layout"),
-    ("grp:win_space_toggle", "Super+Space switches layout"),
     ("compose:ralt", "Right Alt is Compose"),
 ];
 

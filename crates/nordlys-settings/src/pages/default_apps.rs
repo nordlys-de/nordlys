@@ -74,6 +74,22 @@ fn read() -> Result<Data, String> {
     Ok(Data { kinds })
 }
 
+/// What a kind of file or link is, for its row.
+fn kind_detail(label: &str) -> &'static str {
+    match label {
+        "Web browser" => "Web pages and http and https links",
+        "Email" => "Mail links, like mailto",
+        "Files" => "Opening folders",
+        "Text editor" => "Plain text files",
+        "Images" => "PNG, JPEG, WebP and GIF",
+        "Video" => "MP4, Matroska and WebM",
+        "Music" => "MP3, FLAC and Ogg",
+        "PDF documents" => "PDF files",
+        "Archives" => "ZIP, tar and 7z",
+        _ => "",
+    }
+}
+
 impl PageState for State {
     type Msg = Msg;
 
@@ -128,14 +144,14 @@ impl PageState for State {
                     ui::setting(
                         c,
                         k.label,
-                        "",
+                        kind_detail(k.label),
                         text("No app installed for this").size(13).color(c.dim),
                     )
                 } else {
                     ui::setting(
                         c,
                         k.label,
-                        "",
+                        kind_detail(k.label),
                         pick_list(can.clone(), now.clone(), move |a| Msg::Set(i, a))
                             .placeholder("Choose an app")
                             .padding([6, 12])

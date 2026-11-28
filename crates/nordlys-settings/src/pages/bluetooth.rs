@@ -84,7 +84,16 @@ impl PageState for State {
                 }
                 job(
                     move || bluetooth::set_power(on),
-                    |r| Msg::Done(r, String::new()),
+                    move |r| {
+                        Msg::Done(
+                            r,
+                            if on {
+                                "Bluetooth is on".into()
+                            } else {
+                                "Bluetooth is off".into()
+                            },
+                        )
+                    },
                 )
             }
             Msg::Visible(on) => job(
@@ -95,7 +104,7 @@ impl PageState for State {
                         if on {
                             "Visible to nearby devices for 3 minutes".into()
                         } else {
-                            String::new()
+                            "Hidden from others".into()
                         },
                     )
                 },
@@ -114,7 +123,11 @@ impl PageState for State {
             Msg::Connect(a) => self.act(a, "Connected".into(), bluetooth::connect),
             Msg::Disconnect(a) => self.act(a, "Disconnected".into(), bluetooth::disconnect),
             Msg::Pair(a) => self.act(a, "Paired and connected".into(), bluetooth::pair),
-            Msg::Trust(a, on) => self.act(a, String::new(), move |a| bluetooth::set_trusted(a, on)),
+            Msg::Trust(a, on) => self.act(
+                a,
+                if on { "Trusted" } else { "Trust removed" }.into(),
+                move |a| bluetooth::set_trusted(a, on),
+            ),
             Msg::AskForget(name, a) => {
                 self.forget = Some((name, a));
                 Task::none()

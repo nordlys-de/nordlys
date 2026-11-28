@@ -1,7 +1,7 @@
 //! Batteries from sysfs, power profiles from power-profiles-daemon, and
 //! the session's power actions through logind.
 
-use super::run;
+use super::{logind, run};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -11,6 +11,8 @@ pub struct Power {
     pub profile: Option<String>,
     pub profiles: Vec<String>,
     pub can_hibernate: bool,
+    /// What the lid and power button do; None when logind can't be asked.
+    pub buttons: Option<logind::Buttons>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -51,6 +53,7 @@ pub fn read() -> Result<Power, String> {
         p.profiles = all;
     }
     p.can_hibernate = logind_can("CanHibernate");
+    p.buttons = logind::read().ok();
     Ok(p)
 }
 

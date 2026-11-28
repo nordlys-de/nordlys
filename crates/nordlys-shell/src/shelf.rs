@@ -7,6 +7,7 @@
 //! into files beside its socket, and the flyout re-reads the hovered one's
 //! a few times a second while it's open. Elsewhere it's name and title.
 
+use crate::apps;
 use crate::bar::{INTER, INTER_SEMIBOLD, color};
 use crate::events;
 use crate::icons::{self, icon};
@@ -17,13 +18,24 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{Space, button, column, container, image, mouse_area, row, stack, text};
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Subscription, Task};
 use iced_layershell::to_layer_message;
-use nordlys_config::{Config, Palette};
+use nordlys_config::{BarConfig, Config, Gaps, Palette};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 pub const RAIL: f32 = 76.0;
 /// Space the rail reserves at the screen edge: rail plus its margin.
 pub const ZONE: u32 = 88;
+
+/// Where the rail sits, as layer margins (top, right, bottom, left) and the
+/// exclusive zone it asks for. It starts `bar.gap` below the top bar and is
+/// indented `gaps.shelf` from the screen's left edge.
+///
+/// The compositor adds the margin to the exclusive zone, so the zone is the
+/// rail's own width: adding the indent here would reserve it twice.
+pub fn placement(bar: &BarConfig, gaps: &Gaps) -> ((i32, i32, i32, i32), i32) {
+    let (below, side) = (bar.gap as i32, gaps.shelf as i32);
+    ((below, 0, 0, side), ZONE as i32)
+}
 const TILE: f32 = 56.0;
 const GAP: f32 = 10.0;
 const FLYOUT: f32 = 300.0;
@@ -31,6 +43,8 @@ const MAX_SLOTS: usize = 8;
 
 pub struct Shelf {
     palette: Palette,
+    bar: BarConfig,
+    gaps: Gaps,
     compositor: Compositor,
     windows: Vec<ShelfWindow>,
     hover: Option<usize>,
@@ -73,6 +87,8 @@ impl Shelf {
         let windows = compositor.shelf(screen.as_deref());
         Self {
             palette: config.palette(),
+            bar: config.bar.clone(),
+            gaps: config.gaps.clone(),
             compositor,
             // The preview window opens with slot 1's flyout showing.
             hover: (preview && !windows.is_empty()).then_some(0),
@@ -131,7 +147,18 @@ impl Shelf {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Changed => return self.refresh(),
-            Message::Config(c) => self.palette = c.palette(),
+            Message::Config(c) => {
+                self.palette = c.palette();
+                self.bar = c.bar.clone();
+                self.gaps = c.gaps.clone();
+                if !self.preview {
+                    let (margin, exclusive) = placement(&self.bar, &self.gaps);
+                    return Task::batch([
+                        Task::done(Message::MarginChange(margin)),
+                        Task::done(Message::ExclusiveZoneChange(exclusive)),
+                    ]);
+                }
+            }
             Message::Windows(windows) => {
                 let again = self.reads.done();
                 if let Some(w) = windows {
@@ -221,7 +248,7 @@ impl Shelf {
                 container(Space::new().width(TILE - 4.0).height(TILE - 4.0)).style(move |_| {
                     container::Style {
                         border: Border {
-                            radius: 14.0.into(),
+                            radius: r.corner(14.0).into(),
                             width: 1.5,
                             color: r.chip_border,
                         },
@@ -283,21 +310,34 @@ impl Shelf {
 
 fn slot(i: usize, w: &ShelfWindow, hovered: bool, r: Rail) -> Element<'static, Message> {
     let tint = ui::tint(&w.app);
+    let art = apps::icon_for(&w.app);
     let initial = w
         .app
         .chars()
         .next()
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_default();
-    let tile = container(text(initial).font(INTER_SEMIBOLD).size(20).color(r.text))
+    let face: Element<'static, Message> = match &art {
+        Some(path) => ui::app_art(path, TILE * 0.8),
+        None => text(initial)
+            .font(INTER_SEMIBOLD)
+            .size(20)
+            .color(r.text)
+            .into(),
+    };
+    let tile = container(face)
         .width(TILE)
         .height(TILE)
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center)
         .style(move |_| container::Style {
-            background: Some(Background::Color(Color { a: 0.24, ..tint })),
+            background: Some(Background::Color(if art.is_some() {
+                Color::TRANSPARENT
+            } else {
+                Color { a: 0.24, ..tint }
+            })),
             border: Border {
-                radius: 14.0.into(),
+                radius: r.corner(14.0).into(),
                 width: 1.5,
                 color: if hovered { tint } else { Color::TRANSPARENT },
             },
@@ -317,7 +357,7 @@ fn slot(i: usize, w: &ShelfWindow, hovered: bool, r: Rail) -> Element<'static, M
         .style(move |_| container::Style {
             background: Some(Background::Color(r.badge)),
             border: Border {
-                radius: 9.0.into(),
+                radius: r.corner(9.0).into(),
                 width: 1.0,
                 color: r.chip_border,
             },
@@ -366,7 +406,7 @@ fn close_badge(i: usize, r: Rail) -> Element<'static, Message> {
         })),
         text_color: r.text,
         border: Border {
-            radius: 10.0.into(),
+            radius: r.corner(10.0).into(),
             width: 1.0,
             color: r.chip_border,
         },
@@ -402,7 +442,7 @@ fn flyout(
                     move |_| container::Style {
                         background: Some(Background::Color(t)),
                         border: Border {
-                            radius: 4.0.into(),
+                            radius: r.corner(4.0).into(),
                             ..Border::default()
                         },
                         ..container::Style::default()
@@ -469,5 +509,16 @@ mod tests {
         std::fs::write(&path, b"junk").unwrap();
         assert!(matches!(read_picture(&path, None), Picture::Missing));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_indent_is_reserved_once() {
+        let gaps = Gaps {
+            shelf: 40,
+            ..Gaps::default()
+        };
+        let ((_, _, _, left), zone) = placement(&BarConfig::default(), &gaps);
+        // What windows are kept clear of: the zone plus the margin.
+        assert_eq!(zone + left, ZONE as i32 + 40);
     }
 }

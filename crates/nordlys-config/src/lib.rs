@@ -13,6 +13,11 @@ pub use palette::{Palette, Rgb};
 pub struct Config {
     pub theme: Theme,
     pub stage: StageConfig,
+    pub bar: BarConfig,
+    pub gaps: Gaps,
+    pub clock: Clock,
+    pub notifications: Notifications,
+    pub power: PowerConfig,
     #[serde(rename = "group")]
     pub groups: Vec<Group>,
 }
@@ -28,7 +33,13 @@ pub struct Theme {
     /// Swap glass for solid surfaces (weak GPUs, accessibility).
     pub reduce_transparency: bool,
     pub reduce_motion: bool,
+    /// Corner radius in pixels for windows and shell surfaces, 0–24. Every
+    /// other rounded corner scales from it (see `Palette::corner`).
+    pub roundness: u8,
 }
+
+/// The default corner radius, the one the shell was drawn at.
+pub const DEFAULT_ROUNDNESS: u8 = 14;
 
 impl Default for Theme {
     fn default() -> Self {
@@ -38,6 +49,7 @@ impl Default for Theme {
             blur: 24,
             reduce_transparency: false,
             reduce_motion: false,
+            roundness: DEFAULT_ROUNDNESS,
         }
     }
 }
@@ -58,6 +70,9 @@ pub struct StageConfig {
     pub split: f32,
     /// Redraw rate for windows waiting on the shelf.
     pub shelf_fps: u8,
+    /// Show the left shelf rail. Off, the rail isn't started; windows still
+    /// wait, and the keys that cycle them still work.
+    pub shelf: bool,
 }
 
 impl Default for StageConfig {
@@ -66,8 +81,204 @@ impl Default for StageConfig {
             layout: Layout::Auto,
             split: 0.6,
             shelf_fps: 10,
+            shelf: true,
         }
     }
+}
+
+/// The space between the screen's edges and the panels on them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Gaps {
+    /// Pixels from the screen's top edge down to the top bar.
+    pub topbar: u8,
+    /// Pixels from the screen's left edge to the shelf rail.
+    pub shelf: u8,
+}
+
+impl Default for Gaps {
+    fn default() -> Self {
+        Self {
+            topbar: 10,
+            shelf: 12,
+        }
+    }
+}
+
+/// The top bar's spacing and which of its parts show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BarConfig {
+    /// Space in pixels above and below the bar: the gap to the screen's
+    /// edge and to whatever sits under it, like the shelf.
+    pub gap: u8,
+    /// Space in pixels at each end of the bar.
+    pub side: u8,
+    /// Parts of the bar to leave out.
+    pub hidden: Vec<BarItem>,
+}
+
+impl Default for BarConfig {
+    fn default() -> Self {
+        Self {
+            gap: 10,
+            side: 12,
+            hidden: Vec::new(),
+        }
+    }
+}
+
+/// How the time reads on the top bar and the lock screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Clock {
+    /// `3:41 PM` instead of `15:41`.
+    pub twelve_hour: bool,
+    /// The day and date before the time on the top bar.
+    pub date: bool,
+    /// Seconds on the top bar's clock.
+    pub seconds: bool,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self {
+            twelve_hour: false,
+            date: true,
+            seconds: false,
+        }
+    }
+}
+
+impl Clock {
+    /// The time alone, as a strftime format.
+    pub fn time_format(&self, seconds: bool) -> &'static str {
+        match (self.twelve_hour, seconds) {
+            (false, false) => "%H:%M",
+            (false, true) => "%H:%M:%S",
+            (true, false) => "%-I:%M %p",
+            (true, true) => "%-I:%M:%S %p",
+        }
+    }
+
+    /// The top bar's clock, as a strftime format.
+    pub fn bar_format(&self) -> String {
+        let time = self.time_format(self.seconds);
+        if self.date {
+            format!("%a %-d %b  {time}")
+        } else {
+            time.to_owned()
+        }
+    }
+}
+
+/// Battery care.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PowerConfig {
+    /// Warn once when the battery falls to this percentage, 0–50. 0 turns
+    /// the warning off.
+    pub low_battery: u8,
+}
+
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self { low_battery: 15 }
+    }
+}
+
+/// Where toasts show and how long they stay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notifications {
+    pub position: ToastPosition,
+    /// Seconds a toast stays when the app doesn't say, 1–60. Critical ones
+    /// stay until dismissed.
+    pub seconds: u8,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            position: ToastPosition::TopRight,
+            seconds: 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastPosition {
+    #[default]
+    TopRight,
+    TopCenter,
+    TopLeft,
+    BottomRight,
+    BottomCenter,
+    BottomLeft,
+}
+
+impl ToastPosition {
+    pub const ALL: [ToastPosition; 6] = [
+        ToastPosition::TopRight,
+        ToastPosition::TopCenter,
+        ToastPosition::TopLeft,
+        ToastPosition::BottomRight,
+        ToastPosition::BottomCenter,
+        ToastPosition::BottomLeft,
+    ];
+
+    pub fn bottom(self) -> bool {
+        matches!(
+            self,
+            Self::BottomRight | Self::BottomCenter | Self::BottomLeft
+        )
+    }
+
+    /// The value as nordlys.toml writes it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::TopRight => "top-right",
+            Self::TopCenter => "top-center",
+            Self::TopLeft => "top-left",
+            Self::BottomRight => "bottom-right",
+            Self::BottomCenter => "bottom-center",
+            Self::BottomLeft => "bottom-left",
+        }
+    }
+}
+
+/// A part of the top bar that can be hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BarItem {
+    Apps,
+    Workspaces,
+    Stage,
+    Clock,
+    Recording,
+    Media,
+    Notifications,
+    Tray,
+    Layout,
+    Indicators,
+    Battery,
+}
+
+impl BarItem {
+    pub const ALL: [BarItem; 11] = [
+        BarItem::Apps,
+        BarItem::Workspaces,
+        BarItem::Stage,
+        BarItem::Clock,
+        BarItem::Recording,
+        BarItem::Media,
+        BarItem::Notifications,
+        BarItem::Tray,
+        BarItem::Layout,
+        BarItem::Indicators,
+        BarItem::Battery,
+    ];
 }
 
 /// How the shelves are drawn. `Auto` picks by monitor width:
@@ -129,6 +340,7 @@ impl Config {
         if let Some(a) = self.theme.accent.as_deref().and_then(Rgb::parse) {
             p.set_accent(a);
         }
+        p.roundness = self.theme.roundness;
         p
     }
 
@@ -160,6 +372,29 @@ impl Config {
             return Err(Error::Invalid(
                 "stage.split must be between 0.3 and 0.8".into(),
             ));
+        }
+        if self.theme.roundness > 24 {
+            return Err(Error::Invalid("theme.roundness must be 0 to 24".into()));
+        }
+        if self.bar.gap > 24 {
+            return Err(Error::Invalid("bar.gap must be 0 to 24".into()));
+        }
+        if self.gaps.topbar > 40 {
+            return Err(Error::Invalid("gaps.topbar must be 0 to 40".into()));
+        }
+        if self.gaps.shelf > 40 {
+            return Err(Error::Invalid("gaps.shelf must be 0 to 40".into()));
+        }
+        if self.bar.side > 40 {
+            return Err(Error::Invalid("bar.side must be 0 to 40".into()));
+        }
+        if !(1..=60).contains(&self.notifications.seconds) {
+            return Err(Error::Invalid(
+                "notifications.seconds must be 1 to 60".into(),
+            ));
+        }
+        if self.power.low_battery > 50 {
+            return Err(Error::Invalid("power.low_battery must be 0 to 50".into()));
         }
         for g in &self.groups {
             if g.apps.is_empty() {
@@ -225,6 +460,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 #[cfg(test)]
+#[path = "lib_tests.rs"]
+mod lib_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -247,6 +486,73 @@ mod tests {
     fn typos_are_rejected() {
         assert!(Config::from_toml("[theme]\nacent = \"#fff\"").is_err());
         assert!(Config::from_toml("[theme]\naccent = \"blue\"").is_err());
+    }
+
+    #[test]
+    fn look_settings_parse_and_validate() {
+        let c = Config::from_toml(
+            "[theme]\nroundness = 0\n[stage]\nshelf = false\n\
+             [bar]\ngap = 4\nside = 20\nhidden = [\"tray\", \"layout\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.theme.roundness, 0);
+        assert!(!c.stage.shelf);
+        assert_eq!((c.bar.gap, c.bar.side), (4, 20));
+        assert_eq!(c.bar.hidden, [BarItem::Tray, BarItem::Layout]);
+        assert_eq!(c.palette().corner(14.0), 0.0);
+        assert!(Config::from_toml("[bar]\nhidden = [\"clok\"]").is_err());
+        assert!(Config::from_toml("[theme]\nroundness = 25").is_err());
+        assert!(Config::from_toml("[bar]\ngap = 25").is_err());
+        assert!(Config::from_toml("[bar]\nside = 41").is_err());
+    }
+
+    #[test]
+    fn screen_gaps_parse_and_validate() {
+        let c = Config::from_toml("[gaps]\ntopbar = 4\nshelf = 30\n").unwrap();
+        assert_eq!((c.gaps.topbar, c.gaps.shelf), (4, 30));
+        assert_eq!(Config::default().gaps, Gaps::default());
+        assert!(Config::from_toml("[gaps]\ntopbar = 41").is_err());
+        assert!(Config::from_toml("[gaps]\nshelf = 41").is_err());
+        assert!(Config::from_toml("[gaps]\ntop = 4").is_err());
+    }
+
+    #[test]
+    fn clock_and_toast_settings() {
+        let c = Config::default();
+        assert_eq!(c.clock.bar_format(), "%a %-d %b  %H:%M");
+        let c = Config::from_toml(
+            "[clock]\ntwelve_hour = true\ndate = false\nseconds = true\n\
+             [notifications]\nposition = \"bottom-center\"\nseconds = 12\n",
+        )
+        .unwrap();
+        assert_eq!(c.clock.bar_format(), "%-I:%M:%S %p");
+        assert_eq!(c.clock.time_format(false), "%-I:%M %p");
+        assert_eq!(c.notifications.position, ToastPosition::BottomCenter);
+        assert!(c.notifications.position.bottom());
+        assert_eq!(c.notifications.seconds, 12);
+        for p in ToastPosition::ALL {
+            let t = format!("[notifications]\nposition = {:?}", p.key());
+            assert_eq!(Config::from_toml(&t).unwrap().notifications.position, p);
+        }
+        assert!(Config::from_toml("[notifications]\nseconds = 0").is_err());
+        assert!(Config::from_toml("[notifications]\nseconds = 61").is_err());
+        assert!(Config::from_toml("[notifications]\nposition = \"middle\"").is_err());
+    }
+
+    #[test]
+    fn low_battery_warning() {
+        assert_eq!(Config::default().power.low_battery, 15);
+        let off = Config::from_toml("[power]\nlow_battery = 0").unwrap();
+        assert_eq!(off.power.low_battery, 0);
+        assert!(Config::from_toml("[power]\nlow_battery = 51").is_err());
+    }
+
+    #[test]
+    fn corners_scale_from_the_default() {
+        let p = Config::default().palette();
+        assert_eq!(p.corner(8.0), 8.0);
+        let big = Config::from_toml("[theme]\nroundness = 24").unwrap();
+        assert_eq!(big.palette().corner(14.0), 24.0);
     }
 
     #[test]

@@ -51,6 +51,9 @@ Or build a package: `cd packaging/arch && makepkg -si`.
 Log out, pick **Nordlys** in your display manager (SDDM, GDM, greetd…) and
 log in. From a TTY, run `nordlys-session`. In a VM, give it 3D
 acceleration (virtio-gpu with OpenGL, or VMware's 3D); Hyprland needs it.
+If SDDM is set to read sessions from a folder of its own (`SessionDir` under
+`[Wayland]`), the install links the Nordlys entries into it, so they're
+listed beside the sessions you picked.
 
 What you get:
 
@@ -58,7 +61,7 @@ What you get:
   Code and git keep their passwords (see [Saved passwords](#saved-passwords)),
   then starts Hyprland with Nordlys's own config
   (`share/nordlys/hyprland.lua`), so your `~/.config/hypr` is left alone.
-- It starts the bar, shelf, ambient rail, notification daemon, hypridle
+- It starts the bar, shelf, notification daemon, hypridle
   (dim at 4 min, lock at 5, screen off at 6, suspend at 30), the polkit
   agent and the aurora wallpaper, and blurs every shell surface.
 - Those run as systemd user services under `nordlys-session.target`, so
@@ -66,7 +69,7 @@ What you get:
   (`systemctl --user status 'nordlys-*'` shows them, `journalctl --user
   -u nordlys-shell@bar` their logs). Without the units they're started
   directly, without the safety net.
-- The bar, rails and close button appear on every screen, and follow
+- The bar, shelf and close button appear on every screen, and follow
   screens as you plug them in and out.
 - On first login it copies the example `nordlys.toml` to
   `~/.config/nordlys/`. Saving that file recolours the shell live.
@@ -77,13 +80,18 @@ What you get:
 - At every login, `nordlys-theme` themes GTK, Qt and the default apps
   from `nordlys.toml` and writes any of their starting dotfiles that are
   missing (see [The apps](#the-apps)). Files you've made your own are left
-  alone.
+  alone. It keeps running, and themes them again when you change the mode
+  or the accent.
 - Nordlys's default apps open your files (see below), behind any choice
   you make yourself with "Open With" or `xdg-mime default`.
 
 To change things, put Lua in `~/.config/nordlys/hyprland.lua`; it runs
 after the Nordlys config and can override any of it. Your own idle
-settings go in `~/.config/nordlys/hypridle.conf`.
+settings go in `~/.config/nordlys/hypridle.conf`. Variables the
+compositor needs before it starts, such as `AQ_DRM_DEVICES` to choose the
+GPU on a laptop with two, go in `~/.config/nordlys/env`: a shell file the
+session reads at login, where every variable set is exported. An existing
+uwsm env file can be reused with one line, `. ~/.config/uwsm/env-hyprland`.
 
 ### Keys
 
@@ -157,6 +165,20 @@ without 3D: `NORDLYS_VM_EXTRA="-device bochs-display" vm/nordlys-vm run`
 Ctrl+Alt+G grabs the keyboard so Super reaches the VM; Ctrl+Alt+F is
 fullscreen. `vm/nordlys-vm destroy` deletes the VM.
 
+If Super keys or the mouse don't reach the VM's window (your window
+manager takes them first), show the VM through SPICE in `remote-viewer`
+(from virt-viewer) instead:
+
+```sh
+NORDLYS_VM_DISPLAY=spice vm/nordlys-vm run
+```
+
+Inside the VM, install `spice-vdagent` (`setup.sh` does this with
+`--vm-guest`) and start its daemon, so the window and clipboard follow
+the host: `sudo systemctl enable --now spice-vdagentd`. Closing the
+viewer leaves the VM running; reopen it with
+`remote-viewer spice://127.0.0.1:5930`.
+
 ## Try it
 
 ```sh
@@ -194,7 +216,7 @@ Wayland display of its own, and apps started in it are laid out by the
 real Stage model: the newest window takes the stage, the one it replaces
 waits, unmapped, on the shelf, two-up splits the stage with an accent ring
 around the window that has the keys, and every workspace keeps a stage of
-its own. Dialogs float over their parent. The bar, rails, launcher and
+its own. Dialogs float over their parent. The bar, shelf, launcher and
 toasts run inside as layer-shell surfaces, and the space the bar reserves
 comes off the stage.
 
@@ -224,7 +246,7 @@ nordlysctl screenshot stage.png   # what the compositor shows, as a PNG
 `nordlysctl close` asks the app to close its window, and `nordlysctl group`
 starts the group's apps (on an empty workspace, if the group says so).
 
-Glass shell surfaces (bar, launcher, rails, toasts, OSD, welcome) get a
+Glass shell surfaces (bar, launcher, shelf, toasts, OSD, welcome) get a
 dual-kawase blur of what's under them, `theme.blur` strong; reduce
 transparency or `theme.blur = 0` turns it off. Shelved windows keep
 drawing at `stage.shelf_fps`, small, into a `.previews` folder beside the
@@ -258,8 +280,34 @@ screen under the pointer has the keyboard, new windows open there, and
 going to a workspace another screen shows moves the keyboard (and the
 pointer) to that screen. Super+Ctrl+← → moves the keyboard between
 screens, Super+Ctrl+Shift+← → sends the window to the next screen and
-follows it. A screen unplugged leaves its workspace and windows behind, a
-Super+number away. Every screen gets its own bar, rails and close button,
+follows it. Super+Shift+F makes a window fullscreen, and so do apps that
+ask (a video player, a browser on F11): it fills its screen over the bar
+and shelf, while notifications and the launcher still show on top. A
+window another app activates (a link opened from chat, say) comes to the
+stage, from its workspace if need be, but only when the app asking had
+the keyboard at the time, so nothing pulls itself in front later. Clipboard history (cliphist,
+Super+V), screenshots and screen recording work as on Hyprland: the
+compositor speaks wlr-data-control and wlr-screencopy (shared-memory
+buffers), so wl-paste --watch, grim, slurp and wf-recorder see it, and
+Super+Shift+S, Super+R, Super+Shift+R and Super+F1 do what they do
+there. Super+F (float) and Super+- (scratchpad) aren't there yet.
+
+Games and 3D apps can lock or confine the pointer and read raw mouse
+motion (pointer-constraints, relative-pointer); a lock only takes hold
+once the pointer is over the app and the app has the keyboard. Input
+methods such as fcitx5 and ibus work in apps' text fields (text-input v3,
+input-method v2). A virtual machine or remote desktop can ask for the
+keyboard shortcuts while it has the keyboard; then the Nordlys key goes to
+it, the media keys and Ctrl+Alt+F1-F12 still work, and Super+Escape gives
+the shortcuts back.
+
+Touchpad swipes and pinches reach apps (pointer-gestures), so browsers
+pinch to zoom. Other taskbars and window switchers can see the open
+windows (ext-foreign-toplevel-list), on-screen keyboards and wtype can
+type (virtual-keyboard), and portal file pickers sit on the app that asked
+(xdg-foreign).
+A screen unplugged leaves its workspace and windows behind, a
+Super+number away. Every screen gets its own bar, shelf and close button,
 and the lock screen covers them all.
 
 Screens on any GPU work, so an HDMI port wired to a laptop's discrete GPU
@@ -273,13 +321,17 @@ picked up too. `nordlysctl focus-screen DP-1` does
 the same over IPC, and `nordlysctl screenshot` saves the screen with the
 keyboard.
 
-What it doesn't do yet: arranging screens yourself (Settings' Screens page
-writes Hyprland's config, which nordlys-comp doesn't read), mirroring, a
-mode other than the preferred one, screen sharing (no
-portal knows nordlys-comp), fractional scaling (it picks 1 or 2 from the
-screen's density; `NORDLYS_SCALE` overrides it for all of them), and
-hardware cursor planes
-are left to Smithay to choose.
+Screens can be arranged with wlr-randr, kanshi, wdisplays or nwg-displays
+(wlr-output-management): another mode, another place, a scale of 1 to 4
+(`wlr-randr --output DP-1 --mode 2560x1440@144 --pos 1920,0 --scale 2`).
+Each starts in its preferred mode at a scale picked from its density
+(`NORDLYS_SCALE` overrides that), left to right; the changes last until
+the session ends, so put them in kanshi's config to keep them.
+
+What it doesn't do yet: turning a screen off, rotating it, fractional
+scales, mirroring, Settings' Screens page (it writes Hyprland's config,
+which nordlys-comp doesn't read), and screen sharing (no portal knows
+nordlys-comp). Hardware cursor planes are left to Smithay to choose.
 
 ## Settings
 
@@ -320,7 +372,7 @@ installs them; with the package they're optional dependencies.
 | Files | Nautilus (with gvfs and video thumbnails) | Super+N, folders |
 | Text | GNOME Text Editor; Helix in the terminal | Super+E, text and code, `nordlys.toml` |
 | Images | imv (Loupe if that's what you have) | images |
-| Video and music | mpv, with mpv-mpris for the ambient rail | video, audio, streams |
+| Video and music | mpv, with mpv-mpris for the bar's now-playing chip | video, audio, streams |
 | PDF and EPUB | zathura with the mupdf plugin | documents |
 | System monitor | btop in foot | Ctrl+Shift+Esc |
 | Volume per app | pavucontrol | from the launcher |
@@ -339,6 +391,8 @@ overwrites your own work:
   `foot/nordlys.ini`, `mpv/nordlys.conf`, `zathura/nordlys`,
   `helix/themes/nordlys.toml`, `btop/themes/nordlys.theme` and
   `qt6ct/colors/nordlys.conf`. Each app's own config includes or names them.
+  The GTK 3 themes `Nordlys` and `Nordlys-dark` go into
+  `~/.local/share/themes`.
 - **Generated configs** that have to carry the app's own name:
   `gtk-4.0/gtk.css`, `gtk-3.0/gtk.css`, `gtk-3.0/settings.ini`,
   `qt6ct/qt6ct.conf` and `imv/config`. They're rewritten while their first
@@ -355,9 +409,16 @@ overwrites your own work:
 libadwaita apps (Nautilus, Text Editor, Loupe) take dark or light from
 the desktop settings, so `nordlys-theme` also sets `color-scheme` and the
 GTK 3 theme to match `nordlys.toml`, and sets Inter and JetBrains Mono as
-the interface fonts if you haven't chosen fonts yourself. GTK 3 apps
-follow the palette with adw-gtk3 (`adw-gtk-theme`); without it they fall
-back to plain Adwaita in the right mode.
+the interface fonts if you haven't chosen fonts yourself. GTK 3 apps,
+the keyring's password prompt among them, use the Nordlys theme: adw-gtk3
+(`adw-gtk-theme`) with the palette on top, or plain Adwaita without it.
+
+When you change the mode or the accent, open apps follow as far as their
+toolkit lets them. GTK 3 apps take the new theme straight away.
+libadwaita and GTK 4 apps switch between dark and light straight away,
+and take a new accent when they next start, because GTK reads
+`gtk-4.0/gtk.css` only once. Qt, foot, Helix, btop and the rest read
+their files when they start.
 
 After changing `mode` or `accent`, run `nordlys-theme` (or log in again).
 Open apps pick the new colours up when restarted. To see what it would
@@ -397,6 +458,11 @@ runs just one.
 
 The Nordlys session starts it and has Hyprland blur it (layer namespace
 `nordlys-bar`).
+
+Where there's an Intel GPU, the bar, shelf, close button and
+notifications load only its Vulkan driver, which saves memory on laptops
+that also have an NVIDIA one. Apps they start don't inherit this. Set
+`NORDLYS_SHELL_GPU=auto` to turn it off.
 
 ### The tray
 
@@ -462,18 +528,15 @@ of closing, and app groups fall back to starting their apps in order.
 In the Nordlys session it opens with Super+Space, or Super+Shift+Space for
 commands.
 
-## The shelf and the ambient rail
+## The shelf and the top bar's right side
 
 <p>
   <img src="docs/shelf-preview.png" width="49%" alt="The shelf rail with a hover card">
-  <img src="docs/ambient-preview.png" width="49%" alt="The ambient rail with its panel open">
 </p>
 
 ```sh
 cargo run -p nordlys-shell -- shelf             # left rail, layer-shell on Wayland
-cargo run -p nordlys-shell -- ambient           # right rail
-cargo run -p nordlys-shell -- shelf --window    # preview windows
-cargo run -p nordlys-shell -- ambient --window
+cargo run -p nordlys-shell -- shelf --window    # preview window
 ```
 
 **The shelf** (left) holds the windows waiting on this workspace, most
@@ -483,20 +546,17 @@ Hyprland's client list, or from a demo set. On nordlys-comp the flyout
 also shows a live picture of the window, which the compositor keeps
 drawing while it waits; elsewhere each tile shows the app's initial.
 
-**The ambient rail** (right) carries what matters on every workspace: now
-playing, quick settings and notifications. Any tile opens the panel, which
-has play/pause and next, Wi-Fi, Bluetooth and Do not disturb toggles, a
-volume slider (click the percentage to mute) and the notification count.
-Media (MPRIS), Wi-Fi (NetworkManager) and Bluetooth (BlueZ) go straight
-over D-Bus. Volume uses `wpctl`, and anything D-Bus can't reach falls back
-to `playerctl`, `nmcli`, `bluetoothctl` or `dunstctl`. Everything is read
-at once and off the UI thread, so a slow service never freezes the rail.
-A toggle with nothing to talk to shows "Unavailable".
+**The top bar's right side** carries what matters on every workspace. While
+something plays, a chip shows its track; click it for the panel with
+play/pause and next. A bell shows the notification count; click it for the
+panel with **Show last**, **Clear**, a Do not disturb switch and the three
+most recent notifications. Network, Bluetooth and sound stay as indicators
+with their own panels. Media (MPRIS) goes straight over D-Bus. Anything
+D-Bus can't reach falls back to `playerctl` or `dunstctl`. Everything is
+read off the UI thread, so a slow service never freezes the bar.
 
-Each rail reserves 88 px on its edge, so windows sit between them. The
-surface widens while a hover card or the panel is open.
-
-The Nordlys session starts both.
+The shelf reserves 88 px on its edge, so windows sit clear of it. The
+Nordlys session starts it.
 
 ## Notifications
 
@@ -519,9 +579,9 @@ right, newest on top, at most four at a time:
 - With Do not disturb on, toasts wait quietly in history (critical ones
   still show) and appear when it's switched off.
 
-The ambient rail reads from it: the bell's badge counts what arrived since
-you last opened the panel, and the panel lists the three most recent with
-**Show last** and **Clear**. Without the daemon the rail falls back to dunst.
+The bar's bell reads from it: its badge counts what arrived since you last
+opened the panel, and the panel lists the three most recent with **Show
+last** and **Clear**. Without the daemon the bell falls back to dunst.
 
 Only one notification daemon can run. If dunst (or mako) is running, stop
 it first; `notify` says so and exits otherwise. The Nordlys session starts

@@ -279,37 +279,43 @@ fn host() -> futures::channel::mpsc::UnboundedReceiver<Vec<Item>> {
 
         // Any signal from an item or the watcher, or the watcher's name
         // moving, means "read again".
-        let (poke, poked) = std_mpsc::channel::<bool>();
-        let listen = |rule: zbus::Result<zbus::MatchRule<'static>>, rewatch: bool| {
+        let (poke, poked) = std_mpsc::channel::<Poke>();
+        let listen = |rule: zbus::Result<zbus::MatchRule<'static>>, kind: Poke| {
             let Ok(rule) = rule else { return };
             let poke = poke.clone();
             let Ok(signals) = MessageIterator::for_match_rule(rule, bus, Some(256)) else {
                 return;
             };
             std::thread::spawn(move || {
-                for _ in signals.flatten() {
-                    if poke.send(rewatch).is_err() {
+                for m in signals.flatten() {
+                    let h = m.header();
+                    let kind = if h.member().is_some_and(|n| n == "NewToolTip") {
+                        Poke::Tooltip(h.sender().map(|s| s.to_string()).unwrap_or_default())
+                    } else {
+                        kind.clone()
+                    };
+                    if poke.send(kind).is_err() {
                         return;
                     }
                 }
             });
         };
         let signal = || zbus::MatchRule::builder().msg_type(MsgType::Signal);
-        listen(signal().interface(ITEM).map(|r| r.build()), false);
-        listen(signal().interface(WATCHER).map(|r| r.build()), false);
+        listen(signal().interface(ITEM).map(|r| r.build()), Poke::Read);
+        listen(signal().interface(WATCHER).map(|r| r.build()), Poke::Read);
         listen(
             signal()
                 .sender(DBUS)
                 .and_then(|r| r.member("NameOwnerChanged"))
                 .and_then(|r| r.arg(0, WATCHER))
                 .map(|r| r.build()),
-            true,
+            Poke::Rewatch,
         );
 
         let mut icons = IconCache::default();
         let mut last: Option<Vec<String>> = None;
         loop {
-            let items = read_items(bus, &mut icons);
+            let (items, tooltip_titled) = read_items(bus, &mut icons);
             let keys: Vec<String> = items.iter().map(fingerprint).collect();
             if last.as_ref() != Some(&keys) {
                 last = Some(keys);
@@ -319,17 +325,31 @@ fn host() -> futures::channel::mpsc::UnboundedReceiver<Vec<Item>> {
             }
             // Wait for a change (or check anyway every so often), then let
             // the burst settle.
-            let mut rewatch = match poked.recv_timeout(Duration::from_secs(20)) {
-                Ok(r) => r,
-                Err(std_mpsc::RecvTimeoutError::Timeout) => false,
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(Duration::from_secs(20));
-                    false
+            // A tooltip changing alone (some apps tick theirs every
+            // second) only matters to an icon titled by its tooltip. A
+            // signal names its sender's unique name, so an item known by
+            // another name is always read.
+            let wanted = |p: &Poke| match p {
+                Poke::Tooltip(from) => tooltip_titled
+                    .iter()
+                    .any(|s| s == from || !s.starts_with(':')),
+                _ => true,
+            };
+            let first = loop {
+                match poked.recv_timeout(Duration::from_secs(20)) {
+                    Ok(p) if !wanted(&p) => continue,
+                    Ok(p) => break p,
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => break Poke::Read,
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        std::thread::sleep(Duration::from_secs(20));
+                        break Poke::Read;
+                    }
                 }
             };
+            let mut rewatch = first == Poke::Rewatch;
             std::thread::sleep(SETTLE);
-            while let Ok(r) = poked.try_recv() {
-                rewatch |= r;
+            while let Ok(p) = poked.try_recv() {
+                rewatch |= p == Poke::Rewatch;
             }
             if rewatch {
                 // A new watcher: tell it about us.
@@ -338,6 +358,17 @@ fn host() -> futures::channel::mpsc::UnboundedReceiver<Vec<Item>> {
         }
     });
     rx
+}
+
+/// Why the list should be read again.
+#[derive(Clone, PartialEq, Eq)]
+enum Poke {
+    /// Something an icon shows may have changed.
+    Read,
+    /// Only a tooltip changed, that of the item with this bus name.
+    Tooltip(String),
+    /// The watcher changed hands: register with the new one.
+    Rewatch,
 }
 
 /// What decides whether the bar needs the list again.
@@ -357,7 +388,8 @@ fn fingerprint(i: &Item) -> String {
     )
 }
 
-fn read_items(bus: &Connection, icons: &mut IconCache) -> Vec<Item> {
+/// The items, and the bus names of those titled by their tooltip.
+fn read_items(bus: &Connection, icons: &mut IconCache) -> (Vec<Item>, Vec<String>) {
     let entries: Vec<String> = bus
         .call_method(
             Some(WATCHER),
@@ -370,13 +402,15 @@ fn read_items(bus: &Connection, icons: &mut IconCache) -> Vec<Item> {
         .and_then(|m| m.body().deserialize::<OwnedValue>().ok())
         .and_then(|v| Vec::<String>::try_from(v).ok())
         .unwrap_or_default();
-    entries
+    let mut tooltips = Vec::new();
+    let items = entries
         .iter()
         .filter_map(|e| {
             let (service, path) = split_entry(e);
-            read_item(bus, service, path, icons)
+            read_item(bus, service, path, icons, &mut tooltips)
         })
-        .collect()
+        .collect();
+    (items, tooltips)
 }
 
 fn read_item(
@@ -384,6 +418,7 @@ fn read_item(
     service: String,
     path: String,
     icons: &mut IconCache,
+    tooltip_titled: &mut Vec<String>,
 ) -> Option<Item> {
     let props: HashMap<String, OwnedValue> = bus
         .call_method(
@@ -409,7 +444,12 @@ fn read_item(
         return None;
     }
     let attention = status == "NeedsAttention";
-    let title = [text("Title"), tooltip_title(&props), text("Id")]
+    let tooltip = tooltip_title(&props);
+    let titled = text("Title");
+    if titled.is_empty() && !tooltip.is_empty() {
+        tooltip_titled.push(service.clone());
+    }
+    let title = [titled, tooltip, text("Id")]
         .into_iter()
         .find(|t| !t.is_empty())
         .unwrap_or_else(|| service.clone());
@@ -707,7 +747,7 @@ pub fn print() -> Result<(), String> {
         Some(o) => println!("watcher: {o}"),
         None => println!("watcher: none (the bar starts one)"),
     }
-    let items = read_items(bus, &mut IconCache::default());
+    let (items, _) = read_items(bus, &mut IconCache::default());
     if items.is_empty() {
         println!("no icons");
     }
